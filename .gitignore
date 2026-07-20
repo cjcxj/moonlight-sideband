@@ -1,0 +1,22 @@
+# Build directories
+build/
+cmake-build-*/
+out/
+
+# IDE files
+.idea/
+.vscode/
+.vs/
+*.user
+*.suo
+
+# Compiled artifacts
+*.exe
+*.obj
+*.lib
+*.pdb
+*.ilk
+*.exp
+
+# Logs
+*.log
