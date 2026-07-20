@@ -119,7 +119,7 @@ int main(int argc, char *argv[])
     if (!displayPtr->Start())
     {
         Logger::Get().Error("DisplayModule 启动失败");
-        // Display 是骨架，启动失败不致命
+        // Display 启动失败不致命，光标服务仍可工作
     }
 
     // 注册信号处理

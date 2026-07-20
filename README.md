@@ -61,10 +61,10 @@ Hash != 0xFFFFFFFF
 | 1 | Heartbeat | 双向 | 空 | 计划 |
 | 2 | 文本光标状态 | PC→Android | 老格式 | ✅ 已实现 |
 | 3 | Hello/握手 | 双向 | JSON | 计划 |
-| 10 | 显示器列表请求 | Android→PC | 空 | 骨架 |
-| 11 | 显示器列表响应 | PC→Android | JSON | 骨架 |
-| 12 | 切换显示器 | Android→PC | JSON | 骨架 |
-| 13 | 当前显示器 | PC→Android | JSON | 骨架 |
+| 10 | 显示器列表请求 | Android→PC | 空 | ✅ |
+| 11 | 显示器列表响应 | PC→Android | JSON | ✅ |
+| 12 | 切换显示器 | Android→PC | JSON | ✅ |
+| 13 | 当前显示器 | PC→Android | JSON | ✅ |
 | 20-24 | Sunshine 配置 | 双向 | JSON | 计划 |
 | 100+ | 用户扩展 | 双向 | 任意 | - |
 
@@ -79,13 +79,19 @@ Hash != 0xFFFFFFFF
 - 文本插入符追踪
 - 与原协议 100% 兼容
 
-### DisplayModule 🚧 骨架
-- 协议层完整（接受指令，返回 `not_implemented`）
-- 阶段 2 待实现：
-  - `EnumDisplayDevices` 枚举显示器
-  - `ChangeDisplaySettingsEx` 切换主显示器
-  - 监控主显示器变化并推送
-  - 返回分辨率、刷新率、缩放信息
+### DisplayModule ✅ 已实现
+- `EnumDisplayDevicesW` 枚举所有活动显示器
+- `EnumDisplaySettingsExW` 获取分辨率、刷新率、色深
+- `GetDpiForMonitor` 获取缩放百分比
+- `ChangeDisplaySettingsExW` 切换 Windows 主显示器（立即生效）
+- 监控线程每 2 秒检测主显示器变化并主动推送
+- 客户端连接时异步推送当前状态
+- JSON 响应包含：`id/name/adapter/x/y/w/h/refresh/bpp/scale/is_primary/is_active`
+
+**已知限制**：
+- 切换 Windows 主显示器后，Sunshine 捕获的屏幕不会自动跟随
+  （需要重启 Sunshine 才能让它捕获新主显示器，这是 Sunshine 的限制）
+- 切换主显示器时桌面图标位置会重排（Windows 系统行为）
 
 ### 未来模块 💡
 - `SunshineModule` - 通过本地 `sunshine.conf` 读写配置
