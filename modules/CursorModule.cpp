@@ -295,8 +295,8 @@ void CursorEngine::CaptureAndSend()
 
     Logger::Get().Debug("[光标捕获] DPI:", currentDpi, "| 尺寸:", orgW, "x", orgH);
 
-    int hotX = std::clamp(ii.xHotspot, 0, finalSizeW - 1);
-    int hotY = std::clamp(ii.yHotspot, 0, finalSizeH - 1);
+    int hotX = std::clamp(static_cast<int>(ii.xHotspot), 0, finalSizeW - 1);
+    int hotY = std::clamp(static_cast<int>(ii.yHotspot), 0, finalSizeH - 1);
 
     int sheetW = finalSizeW;
     int sheetH = finalSizeH * frames;

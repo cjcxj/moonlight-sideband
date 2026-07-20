@@ -10,9 +10,8 @@
  *         现有 Android 客户端无需修改即可连接并接收光标。
  */
 
-#define NOMINMAX
-#define WIN32_LEAN_AND_MEAN
-#define _WINSOCK_DEPRECATED_NO_WARNINGS
+// NOMINMAX / WIN32_LEAN_AND_MEAN / _WINSOCK_DEPRECATED_NO_WARNINGS
+// 由 CMakeLists.txt 的 add_compile_definitions 全局定义，此处不再 #define
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
