@@ -27,6 +27,6 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: moonlight-sideband-windows
-        path: build/Release/moonlight_sideband.exe
+        path: build/moonlight_sideband.exe
         if-no-files-found: error
         retention-days: 30
