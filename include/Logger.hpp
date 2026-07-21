@@ -72,6 +72,12 @@ public:
             Log("[ERROR] ", args...);
     }
     template <typename... Args>
+    void Warning(Args... args)
+    {
+        if (m_level <= LogLevel::INFO)
+            Log("[WARN] ", args...);
+    }
+    template <typename... Args>
     void Debug(Args... args)
     {
         if (m_level <= LogLevel::DEBUG)
