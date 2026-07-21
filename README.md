@@ -65,6 +65,10 @@ Hash != 0xFFFFFFFF
 | 11 | 显示器列表响应 | PC→Android | JSON | ✅ |
 | 12 | 切换显示器 | Android→PC | JSON | ✅ |
 | 13 | 当前显示器 | PC→Android | JSON | ✅ |
+| 14 | 查询显示器模式列表 | Android→PC | JSON | ✅ |
+| 15 | 模式列表响应 | PC→Android | JSON | ✅ |
+| 16 | 设置分辨率/刷新率 | Android→PC | JSON | ✅ |
+| 17 | 设置缩放 | Android→PC | JSON | ✅ |
 | 20-24 | Sunshine 配置 | 双向 | JSON | 计划 |
 | 100+ | 用户扩展 | 双向 | 任意 | - |
 

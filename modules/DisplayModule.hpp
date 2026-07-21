@@ -31,6 +31,22 @@
  *    - 周期性监控主显示器变化（分辨率/刷新率/缩放）
  *    - 变化时通过 BroadcastCommand 推送
  *    - 客户端连接时立即推送一次当前状态
+ *
+ * 4. 查询显示器支持的模式列表（CmdID=14/15）
+ *    - 通过 EnumDisplaySettingsExW + ENUM_DISPLAY_SETTINGS_MODES 枚举
+ *    - 返回 JSON: {display_id, modes:[{w,h,refresh,bpp},...]}
+ *    - 模式去重（同分辨率+刷新率只保留一个）
+ *
+ * 5. 设置分辨率/刷新率（CmdID=16）
+ *    - 通过 ChangeDisplaySettingsExW + CDS_UPDATEREGISTRY
+ *    - 立即生效
+ *    - 返回 JSON: {ok, display_id, w, h, refresh} 或 {ok:false, error}
+ *
+ * 6. 设置缩放（CmdID=17）
+ *    - 写注册表 HKCU\Control Panel\Desktop\WindowMetrics\AppliedDPI
+ *    - 同时设置 Win8DpiScaling=1 启用自定义缩放
+ *    - 不立即生效，需要注销/登录或重启 explorer
+ *    - 返回 JSON: {ok, display_id, scale, requires_sign_out:true} 或 {ok:false, error}
  */
 class DisplayModule : public ISidebandModule
 {
@@ -70,6 +86,15 @@ private:
         bool isActive = false;
     };
 
+    // 显示模式（分辨率+刷新率+色深）
+    struct DisplayMode
+    {
+        int width = 0;
+        int height = 0;
+        int refreshRate = 0;
+        int bitsPerPel = 0;
+    };
+
     SidebandServer &m_server;
     std::atomic<bool> m_exit{false};
     std::atomic<bool> m_forcePush{false};  // 客户端连接时置位，由 MonitorLoop 异步推送
@@ -102,6 +127,30 @@ private:
     };
     SwitchResult SwitchPrimaryDisplay(const std::string &displayId);
 
+    // 枚举某显示器支持的所有模式（去重）
+    std::vector<DisplayMode> EnumerateModes(const std::string &displayId) const;
+
+    // 设置显示器分辨率/刷新率
+    enum class SetModeResult
+    {
+        Ok,
+        NotFound,
+        NotActive,
+        ModeNotFound,
+        ApiFailed
+    };
+    SetModeResult SetDisplayMode(const std::string &displayId, int w, int h, int refresh);
+
+    // 设置缩放（写注册表）
+    enum class SetScaleResult
+    {
+        Ok,
+        NotFound,
+        InvalidScale,
+        RegistryFailed
+    };
+    SetScaleResult SetDisplayScale(const std::string &displayId, int scale);
+
     // 获取当前主显示器信息（不含完整列表）
     bool GetCurrentPrimary(DisplayInfo &out) const;
 
@@ -110,6 +159,9 @@ private:
 
     // 把单个 DisplayInfo 序列化为 JSON
     std::string DisplayToJson(const DisplayInfo &d) const;
+
+    // 把 DisplayMode 列表序列化为 JSON
+    std::string ModesToJson(const std::string &displayId, const std::vector<DisplayMode> &modes) const;
 
     // 监控主显示器变化的循环
     void MonitorLoop();
@@ -125,3 +177,9 @@ std::string WideToUtf8(const std::wstring &w);
 
 // JSON 字符串转义
 std::string EscapeJson(const std::string &s);
+
+// 从 JSON 字符串中提取字符串字段值（简易解析）
+std::string ParseJsonStringField(const std::string &json, const std::string &key);
+
+// 从 JSON 字符串中提取整数字段值
+int ParseJsonIntField(const std::string &json, const std::string &key);

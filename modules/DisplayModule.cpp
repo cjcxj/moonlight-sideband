@@ -71,6 +71,46 @@ std::string EscapeJson(const std::string &s)
     return out;
 }
 
+// 从 JSON 字符串中提取字符串字段值（简易解析，不处理转义）
+std::string ParseJsonStringField(const std::string &json, const std::string &key)
+{
+    std::string needle = "\"" + key + "\"";
+    size_t keyPos = json.find(needle);
+    if (keyPos == std::string::npos) return "";
+    size_t colon = json.find(':', keyPos + needle.size());
+    if (colon == std::string::npos) return "";
+    size_t q1 = json.find('"', colon + 1);
+    if (q1 == std::string::npos) return "";
+    size_t q2 = json.find('"', q1 + 1);
+    if (q2 == std::string::npos) return "";
+    return json.substr(q1 + 1, q2 - q1 - 1);
+}
+
+// 从 JSON 字符串中提取整数字段值（简易解析）
+int ParseJsonIntField(const std::string &json, const std::string &key)
+{
+    std::string needle = "\"" + key + "\"";
+    size_t keyPos = json.find(needle);
+    if (keyPos == std::string::npos) return 0;
+    size_t colon = json.find(':', keyPos + needle.size());
+    if (colon == std::string::npos) return 0;
+    size_t start = colon + 1;
+    while (start < json.size() && (json[start] == ' ' || json[start] == '\t')) ++start;
+    if (start >= json.size()) return 0;
+    bool negative = false;
+    if (json[start] == '-') { negative = true; ++start; }
+    int value = 0;
+    bool anyDigit = false;
+    while (start < json.size() && json[start] >= '0' && json[start] <= '9')
+    {
+        value = value * 10 + (json[start] - '0');
+        ++start;
+        anyDigit = true;
+    }
+    if (!anyDigit) return 0;
+    return negative ? -value : value;
+}
+
 // ============================================================
 //                      DisplayModule
 // ============================================================
@@ -327,6 +367,192 @@ DisplayModule::SwitchResult DisplayModule::SwitchPrimaryDisplay(const std::strin
 }
 
 // ============================================================
+//                      枚举显示模式
+// ============================================================
+
+std::vector<DisplayModule::DisplayMode> DisplayModule::EnumerateModes(const std::string &displayId) const
+{
+    std::vector<DisplayMode> result;
+    std::wstring devName(displayId.begin(), displayId.end());
+
+    DEVMODEW dm = {};
+    dm.dmSize = sizeof(dm);
+    dm.dmDriverExtra = 0;
+
+    DWORD i = 0;
+    while (EnumDisplaySettingsExW(devName.c_str(), i, &dm, 0))
+    {
+        // 仅保留 32 位色深（低于 24 的过滤掉，避免列表过长）
+        if (dm.dmBitsPerPel >= 24)
+        {
+            DisplayMode m;
+            m.width = (int)dm.dmPelsWidth;
+            m.height = (int)dm.dmPelsHeight;
+            m.refreshRate = (int)dm.dmDisplayFrequency;
+            m.bitsPerPel = (int)dm.dmBitsPerPel;
+
+            // 去重（同 w/h/refresh/bpp）
+            bool dup = false;
+            for (const auto &e : result)
+            {
+                if (e.width == m.width && e.height == m.height &&
+                    e.refreshRate == m.refreshRate && e.bitsPerPel == m.bitsPerPel)
+                {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup)
+                result.push_back(m);
+        }
+        ++i;
+
+        // 限制枚举数量避免异常驱动导致死循环
+        if (i > 1024)
+            break;
+    }
+
+    // 排序：分辨率降序 → 刷新率降序
+    std::sort(result.begin(), result.end(), [](const DisplayMode &a, const DisplayMode &b) {
+        if (a.width != b.width) return a.width > b.width;
+        if (a.height != b.height) return a.height > b.height;
+        return a.refreshRate > b.refreshRate;
+    });
+
+    return result;
+}
+
+// ============================================================
+//                      设置分辨率/刷新率
+// ============================================================
+
+DisplayModule::SetModeResult DisplayModule::SetDisplayMode(const std::string &displayId, int w, int h, int refresh)
+{
+    auto displays = EnumerateDisplays();
+    const DisplayInfo *target = nullptr;
+    for (const auto &d : displays)
+    {
+        if (d.id == displayId) { target = &d; break; }
+    }
+    if (!target) return SetModeResult::NotFound;
+    if (!target->isActive) return SetModeResult::NotActive;
+
+    // 验证模式是否在支持列表中
+    auto modes = EnumerateModes(displayId);
+    bool found = false;
+    for (const auto &m : modes)
+    {
+        if (m.width == w && m.height == h && m.refreshRate == refresh)
+        {
+            found = true;
+            break;
+        }
+    }
+    if (!found)
+    {
+        Logger::Get().Warning("DisplayModule: 模式不支持 ", w, "x", h, "@", refresh);
+        return SetModeResult::ModeNotFound;
+    }
+
+    std::wstring devName(displayId.begin(), displayId.end());
+    DEVMODEW dm = {};
+    dm.dmSize = sizeof(dm);
+    dm.dmDriverExtra = 0;
+    if (!EnumDisplaySettingsExW(devName.c_str(), ENUM_CURRENT_SETTINGS, &dm, 0))
+    {
+        Logger::Get().Error("DisplayModule: 获取当前模式失败");
+        return SetModeResult::ApiFailed;
+    }
+
+    dm.dmPelsWidth = (DWORD)w;
+    dm.dmPelsHeight = (DWORD)h;
+    dm.dmDisplayFrequency = (DWORD)refresh;
+    dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
+
+    LONG r = ChangeDisplaySettingsExW(devName.c_str(), &dm, nullptr,
+                                       CDS_UPDATEREGISTRY | CDS_NORESET, nullptr);
+    if (r != DISP_CHANGE_SUCCESSFUL)
+    {
+        Logger::Get().Error("DisplayModule: 设置模式失败 code=", r);
+        return SetModeResult::ApiFailed;
+    }
+
+    // 应用
+    r = ChangeDisplaySettingsExW(nullptr, nullptr, nullptr, 0, nullptr);
+    if (r != DISP_CHANGE_SUCCESSFUL)
+    {
+        Logger::Get().Error("DisplayModule: 应用模式失败 code=", r);
+        return SetModeResult::ApiFailed;
+    }
+
+    Logger::Get().Info("DisplayModule: 已设置 ", displayId, " -> ", w, "x", h, "@", refresh);
+    return SetModeResult::Ok;
+}
+
+// ============================================================
+//                      设置缩放
+// ============================================================
+
+DisplayModule::SetScaleResult DisplayModule::SetDisplayScale(const std::string &displayId, int scale)
+{
+    // 校验缩放值（仅允许常见档位）
+    static const int VALID_SCALES[] = {100, 125, 150, 175, 200, 225, 250, 300};
+    bool valid = false;
+    for (int s : VALID_SCALES)
+    {
+        if (scale == s) { valid = true; break; }
+    }
+    if (!valid) return SetScaleResult::InvalidScale;
+
+    auto displays = EnumerateDisplays();
+    const DisplayInfo *target = nullptr;
+    for (const auto &d : displays)
+    {
+        if (d.id == displayId) { target = &d; break; }
+    }
+    if (!target) return SetScaleResult::NotFound;
+
+    // 计算 AppliedDPI: scale=100 -> 96, 125 -> 120, 150 -> 144, 200 -> 192
+    DWORD appliedDpi = (DWORD)(96 * scale / 100);
+
+    HKEY hKey = nullptr;
+    LONG r = RegOpenKeyExW(HKEY_CURRENT_USER,
+                           L"Control Panel\\Desktop\\WindowMetrics",
+                           0, KEY_SET_VALUE, &hKey);
+    if (r != ERROR_SUCCESS)
+    {
+        Logger::Get().Error("DisplayModule: 打开 WindowMetrics 注册表失败 code=", r);
+        return SetScaleResult::RegistryFailed;
+    }
+
+    r = RegSetValueExW(hKey, L"AppliedDPI", 0, REG_DWORD,
+                       reinterpret_cast<const BYTE *>(&appliedDpi), sizeof(appliedDpi));
+    RegCloseKey(hKey);
+    if (r != ERROR_SUCCESS)
+    {
+        Logger::Get().Error("DisplayModule: 写入 AppliedDPI 失败 code=", r);
+        return SetScaleResult::RegistryFailed;
+    }
+
+    // 启用 Win8DpiScaling（让自定义 DPI 生效）
+    HKEY hKeyDesktop = nullptr;
+    r = RegOpenKeyExW(HKEY_CURRENT_USER,
+                      L"Control Panel\\Desktop",
+                      0, KEY_SET_VALUE, &hKeyDesktop);
+    if (r == ERROR_SUCCESS)
+    {
+        DWORD one = 1;
+        RegSetValueExW(hKeyDesktop, L"Win8DpiScaling", 0, REG_DWORD,
+                       reinterpret_cast<const BYTE *>(&one), sizeof(one));
+        RegCloseKey(hKeyDesktop);
+    }
+
+    Logger::Get().Info("DisplayModule: 已设置缩放 ", displayId, " -> ", scale,
+                       "% (AppliedDPI=", appliedDpi, ", 需注销生效)");
+    return SetScaleResult::Ok;
+}
+
+// ============================================================
 //                      JSON 序列化
 // ============================================================
 
@@ -361,6 +587,26 @@ std::string DisplayModule::DisplaysToJson(const std::vector<DisplayInfo> &displa
         ss << DisplayToJson(displays[i]);
     }
     ss << "]";
+    return ss.str();
+}
+
+std::string DisplayModule::ModesToJson(const std::string &displayId,
+                                        const std::vector<DisplayMode> &modes) const
+{
+    std::ostringstream ss;
+    ss << "{";
+    ss << "\"display_id\":\"" << EscapeJson(displayId) << "\",";
+    ss << "\"modes\":[";
+    for (size_t i = 0; i < modes.size(); ++i)
+    {
+        if (i > 0) ss << ",";
+        const auto &m = modes[i];
+        ss << "{\"w\":" << m.width;
+        ss << ",\"h\":" << m.height;
+        ss << ",\"refresh\":" << m.refreshRate;
+        ss << ",\"bpp\":" << m.bitsPerPel << "}";
+    }
+    ss << "]}";
     return ss.str();
 }
 
@@ -446,6 +692,119 @@ void DisplayModule::OnCommand(SidebandSession &session,
         {
             m_forcePush.store(true);
         }
+        break;
+    }
+    case Cmd::DISPLAY_MODE_LIST_REQ:
+    {
+        // payload: JSON: {"display_id":"\\\\.\\DISPLAY1"}
+        std::string payloadStr(payload ? (const char *)payload : "",
+                               payload ? payload_len : 0);
+        std::string displayId = ParseJsonStringField(payloadStr, "display_id");
+
+        std::string respJson;
+        if (displayId.empty())
+        {
+            respJson = R"({"ok":false,"error":"invalid_payload"})";
+        }
+        else
+        {
+            auto modes = EnumerateModes(displayId);
+            respJson = "{\"ok\":true," + ModesToJson(displayId, modes).substr(1);
+        }
+        std::vector<uint8_t> p(respJson.begin(), respJson.end());
+        session.SendCommand(Cmd::DISPLAY_MODE_LIST_RESP, req_id, p);
+        Logger::Get().Info("DisplayModule: 查询模式列表 ", displayId);
+        break;
+    }
+    case Cmd::DISPLAY_MODE_SET:
+    {
+        // payload: JSON: {"display_id":"...","w":1920,"h":1080,"refresh":60}
+        std::string payloadStr(payload ? (const char *)payload : "",
+                               payload ? payload_len : 0);
+        std::string displayId = ParseJsonStringField(payloadStr, "display_id");
+        int w = ParseJsonIntField(payloadStr, "w");
+        int h = ParseJsonIntField(payloadStr, "h");
+        int refresh = ParseJsonIntField(payloadStr, "refresh");
+
+        std::string respJson;
+        if (displayId.empty() || w <= 0 || h <= 0 || refresh <= 0)
+        {
+            respJson = R"({"ok":false,"error":"invalid_payload"})";
+        }
+        else
+        {
+            SetModeResult r = SetDisplayMode(displayId, w, h, refresh);
+            switch (r)
+            {
+            case SetModeResult::Ok:
+                respJson = "{\"ok\":true,\"display_id\":\"" + EscapeJson(displayId) +
+                           "\",\"w\":" + std::to_string(w) +
+                           ",\"h\":" + std::to_string(h) +
+                           ",\"refresh\":" + std::to_string(refresh) + "}";
+                break;
+            case SetModeResult::NotFound:
+                respJson = R"({"ok":false,"error":"not_found"})";
+                break;
+            case SetModeResult::NotActive:
+                respJson = R"({"ok":false,"error":"not_active"})";
+                break;
+            case SetModeResult::ModeNotFound:
+                respJson = R"({"ok":false,"error":"mode_not_found"})";
+                break;
+            case SetModeResult::ApiFailed:
+                respJson = R"({"ok":false,"error":"api_failed"})";
+                break;
+            }
+        }
+
+        std::vector<uint8_t> p(respJson.begin(), respJson.end());
+        session.SendCommand(Cmd::DISPLAY_CURRENT, req_id, p);
+
+        // 分辨率变化后异步推送新状态
+        if (respJson.find("\"ok\":true") != std::string::npos)
+        {
+            m_forcePush.store(true);
+        }
+        break;
+    }
+    case Cmd::DISPLAY_SCALE_SET:
+    {
+        // payload: JSON: {"display_id":"...","scale":125}
+        std::string payloadStr(payload ? (const char *)payload : "",
+                               payload ? payload_len : 0);
+        std::string displayId = ParseJsonStringField(payloadStr, "display_id");
+        int scale = ParseJsonIntField(payloadStr, "scale");
+
+        std::string respJson;
+        if (displayId.empty() || scale <= 0)
+        {
+            respJson = R"({"ok":false,"error":"invalid_payload"})";
+        }
+        else
+        {
+            SetScaleResult r = SetDisplayScale(displayId, scale);
+            switch (r)
+            {
+            case SetScaleResult::Ok:
+                respJson = "{\"ok\":true,\"display_id\":\"" + EscapeJson(displayId) +
+                           "\",\"scale\":" + std::to_string(scale) +
+                           ",\"requires_sign_out\":true}";
+                break;
+            case SetScaleResult::NotFound:
+                respJson = R"({"ok":false,"error":"not_found"})";
+                break;
+            case SetScaleResult::InvalidScale:
+                respJson = R"({"ok":false,"error":"invalid_scale","msg":"allowed: 100,125,150,175,200,225,250,300"})";
+                break;
+            case SetScaleResult::RegistryFailed:
+                respJson = R"({"ok":false,"error":"registry_failed"})";
+                break;
+            }
+        }
+
+        std::vector<uint8_t> p(respJson.begin(), respJson.end());
+        // 缩放不立即生效，用 DISPLAY_SCALE_SET 作为响应（客户端可识别）
+        session.SendCommand(Cmd::DISPLAY_SCALE_SET, req_id, p);
         break;
     }
     default:

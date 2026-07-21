@@ -32,6 +32,15 @@ namespace Cmd {
     constexpr uint32_t DISPLAY_SWITCH = 12;       // Android -> PC, JSON: {display_id}
     constexpr uint32_t DISPLAY_CURRENT = 13;      // PC -> Android (事件通知), JSON: {display_id,w,h,refresh,scale}
 
+    // === Display 模式 / 缩放修改 ===
+    // 查询某显示器支持的所有显示模式
+    constexpr uint32_t DISPLAY_MODE_LIST_REQ = 14;  // Android -> PC, JSON: {display_id}
+    constexpr uint32_t DISPLAY_MODE_LIST_RESP = 15; // PC -> Android, JSON: {display_id, modes:[{w,h,refresh,bpp},...]}
+    // 设置分辨率/刷新率（立即生效）
+    constexpr uint32_t DISPLAY_MODE_SET = 16;       // Android -> PC, JSON: {display_id,w,h,refresh}
+    // 设置缩放（写注册表，需要注销/登录生效）
+    constexpr uint32_t DISPLAY_SCALE_SET = 17;      // Android -> PC, JSON: {display_id,scale}
+
     // === Sunshine 配置 (阶段 3) ===
     constexpr uint32_t SUNSHINE_CONFIG_READ = 20;
     constexpr uint32_t SUNSHINE_CONFIG_RESP = 21;
