@@ -55,6 +55,26 @@ static LONG WINAPI CrashHandler(EXCEPTION_POINTERS *ep)
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
+// std::terminate 处理器：C++ 异常未捕获时触发
+static void TerminateHandler()
+{
+    Logger::Get().Error("======= std::terminate 被调用 =======");
+    try
+    {
+        std::rethrow_exception(std::current_exception());
+    }
+    catch (const std::exception &e)
+    {
+        Logger::Get().Error("未捕获异常: ", e.what());
+    }
+    catch (...)
+    {
+        Logger::Get().Error("未捕获未知异常");
+    }
+    Logger::Get().Error("====================================");
+    std::abort();
+}
+
 static void ShowUsage()
 {
     std::cout << "Usage: moonlight_sideband [options]\n"
@@ -111,6 +131,7 @@ int main(int argc, char *argv[])
 
     // 注册崩溃处理器
     SetUnhandledExceptionFilter(CrashHandler);
+    std::set_terminate(TerminateHandler);
 
     // 创建服务器
     SidebandServer server;

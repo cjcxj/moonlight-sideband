@@ -534,6 +534,8 @@ void CursorModule::HookLoop()
 {
     m_hookThreadId = GetCurrentThreadId();
 
+    try
+    {
     // 在此线程上安装钩子（要求消息循环）
     m_hWinEventHook = SetWinEventHook(
         EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_NAMECHANGE, NULL,
@@ -556,6 +558,15 @@ void CursorModule::HookLoop()
     {
         TranslateMessage(&msg);
         DispatchMessage(&msg);
+    }
+    }
+    catch (const std::exception &e)
+    {
+        Logger::Get().Error("CursorModule: HookLoop 异常: ", e.what());
+    }
+    catch (...)
+    {
+        Logger::Get().Error("CursorModule: HookLoop 未知异常");
     }
 
     // 卸载钩子（必须在安装它的线程上）
@@ -601,16 +612,27 @@ void CursorModule::WorkerLoop()
 {
     while (!m_exit)
     {
+        try
         {
-            std::unique_lock<std::mutex> l(m_mutexCursor);
-            m_cvCursorChanged.wait_for(l, std::chrono::milliseconds(33),
-                                       [this] { return m_cursorChanged || m_exit; });
-            if (m_exit)
-                break;
-            m_cursorChanged = false;
+            {
+                std::unique_lock<std::mutex> l(m_mutexCursor);
+                m_cvCursorChanged.wait_for(l, std::chrono::milliseconds(33),
+                                           [this] { return m_cursorChanged || m_exit; });
+                if (m_exit)
+                    break;
+                m_cursorChanged = false;
+            }
+            if (m_engine)
+                m_engine->CaptureAndSend();
         }
-        if (m_engine)
-            m_engine->CaptureAndSend();
+        catch (const std::exception &e)
+        {
+            Logger::Get().Error("CursorModule: WorkerLoop 异常: ", e.what());
+        }
+        catch (...)
+        {
+            Logger::Get().Error("CursorModule: WorkerLoop 未知异常");
+        }
     }
 }
 
@@ -619,11 +641,22 @@ void CursorModule::TextCursorMonitorLoop()
     Logger::Get().Info("CursorModule: 文本光标监控线程已启动");
     while (!m_exit)
     {
-        if (m_server.HasClients())
+        try
         {
-            UpdateTextCursorState();
+            if (m_server.HasClients())
+            {
+                UpdateTextCursorState();
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        catch (const std::exception &e)
+        {
+            Logger::Get().Error("CursorModule: TextCursorMonitorLoop 异常: ", e.what());
+        }
+        catch (...)
+        {
+            Logger::Get().Error("CursorModule: TextCursorMonitorLoop 未知异常");
+        }
     }
 }
 

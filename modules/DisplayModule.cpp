@@ -823,6 +823,8 @@ void DisplayModule::MonitorLoop()
 
     while (!m_exit)
     {
+        try
+        {
         // 处理客户端连接时的强制推送请求（不依赖 HasClients，确保首次推送）
         if (m_forcePush.exchange(false))
         {
@@ -888,6 +890,15 @@ void DisplayModule::MonitorLoop()
         // 每 2 秒检查一次（频繁枚举显示器开销较大）
         for (int i = 0; i < 20 && !m_exit; ++i)
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        catch (const std::exception &e)
+        {
+            Logger::Get().Error("DisplayModule: MonitorLoop 异常: ", e.what());
+        }
+        catch (...)
+        {
+            Logger::Get().Error("DisplayModule: MonitorLoop 未知异常");
+        }
     }
 
     Logger::Get().Info("DisplayModule: 监控线程退出");
