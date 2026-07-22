@@ -37,6 +37,24 @@ static void OnSignal(int)
         s->RequestStop();
 }
 
+// 未处理异常捕获：记录崩溃信息到日志
+static LONG WINAPI CrashHandler(EXCEPTION_POINTERS *ep)
+{
+    Logger::Get().Error("======= 程序崩溃 =======");
+    Logger::Get().Error("异常代码: 0x", std::hex, ep->ExceptionRecord->ExceptionCode);
+    Logger::Get().Error("地址: 0x", std::hex,
+                        (uintptr_t)ep->ExceptionRecord->ExceptionAddress);
+    if (ep->ExceptionRecord->ExceptionCode == 0xC0000005) // ACCESS_VIOLATION
+    {
+        Logger::Get().Error("访问违规, 类型: ",
+                            ep->ExceptionRecord->ExceptionInformation[0] == 0 ? "读" : "写",
+                            " 地址: 0x", std::hex,
+                            ep->ExceptionRecord->ExceptionInformation[1]);
+    }
+    Logger::Get().Error("=========================");
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
 static void ShowUsage()
 {
     std::cout << "Usage: moonlight_sideband [options]\n"
@@ -90,6 +108,9 @@ int main(int argc, char *argv[])
 
     Logger::Get().Info("======= moonlight-sideband 启动 =======");
     Logger::Get().Info("协议版本: 1, 端口: ", port);
+
+    // 注册崩溃处理器
+    SetUnhandledExceptionFilter(CrashHandler);
 
     // 创建服务器
     SidebandServer server;

@@ -406,9 +406,15 @@ void CursorEngine::CaptureAndSend()
     if (!m_net.GetCachedPng(hash, m_pngBuffer))
     {
         Gdiplus::Bitmap gdiBmp(sheetW, sheetH, PixelFormat32bppARGB);
-        Gdiplus::BitmapData bd;
+        Gdiplus::BitmapData bd = {};
         Gdiplus::Rect r(0, 0, sheetW, sheetH);
-        gdiBmp.LockBits(&r, Gdiplus::ImageLockModeWrite, PixelFormat32bppARGB, &bd);
+        Gdiplus::Status st = gdiBmp.LockBits(&r, Gdiplus::ImageLockModeWrite,
+                                              PixelFormat32bppARGB, &bd);
+        if (st != Gdiplus::Ok || !bd.Scan0)
+        {
+            Logger::Get().Error("CursorEngine: LockBits 失败 status=", (int)st);
+            return;
+        }
         memcpy(bd.Scan0, m_rawPixels.data(), rawDataSize);
         gdiBmp.UnlockBits(&bd);
 
@@ -418,9 +424,20 @@ void CursorEngine::CaptureAndSend()
             Logger::Get().Error("CursorEngine: 创建 PNG 流失败");
             return;
         }
-        CLSID pngId;
-        GetEncoderClsid(L"image/png", &pngId);
-        gdiBmp.Save(s, &pngId, NULL);
+        CLSID pngId = {};
+        if (GetEncoderClsid(L"image/png", &pngId) < 0)
+        {
+            Logger::Get().Error("CursorEngine: 找不到 PNG 编码器");
+            s->Release();
+            return;
+        }
+        st = gdiBmp.Save(s, &pngId, NULL);
+        if (st != Gdiplus::Ok)
+        {
+            Logger::Get().Error("CursorEngine: PNG 编码失败 status=", (int)st);
+            s->Release();
+            return;
+        }
 
         STATSTG stg;
         s->Stat(&stg, STATFLAG_NONAME);
