@@ -31,10 +31,17 @@ bool SidebandSession::SendCursor(uint32_t hash, int32_t hotX, int32_t hotY,
         ? SidebandProtocol::BuildCachedCursorPacket(hash, hotX, hotY, frames, delay)
         : SidebandProtocol::BuildCursorPacket(hash, hotX, hotY, frames, delay, pngData);
 
+    std::lock_guard<std::mutex> lk(m_sendMutex);
     int sent = send(m_socket, (const char *)packet.data(), (int)packet.size(), 0);
     if (sent == SOCKET_ERROR)
     {
-        Logger::Get().Debug("SidebandSession: send 失败 (cursor)");
+        int err = WSAGetLastError();
+        if (err == WSAEWOULDBLOCK)
+        {
+            // 发送缓冲区满，跳过本帧（光标丢一帧可接受），不断开连接
+            return true;
+        }
+        Logger::Get().Debug("SidebandSession: send 失败 (cursor) WSA=", err);
         m_connected = false;
         return false;
     }
@@ -47,10 +54,14 @@ bool SidebandSession::SendTextCursorState(int32_t yPercentage)
     if (!m_connected)
         return false;
     auto packet = SidebandProtocol::BuildTextCursorPacket(yPercentage);
+    std::lock_guard<std::mutex> lk(m_sendMutex);
     int sent = send(m_socket, (const char *)packet.data(), (int)packet.size(), 0);
     if (sent == SOCKET_ERROR)
     {
-        Logger::Get().Debug("SidebandSession: send 失败 (text-cursor)");
+        int err = WSAGetLastError();
+        if (err == WSAEWOULDBLOCK)
+            return true;  // 跳过，不断开
+        Logger::Get().Debug("SidebandSession: send 失败 (text-cursor) WSA=", err);
         m_connected = false;
         return false;
     }
@@ -63,14 +74,52 @@ bool SidebandSession::SendCommand(uint32_t cmd_id, uint32_t req_id,
     if (!m_connected)
         return false;
     auto packet = SidebandProtocol::BuildCommandPacket(cmd_id, req_id, payload, payload_len);
+    std::lock_guard<std::mutex> lk(m_sendMutex);
     int sent = send(m_socket, (const char *)packet.data(), (int)packet.size(), 0);
     if (sent == SOCKET_ERROR)
     {
-        Logger::Get().Debug("SidebandSession: send 失败 (command)");
+        int err = WSAGetLastError();
+        if (err == WSAEWOULDBLOCK)
+        {
+            // 控制指令不能丢，放入发送队列稍后重试
+            m_sendQueue.insert(m_sendQueue.end(), packet.begin(), packet.end());
+            return true;
+        }
+        Logger::Get().Debug("SidebandSession: send 失败 (command) WSA=", err);
         m_connected = false;
         return false;
     }
     return true;
+}
+
+bool SidebandSession::FlushSendQueue()
+{
+    if (!m_connected)
+        return false;
+    std::lock_guard<std::mutex> lk(m_sendMutex);
+    while (!m_sendQueue.empty())
+    {
+        int sent = send(m_socket, (const char *)m_sendQueue.data(),
+                        (int)m_sendQueue.size(), 0);
+        if (sent == SOCKET_ERROR)
+        {
+            int err = WSAGetLastError();
+            if (err == WSAEWOULDBLOCK)
+                return true;  // 缓冲区仍满，下次再试
+            m_connected = false;
+            m_sendQueue.clear();
+            return false;
+        }
+        if (sent > 0)
+            m_sendQueue.erase(m_sendQueue.begin(), m_sendQueue.begin() + sent);
+    }
+    return true;
+}
+
+bool SidebandSession::HasQueuedData() const
+{
+    std::lock_guard<std::mutex> lk(m_sendMutex);
+    return !m_sendQueue.empty();
 }
 
 bool SidebandSession::TryReceive()
@@ -204,4 +253,6 @@ void SidebandSession::Close()
     }
     m_connected = false;
     m_rxBuffer.clear();
+    std::lock_guard<std::mutex> lk(m_sendMutex);
+    m_sendQueue.clear();
 }

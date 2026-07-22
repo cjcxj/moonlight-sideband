@@ -5,6 +5,7 @@
 #include <vector>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 
 #include "SidebandProtocol.hpp"
 
@@ -51,6 +52,12 @@ public:
         return SendCommand(cmd_id, req_id, payload.data(), (uint32_t)payload.size());
     }
 
+    // 刷新发送队列（WSAEWOULDBLOCK 时排队的数据）
+    bool FlushSendQueue();
+
+    // 是否有待发送的队列数据
+    bool HasQueuedData() const;
+
     // === 接收 API ===
 
     // 尝试从 socket 读取数据并解析指令。
@@ -77,6 +84,10 @@ private:
     // 接收缓冲区
     std::vector<uint8_t> m_rxBuffer;
     CommandCallback m_commandCallback;
+
+    // 发送队列（WSAEWOULDBLOCK 时暂存控制指令）
+    std::vector<uint8_t> m_sendQueue;
+    mutable std::mutex m_sendMutex;
 
     // 解析接收缓冲区中的完整包
     void ProcessRxBuffer();

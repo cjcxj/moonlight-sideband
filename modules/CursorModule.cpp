@@ -293,6 +293,13 @@ void CursorEngine::CaptureAndSend()
     int finalSizeW = orgW;
     int finalSizeH = orgH;
 
+    // 安全检查：尺寸为 0 时 std::clamp(lo, 0, -1) 是未定义行为
+    if (finalSizeW <= 0 || finalSizeH <= 0)
+    {
+        Logger::Get().Warning("CursorEngine: 异常光标尺寸 ", finalSizeW, "x", finalSizeH, "，跳过");
+        return;
+    }
+
     Logger::Get().Debug("[光标捕获] DPI:", currentDpi, "| 尺寸:", orgW, "x", orgH);
 
     int hotX = std::clamp(static_cast<int>(ii.xHotspot), 0, finalSizeW - 1);

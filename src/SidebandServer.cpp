@@ -301,20 +301,36 @@ void SidebandServer::Run()
         }
 
         // 2. 轮询所有客户端 socket，接收数据
+        //    在锁内拷贝客户端列表（shared_ptr 保持引用），在锁外调用 TryReceive
+        //    避免持锁期间 OnCommand 执行耗时操作（ChangeDisplaySettings 等）阻塞其他线程
+        std::vector<std::shared_ptr<SidebandSession>> clientsSnapshot;
+        std::vector<std::shared_ptr<SidebandSession>> disconnected;
+
         {
             std::lock_guard<std::mutex> lock(m_clientsMutex);
-            for (auto it = m_clients.begin(); it != m_clients.end();)
+            for (auto &c : m_clients)
             {
-                auto &client = *it;
-                if (!client->TryReceive())
-                {
-                    // 连接断开
-                    NotifyClientDisconnected(*client);
-                    it = m_clients.erase(it);
-                    didWork = true;
-                    continue;
-                }
-                ++it;
+                c->FlushSendQueue();
+                clientsSnapshot.push_back(c);
+            }
+        }
+
+        // 锁外接收并处理指令（OnCommand 在此执行，可能耗时）
+        for (auto &client : clientsSnapshot)
+        {
+            if (!client->TryReceive())
+                disconnected.push_back(client);
+            didWork = true;
+        }
+
+        // 锁内移除断开的客户端
+        if (!disconnected.empty())
+        {
+            std::lock_guard<std::mutex> lock(m_clientsMutex);
+            for (auto &d : disconnected)
+            {
+                m_clients.remove(d);
+                NotifyClientDisconnected(*d);
             }
         }
 
@@ -327,7 +343,7 @@ void SidebandServer::Run()
             didWork = true;
         }
 
-        // 4. 没事做时短暂休眠，避免 100% CPU
+        // 4. 没事做时短暂休息，避免 100% CPU
         if (!didWork)
         {
             Sleep(2);
