@@ -236,102 +236,106 @@ static std::map<std::wstring, std::wstring> BuildFriendlyNameMap()
     return result;
 }
 
-// EnumDisplayMonitors 回调上下文
-struct EnumMonitorContext
-{
-    std::vector<DisplayModule::DisplayInfo> *result;
-};
-
-// EnumDisplayMonitors 回调：枚举当前桌面中所有可见的物理监视器
-static BOOL CALLBACK MonitorEnumProc(HMONITOR hMonitor, HDC hdc, LPRECT lprcMonitor, LPARAM dwData)
-{
-    auto *ctx = reinterpret_cast<EnumMonitorContext *>(dwData);
-
-    MONITORINFOEXW mi = {};
-    mi.cbSize = sizeof(mi);
-    if (!GetMonitorInfoW(hMonitor, &mi))
-        return TRUE;  // 继续枚举下一个
-
-    DisplayModule::DisplayInfo info;
-    info.id = WideToUtf8(mi.szDevice);       // "\\.\DISPLAY1"
-    info.isActive = true;                     // EnumDisplayMonitors 只返回活跃监视器
-    info.isPrimary = (mi.dwFlags & MONITORINFOF_PRIMARY) != 0;
-    info.x = mi.rcMonitor.left;
-    info.y = mi.rcMonitor.top;
-    info.width = mi.rcMonitor.right - mi.rcMonitor.left;
-    info.height = mi.rcMonitor.bottom - mi.rcMonitor.top;
-
-    // 获取分辨率/刷新率/色深
-    DEVMODEW dm = {};
-    dm.dmSize = sizeof(dm);
-    dm.dmDriverExtra = 0;
-    if (EnumDisplaySettingsExW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm, 0))
-    {
-        info.width = (int)dm.dmPelsWidth;
-        info.height = (int)dm.dmPelsHeight;
-        info.refreshRate = (int)dm.dmDisplayFrequency;
-        info.bitsPerPel = (int)dm.dmBitsPerPel;
-    }
-
-    // 获取监视器名称和 DeviceID（用于 PerMonitorSettings 注册表）
-    DISPLAY_DEVICEW monitor = {};
-    monitor.cb = sizeof(monitor);
-    if (EnumDisplayDevicesW(mi.szDevice, 0, &monitor, 0))
-    {
-        info.name = WideToUtf8(monitor.DeviceString);
-        info.deviceId = WideToUtf8(monitor.DeviceID);
-    }
-    if (info.name.empty())
-        info.name = "Display " + std::to_string(ctx->result->size() + 1);
-
-    // 获取适配器名称
-    DISPLAY_DEVICEW adapter = {};
-    adapter.cb = sizeof(adapter);
-    for (DWORD i = 0; EnumDisplayDevicesW(nullptr, i, &adapter, 0); ++i)
-    {
-        if (_wcsicmp(adapter.DeviceName, mi.szDevice) == 0)
-        {
-            info.adapterName = WideToUtf8(adapter.DeviceString);
-            break;
-        }
-    }
-
-    // 获取 DPI（缩放）
-    UINT dpiX = 96, dpiY = 96;
-    if (SUCCEEDED(GetDpiForMonitor(hMonitor, MDT_EFFECTIVE_DPI, &dpiX, &dpiY)))
-    {
-        info.scale = (int)((dpiX * 100 + 48) / 96);
-    }
-
-    Logger::Get().Debug("DisplayModule: 监视器 ", info.id,
-                        " ", info.width, "x", info.height, "@", info.refreshRate,
-                        " scale=", info.scale, "% primary=", info.isPrimary);
-
-    ctx->result->push_back(info);
-    return TRUE;
-}
-
 std::vector<DisplayModule::DisplayInfo> DisplayModule::EnumerateDisplays() const
 {
     std::vector<DisplayInfo> result;
-    EnumMonitorContext ctx{&result};
-    EnumDisplayMonitors(NULL, NULL, MonitorEnumProc, reinterpret_cast<LPARAM>(&ctx));
 
-    // 用 CCD API 补充显示器友好名称（如 "Dell U2720Q"）
+    // CCD API 友好名称映射（只含活跃路径）
     auto nameMap = BuildFriendlyNameMap();
-    for (auto &info : result)
+
+    DISPLAY_DEVICEW adapter = {};
+    adapter.cb = sizeof(adapter);
+
+    for (DWORD i = 0; EnumDisplayDevicesW(nullptr, i, &adapter, 0); ++i)
     {
-        std::wstring devName(info.id.begin(), info.id.end());
-        auto it = nameMap.find(devName);
+        std::string adapterId = WideToUtf8(adapter.DeviceName);
+
+        // 尝试获取监视器信息——只有物理连接了显示器的才显示
+        DISPLAY_DEVICEW monitor = {};
+        monitor.cb = sizeof(monitor);
+        bool gotMonitor = EnumDisplayDevicesW(adapter.DeviceName, 0, &monitor, 0) != FALSE;
+        if (!gotMonitor)
+        {
+            // 尝试获取设备接口名
+            monitor = {};
+            monitor.cb = sizeof(monitor);
+            gotMonitor = EnumDisplayDevicesW(adapter.DeviceName, 0, &monitor,
+                                             EDD_GET_DEVICE_INTERFACE_NAME) != FALSE;
+        }
+        if (!gotMonitor)
+            continue;  // 没有连接监视器，跳过
+
+        bool adapterActive = (adapter.StateFlags & DISPLAY_DEVICE_ACTIVE) != 0;
+
+        DisplayInfo info;
+        info.id = adapterId;
+        info.adapterName = WideToUtf8(adapter.DeviceString);
+        info.isActive = adapterActive;
+        info.name = WideToUtf8(monitor.DeviceString);
+        info.deviceId = WideToUtf8(monitor.DeviceID);
+
+        // CCD 友好名称优先（如 "Dell U2720Q"），仅对活跃显示器有效
+        auto it = nameMap.find(adapter.DeviceName);
         if (it != nameMap.end() && it->second[0] != L'\0')
         {
             std::string friendly = WideToUtf8(it->second);
             if (!friendly.empty())
                 info.name = friendly;
         }
+
+        if (info.name.empty())
+            info.name = "Display " + std::to_string(result.size() + 1);
+
+        // 获取当前显示模式
+        DEVMODEW dm = {};
+        dm.dmSize = sizeof(dm);
+        dm.dmDriverExtra = 0;
+        if (EnumDisplaySettingsExW(adapter.DeviceName, ENUM_CURRENT_SETTINGS, &dm, 0))
+        {
+            info.x = dm.dmPosition.x;
+            info.y = dm.dmPosition.y;
+            info.width = (int)dm.dmPelsWidth;
+            info.height = (int)dm.dmPelsHeight;
+            info.refreshRate = (int)dm.dmDisplayFrequency;
+            info.bitsPerPel = (int)dm.dmBitsPerPel;
+            info.isPrimary = (dm.dmPosition.x == 0 && dm.dmPosition.y == 0);
+        }
+        else
+        {
+            // 未启用显示器：尝试从注册表获取上次保存的模式
+            if (EnumDisplaySettingsExW(adapter.DeviceName, ENUM_REGISTRY_SETTINGS, &dm, 0))
+            {
+                info.x = dm.dmPosition.x;
+                info.y = dm.dmPosition.y;
+                info.width = (int)dm.dmPelsWidth;
+                info.height = (int)dm.dmPelsHeight;
+                info.refreshRate = (int)dm.dmDisplayFrequency;
+                info.bitsPerPel = (int)dm.dmBitsPerPel;
+            }
+        }
+
+        // 获取 DPI（缩放）——只对活跃显示器获取
+        if (info.isActive && info.width > 0 && info.height > 0)
+        {
+            POINT pt = {info.x + info.width / 2, info.y + info.height / 2};
+            HMONITOR hMon = MonitorFromPoint(pt, MONITOR_DEFAULTTONULL);
+            if (hMon)
+            {
+                UINT dpiX = 96, dpiY = 96;
+                if (SUCCEEDED(GetDpiForMonitor(hMon, MDT_EFFECTIVE_DPI, &dpiX, &dpiY)))
+                {
+                    info.scale = (int)((dpiX * 100 + 48) / 96);
+                }
+            }
+        }
+
+        Logger::Get().Debug("DisplayModule: ", info.id, " active=", info.isActive,
+                            " ", info.width, "x", info.height, "@", info.refreshRate,
+                            " name=", info.name);
+
+        result.push_back(info);
     }
 
-    Logger::Get().Debug("DisplayModule: 枚举到 ", result.size(), " 个活跃监视器");
     return result;
 }
 
@@ -350,7 +354,7 @@ bool DisplayModule::GetCurrentPrimary(DisplayInfo &out) const
 }
 
 // ============================================================
-//                      切换主显示器
+//                      切换主显示器（单显示器模式）
 // ============================================================
 
 DisplayModule::SwitchResult DisplayModule::SwitchPrimaryDisplay(const std::string &displayId)
@@ -359,51 +363,42 @@ DisplayModule::SwitchResult DisplayModule::SwitchPrimaryDisplay(const std::strin
 
     // 找到目标显示器
     const DisplayInfo *target = nullptr;
-    const DisplayInfo *oldPrimary = nullptr;
     for (const auto &d : displays)
     {
-        if (d.id == displayId)
-            target = &d;
-        if (d.isPrimary)
-            oldPrimary = &d;
+        if (d.id == displayId) { target = &d; break; }
     }
 
     if (!target)
         return SwitchResult::NotFound;
 
-    if (!target->isActive)
-        return SwitchResult::NotActive;
-
-    if (target->isPrimary)
+    if (target->isPrimary && target->isActive)
         return SwitchResult::AlreadyPrimary;
 
-    if (!oldPrimary)
-    {
-        Logger::Get().Info("DisplayModule: 未找到原主显示器，仍尝试切换");
-    }
-
-    Logger::Get().Info("DisplayModule: 切换主显示器 ", displayId,
-                       " (原主: ", (oldPrimary ? oldPrimary->id : "none"), ")");
-
-    // 策略：
-    // 1. 把目标显示器设为 (0,0) + CDS_SET_PRIMARY
-    // 2. 把原主显示器移到目标显示器右侧
-    // 3. 其他显示器保持原位置（如果与 (0,0) 重叠，向右偏移到目标右侧）
-    // 4. 应用所有更改
+    Logger::Get().Info("DisplayModule: 切换到单显示器模式 ", displayId);
 
     std::wstring targetDevName(displayId.begin(), displayId.end());
 
-    // 1. 设置目标显示器为主显示器
+    // 策略：仅启用目标显示器，禁用其他所有显示器
+    // 1. 启用目标显示器，设为 (0,0) + CDS_SET_PRIMARY
+    // 2. 禁用其他显示器（dmPelsWidth=0, dmPelsHeight=0）
+    // 3. 应用所有更改
+
+    // 1. 启用目标显示器
     DEVMODEW targetDm = {};
     targetDm.dmSize = sizeof(targetDm);
     targetDm.dmDriverExtra = 0;
+
+    // 优先用当前模式，失败则用注册表模式（适用于从未启用状态切换）
     if (!EnumDisplaySettingsExW(targetDevName.c_str(), ENUM_CURRENT_SETTINGS, &targetDm, 0))
     {
-        Logger::Get().Error("DisplayModule: 获取目标显示器当前模式失败");
-        return SwitchResult::ApiFailed;
+        if (!EnumDisplaySettingsExW(targetDevName.c_str(), ENUM_REGISTRY_SETTINGS, &targetDm, 0))
+        {
+            Logger::Get().Error("DisplayModule: 获取目标显示器模式失败");
+            return SwitchResult::ApiFailed;
+        }
     }
 
-    targetDm.dmFields = DM_POSITION | DM_PELSWIDTH | DM_PELSHEIGHT;
+    targetDm.dmFields = DM_POSITION | DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
     targetDm.dmPosition.x = 0;
     targetDm.dmPosition.y = 0;
 
@@ -416,8 +411,7 @@ DisplayModule::SwitchResult DisplayModule::SwitchPrimaryDisplay(const std::strin
         return SwitchResult::ApiFailed;
     }
 
-    // 2. 调整其他显示器的位置（避免与目标重叠）
-    int nextX = targetDm.dmPelsWidth;  // 其他显示器排在目标右侧
+    // 2. 禁用其他所有显示器
     for (const auto &d : displays)
     {
         if (d.id == displayId)
@@ -427,23 +421,18 @@ DisplayModule::SwitchResult DisplayModule::SwitchPrimaryDisplay(const std::strin
         DEVMODEW dm = {};
         dm.dmSize = sizeof(dm);
         dm.dmDriverExtra = 0;
+
+        // 获取当前或注册表模式作为基础（保留分辨率信息，只改位置和状态）
         if (!EnumDisplaySettingsExW(devName.c_str(), ENUM_CURRENT_SETTINGS, &dm, 0))
-            continue;
+            EnumDisplaySettingsExW(devName.c_str(), ENUM_REGISTRY_SETTINGS, &dm, 0);
 
-        // 如果原位置与 (0,0) 重叠或为目标显示器区域，需要偏移
-        int newX = d.x;
-        int newY = d.y;
-        if (newX < targetDm.dmPelsWidth && newX >= 0)
-        {
-            // 与目标显示器区域重叠，移到右侧
-            newX = nextX;
-            newY = 0;
-            nextX += d.width;
-        }
+        // 设置为禁用状态：PelsWidth=0, PelsHeight=0
+        dm.dmFields = DM_POSITION | DM_PELSWIDTH | DM_PELSHEIGHT;
+        dm.dmPelsWidth = 0;
+        dm.dmPelsHeight = 0;
+        dm.dmPosition.x = 0;
+        dm.dmPosition.y = 0;
 
-        dm.dmFields = DM_POSITION;
-        dm.dmPosition.x = newX;
-        dm.dmPosition.y = newY;
         ChangeDisplaySettingsExW(devName.c_str(), &dm, nullptr,
                                  CDS_UPDATEREGISTRY | CDS_NORESET, nullptr);
     }
@@ -456,12 +445,12 @@ DisplayModule::SwitchResult DisplayModule::SwitchPrimaryDisplay(const std::strin
         return SwitchResult::ApiFailed;
     }
 
-    Logger::Get().Info("DisplayModule: 主显示器已切换为 ", displayId);
+    Logger::Get().Info("DisplayModule: 已切换到 ", displayId, " (其他显示器已禁用)");
 
     // 强制刷新缓存，下次 MonitorLoop 会推送新状态
     {
         std::lock_guard<std::mutex> l(m_mutex);
-        m_lastPrimaryId.clear();  // 强制触发变化检测
+        m_lastPrimaryId.clear();
     }
 
     return SwitchResult::Ok;
