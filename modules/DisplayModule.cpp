@@ -194,6 +194,7 @@ std::vector<DisplayModule::DisplayInfo> DisplayModule::EnumerateDisplays() const
         if (gotMonitor)
         {
             info.name = WideToUtf8(monitor.DeviceString);
+            info.deviceId = WideToUtf8(monitor.DeviceID);
             if (info.name.empty())
                 info.name = WideToUtf8(monitor.DeviceName);
         }
@@ -493,16 +494,29 @@ DisplayModule::SetModeResult DisplayModule::SetDisplayMode(const std::string &di
 //                      设置缩放
 // ============================================================
 
+// scale 百分比 -> PerMonitorSettings 的 DpiValue 枚举值
+// 0=100%, 1=125%, 2=150%, 3=175%, 4=200%, 5=225%, 6=250%, 7=300%
+static int ScaleToDpiValue(int scale)
+{
+    switch (scale)
+    {
+    case 100: return 0;
+    case 125: return 1;
+    case 150: return 2;
+    case 175: return 3;
+    case 200: return 4;
+    case 225: return 5;
+    case 250: return 6;
+    case 300: return 7;
+    default:  return -1;
+    }
+}
+
 DisplayModule::SetScaleResult DisplayModule::SetDisplayScale(const std::string &displayId, int scale)
 {
-    // 校验缩放值（仅允许常见档位）
-    static const int VALID_SCALES[] = {100, 125, 150, 175, 200, 225, 250, 300};
-    bool valid = false;
-    for (int s : VALID_SCALES)
-    {
-        if (scale == s) { valid = true; break; }
-    }
-    if (!valid) return SetScaleResult::InvalidScale;
+    // 校验缩放值并转换为 DpiValue 枚举
+    int dpiValue = ScaleToDpiValue(scale);
+    if (dpiValue < 0) return SetScaleResult::InvalidScale;
 
     auto displays = EnumerateDisplays();
     const DisplayInfo *target = nullptr;
@@ -512,43 +526,46 @@ DisplayModule::SetScaleResult DisplayModule::SetDisplayScale(const std::string &
     }
     if (!target) return SetScaleResult::NotFound;
 
-    // 计算 AppliedDPI: scale=100 -> 96, 125 -> 120, 150 -> 144, 200 -> 192
-    DWORD appliedDpi = (DWORD)(96 * scale / 100);
-
-    HKEY hKey = nullptr;
-    LONG r = RegOpenKeyExW(HKEY_CURRENT_USER,
-                           L"Control Panel\\Desktop\\WindowMetrics",
-                           0, KEY_SET_VALUE, &hKey);
-    if (r != ERROR_SUCCESS)
+    if (target->deviceId.empty())
     {
-        Logger::Get().Error("DisplayModule: 打开 WindowMetrics 注册表失败 code=", r);
+        Logger::Get().Error("DisplayModule: 显示器 deviceId 为空，无法设置 per-monitor 缩放");
         return SetScaleResult::RegistryFailed;
     }
 
-    r = RegSetValueExW(hKey, L"AppliedDPI", 0, REG_DWORD,
-                       reinterpret_cast<const BYTE *>(&appliedDpi), sizeof(appliedDpi));
+    // DeviceID 中的 '\' 替换为 '#' 作为注册表键名
+    // 例如 "MONITOR\SAM0F91\5&..." -> "MONITOR#SAM0F91#5&..."
+    std::string regKey = target->deviceId;
+    for (char &c : regKey)
+    {
+        if (c == '\\') c = '#';
+    }
+
+    std::wstring regPath = L"Control Panel\\Desktop\\PerMonitorSettings\\";
+    regPath += std::wstring(regKey.begin(), regKey.end());
+
+    HKEY hKey = nullptr;
+    DWORD disposition = 0;
+    LONG r = RegCreateKeyExW(HKEY_CURRENT_USER, regPath.c_str(),
+                             0, nullptr, 0, KEY_SET_VALUE, nullptr, &hKey, &disposition);
+    if (r != ERROR_SUCCESS)
+    {
+        Logger::Get().Error("DisplayModule: 打开/创建 PerMonitorSettings 注册表失败 code=", r,
+                            " path=", regKey);
+        return SetScaleResult::RegistryFailed;
+    }
+
+    DWORD val = (DWORD)dpiValue;
+    r = RegSetValueExW(hKey, L"DpiValue", 0, REG_DWORD,
+                       reinterpret_cast<const BYTE *>(&val), sizeof(val));
     RegCloseKey(hKey);
     if (r != ERROR_SUCCESS)
     {
-        Logger::Get().Error("DisplayModule: 写入 AppliedDPI 失败 code=", r);
+        Logger::Get().Error("DisplayModule: 写入 DpiValue 失败 code=", r);
         return SetScaleResult::RegistryFailed;
     }
 
-    // 启用 Win8DpiScaling（让自定义 DPI 生效）
-    HKEY hKeyDesktop = nullptr;
-    r = RegOpenKeyExW(HKEY_CURRENT_USER,
-                      L"Control Panel\\Desktop",
-                      0, KEY_SET_VALUE, &hKeyDesktop);
-    if (r == ERROR_SUCCESS)
-    {
-        DWORD one = 1;
-        RegSetValueExW(hKeyDesktop, L"Win8DpiScaling", 0, REG_DWORD,
-                       reinterpret_cast<const BYTE *>(&one), sizeof(one));
-        RegCloseKey(hKeyDesktop);
-    }
-
     Logger::Get().Info("DisplayModule: 已设置缩放 ", displayId, " -> ", scale,
-                       "% (AppliedDPI=", appliedDpi, ", 需注销生效)");
+                       "% (DpiValue=", dpiValue, ", key=", regKey, ", 需注销生效)");
     return SetScaleResult::Ok;
 }
 
@@ -561,6 +578,7 @@ std::string DisplayModule::DisplayToJson(const DisplayInfo &d) const
     std::ostringstream ss;
     ss << "{";
     ss << "\"id\":\"" << EscapeJson(d.id) << "\",";
+    ss << "\"device_id\":\"" << EscapeJson(d.deviceId) << "\",";
     ss << "\"name\":\"" << EscapeJson(d.name) << "\",";
     ss << "\"adapter\":\"" << EscapeJson(d.adapterName) << "\",";
     ss << "\"x\":" << d.x << ",";

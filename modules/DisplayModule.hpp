@@ -43,9 +43,11 @@
  *    - 返回 JSON: {ok, display_id, w, h, refresh} 或 {ok:false, error}
  *
  * 6. 设置缩放（CmdID=17）
- *    - 写注册表 HKCU\Control Panel\Desktop\WindowMetrics\AppliedDPI
- *    - 同时设置 Win8DpiScaling=1 启用自定义缩放
- *    - 不立即生效，需要注销/登录或重启 explorer
+ *    - 写注册表 HKCU\Control Panel\Desktop\PerMonitorSettings\<DeviceID>\DpiValue
+ *    - 支持 per-monitor 独立缩放（不影响其他显示器）
+ *    - DeviceID 取自 EnumDisplayDevicesW，将 '\' 替换为 '#' 作为注册表键名
+ *    - DpiValue 枚举值：0=100%, 1=125%, 2=150%, 3=175%, 4=200%, 5=225%, 6=250%, 7=300%
+ *    - 不立即生效，需要注销/登录
  *    - 返回 JSON: {ok, display_id, scale, requires_sign_out:true} 或 {ok:false, error}
  */
 class DisplayModule : public ISidebandModule
@@ -72,7 +74,8 @@ private:
     // 显示器信息结构
     struct DisplayInfo
     {
-        std::string id;          // "\\\\.\\DISPLAY1"
+        std::string id;          // "\\\\.\\DISPLAY1"（GDI 设备名，用于 ChangeDisplaySettingsExW）
+        std::string deviceId;    // 监视器设备 ID（如 "MONITOR\\SAM0F91\\5&..."，用于 PerMonitorSettings 注册表路径）
         std::string name;        // 监视器名称（如 "DELL U2720Q"）
         std::string adapterName; // 适配器名称（如 "NVIDIA GeForce RTX 3060"）
         int x = 0;
