@@ -53,24 +53,6 @@
 class DisplayModule : public ISidebandModule
 {
 public:
-    explicit DisplayModule(SidebandServer &server);
-    ~DisplayModule() override;
-
-    const char *GetName() const override { return "Display"; }
-
-    void OnClientConnected(SidebandSession &session) override;
-    void OnClientDisconnected(SidebandSession &session) override {}
-    void OnCommand(SidebandSession &session,
-                   uint32_t cmd_id,
-                   uint32_t req_id,
-                   const uint8_t *payload,
-                   uint32_t payload_len) override;
-
-    // 启动/停止（由 main 调用）
-    bool Start();
-    void Stop();
-
-private:
     // 显示器信息结构
     struct DisplayInfo
     {
@@ -97,6 +79,25 @@ private:
         int refreshRate = 0;
         int bitsPerPel = 0;
     };
+
+    explicit DisplayModule(SidebandServer &server);
+    ~DisplayModule() override;
+
+    const char *GetName() const override { return "Display"; }
+
+    void OnClientConnected(SidebandSession &session) override;
+    void OnClientDisconnected(SidebandSession &session) override {}
+    void OnCommand(SidebandSession &session,
+                   uint32_t cmd_id,
+                   uint32_t req_id,
+                   const uint8_t *payload,
+                   uint32_t payload_len) override;
+
+    // 启动/停止（由 main 调用）
+    bool Start();
+    void Stop();
+
+private:
 
     SidebandServer &m_server;
     std::atomic<bool> m_exit{false};
