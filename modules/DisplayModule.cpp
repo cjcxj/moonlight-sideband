@@ -19,6 +19,7 @@
 #include <sstream>
 #include <chrono>
 #include <cstdio>
+#include <map>
 #include <cstring>
 
 #pragma comment(lib, "shcore.lib")  // GetDpiForMonitor
@@ -188,6 +189,52 @@ void DisplayModule::OnClientConnected(SidebandSession &session)
 //                      枚举显示器
 // ============================================================
 
+// 用 CCD API 构建 GDI 设备名 → 显示器友好名称 的映射
+// 例如 "\\.\DISPLAY1" → "Dell U2720Q"
+static std::map<std::wstring, std::wstring> BuildFriendlyNameMap()
+{
+    std::map<std::wstring, std::wstring> result;
+
+    UINT32 numPaths = 0, numModes = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ALL_PATHS, &numPaths, &numModes) != ERROR_SUCCESS)
+        return result;
+
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths(numPaths);
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes(numModes);
+
+    if (QueryDisplayConfig(QDC_ALL_PATHS, &numPaths, paths.data(),
+                           &numModes, modes.data(), nullptr) != ERROR_SUCCESS)
+        return result;
+
+    for (const auto &path : paths)
+    {
+        // 获取源设备名（GDI 设备名，如 "\\.\DISPLAY1"）
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME sourceName = {};
+        sourceName.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+        sourceName.header.size = sizeof(sourceName);
+        sourceName.header.adapterId = path.sourceInfo.adapterId;
+        sourceName.header.id = path.sourceInfo.id;
+        if (DisplayConfigGetDeviceInfo(&sourceName.header) != ERROR_SUCCESS)
+            continue;
+
+        // 获取目标设备名（显示器友好名称，如 "Dell U2720Q"）
+        DISPLAYCONFIG_TARGET_DEVICE_NAME targetName = {};
+        targetName.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+        targetName.header.size = sizeof(targetName);
+        targetName.header.adapterId = path.targetInfo.adapterId;
+        targetName.header.id = path.targetInfo.id;
+        if (DisplayConfigGetDeviceInfo(&targetName.header) != ERROR_SUCCESS)
+            continue;
+
+        if (targetName.monitorFriendlyDeviceName[0] != L'\0')
+        {
+            result[sourceName.viewGdiDeviceName] = targetName.monitorFriendlyDeviceName;
+        }
+    }
+
+    return result;
+}
+
 // EnumDisplayMonitors 回调上下文
 struct EnumMonitorContext
 {
@@ -268,6 +315,20 @@ std::vector<DisplayModule::DisplayInfo> DisplayModule::EnumerateDisplays() const
     std::vector<DisplayInfo> result;
     EnumMonitorContext ctx{&result};
     EnumDisplayMonitors(NULL, NULL, MonitorEnumProc, reinterpret_cast<LPARAM>(&ctx));
+
+    // 用 CCD API 补充显示器友好名称（如 "Dell U2720Q"）
+    auto nameMap = BuildFriendlyNameMap();
+    for (auto &info : result)
+    {
+        std::wstring devName(info.id.begin(), info.id.end());
+        auto it = nameMap.find(devName);
+        if (it != nameMap.end() && it->second[0] != L'\0')
+        {
+            std::string friendly = WideToUtf8(it->second);
+            if (!friendly.empty())
+                info.name = friendly;
+        }
+    }
 
     Logger::Get().Debug("DisplayModule: 枚举到 ", result.size(), " 个活跃监视器");
     return result;
@@ -550,9 +611,83 @@ static int ScaleToDpiValue(int scale)
     }
 }
 
-DisplayModule::SetScaleResult DisplayModule::SetDisplayScale(const std::string &displayId, int scale)
+// 从 "\\.\DISPLAY1" 提取显示器序号 1
+static int ExtractMonitorIndex(const std::string &displayId)
 {
-    // 校验缩放值并转换为 DpiValue 枚举
+    size_t i = displayId.size();
+    while (i > 0 && displayId[i - 1] >= '0' && displayId[i - 1] <= '9')
+        --i;
+    if (i < displayId.size())
+        return std::atoi(displayId.c_str() + i);
+    return -1;
+}
+
+// 获取程序所在目录（含末尾 '\'）
+static std::wstring GetExeDir()
+{
+    wchar_t exePath[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+    std::wstring path(exePath);
+    size_t pos = path.find_last_of(L'\\');
+    if (pos != std::wstring::npos)
+        return path.substr(0, pos + 1);
+    return L".\\";
+}
+
+// 调用 SetDPI.exe 设置缩放，返回 true 表示成功
+// 用法: SetDPI.exe <scale> <monitor_index>
+static bool CallSetDPI(int scale, int monitorIndex)
+{
+    std::wstring exeDir = GetExeDir();
+    std::wstring setDpiPath = exeDir + L"SetDPI.exe";
+
+    // 检测 SetDPI.exe 是否存在
+    if (GetFileAttributesW(setDpiPath.c_str()) == INVALID_FILE_ATTRIBUTES)
+    {
+        Logger::Get().Info("DisplayModule: SetDPI.exe 不存在于 ", WideToUtf8(exeDir),
+                           "，回退到注册表方式");
+        return false;
+    }
+
+    // 构造命令行: SetDPI.exe <scale> <monitorIndex>
+    std::wstring cmd = L"\"" + setDpiPath + L"\" " + std::to_wstring(scale);
+    if (monitorIndex > 0)
+        cmd += L" " + std::to_wstring(monitorIndex);
+
+    Logger::Get().Info("DisplayModule: 调用 ", WideToUtf8(cmd));
+
+    STARTUPINFOW si = {};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi = {};
+
+    if (!CreateProcessW(nullptr, const_cast<LPWSTR>(cmd.c_str()),
+                        nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi))
+    {
+        Logger::Get().Error("DisplayModule: CreateProcess(SetDPI) 失败 code=", GetLastError());
+        return false;
+    }
+
+    WaitForSingleObject(pi.hProcess, 10000);  // 最多等 10 秒
+    DWORD exitCode = 1;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    if (exitCode != 0)
+    {
+        Logger::Get().Error("DisplayModule: SetDPI.exe 退出码=", exitCode);
+        return false;
+    }
+
+    Logger::Get().Info("DisplayModule: SetDPI.exe 设置成功 scale=", scale, " monitor=", monitorIndex);
+    return true;
+}
+
+DisplayModule::SetScaleResult DisplayModule::SetDisplayScale(const std::string &displayId, int scale, bool *immediate)
+{
+    // 校验缩放值
     int dpiValue = ScaleToDpiValue(scale);
     if (dpiValue < 0) return SetScaleResult::InvalidScale;
 
@@ -564,6 +699,17 @@ DisplayModule::SetScaleResult DisplayModule::SetDisplayScale(const std::string &
     }
     if (!target) return SetScaleResult::NotFound;
 
+    // 优先尝试 SetDPI.exe（即时生效，无需注销）
+    int monitorIndex = ExtractMonitorIndex(displayId);
+    if (CallSetDPI(scale, monitorIndex))
+    {
+        if (immediate) *immediate = true;
+        return SetScaleResult::Ok;
+    }
+
+    // 回退到注册表方式（需要注销生效）
+    if (immediate) *immediate = false;
+
     if (target->deviceId.empty())
     {
         Logger::Get().Error("DisplayModule: 显示器 deviceId 为空，无法设置 per-monitor 缩放");
@@ -571,7 +717,6 @@ DisplayModule::SetScaleResult DisplayModule::SetDisplayScale(const std::string &
     }
 
     // DeviceID 中的 '\' 替换为 '#' 作为注册表键名
-    // 例如 "MONITOR\SAM0F91\5&..." -> "MONITOR#SAM0F91#5&..."
     std::string regKey = target->deviceId;
     for (char &c : regKey)
     {
@@ -602,7 +747,7 @@ DisplayModule::SetScaleResult DisplayModule::SetDisplayScale(const std::string &
         return SetScaleResult::RegistryFailed;
     }
 
-    Logger::Get().Info("DisplayModule: 已设置缩放 ", displayId, " -> ", scale,
+    Logger::Get().Info("DisplayModule: 已设置缩放(注册表) ", displayId, " -> ", scale,
                        "% (DpiValue=", dpiValue, ", key=", regKey, ", 需注销生效)");
     return SetScaleResult::Ok;
 }
@@ -825,13 +970,14 @@ void DisplayModule::OnCommand(SidebandSession &session,
         }
         else
         {
-            SetScaleResult r = SetDisplayScale(displayId, scale);
+            bool immediate = false;
+            SetScaleResult r = SetDisplayScale(displayId, scale, &immediate);
             switch (r)
             {
             case SetScaleResult::Ok:
                 respJson = "{\"ok\":true,\"display_id\":\"" + EscapeJson(displayId) +
                            "\",\"scale\":" + std::to_string(scale) +
-                           ",\"requires_sign_out\":true}";
+                           ",\"requires_sign_out\":" + (immediate ? "false" : "true") + "}";
                 break;
             case SetScaleResult::NotFound:
                 respJson = R"({"ok":false,"error":"not_found"})";

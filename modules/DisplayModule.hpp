@@ -43,12 +43,12 @@
  *    - 返回 JSON: {ok, display_id, w, h, refresh} 或 {ok:false, error}
  *
  * 6. 设置缩放（CmdID=17）
- *    - 写注册表 HKCU\Control Panel\Desktop\PerMonitorSettings\<DeviceID>\DpiValue
- *    - 支持 per-monitor 独立缩放（不影响其他显示器）
- *    - DeviceID 取自 EnumDisplayDevicesW，将 '\' 替换为 '#' 作为注册表键名
- *    - DpiValue 枚举值：0=100%, 1=125%, 2=150%, 3=175%, 4=200%, 5=225%, 6=250%, 7=300%
- *    - 不立即生效，需要注销/登录
- *    - 返回 JSON: {ok, display_id, scale, requires_sign_out:true} 或 {ok:false, error}
+ *    - 优先调用 SetDPI.exe（即时生效，无需注销）
+ *      用法: SetDPI.exe <scale> <monitor_index>
+ *      例如: SetDPI.exe 150 2  设置第2个显示器为150%
+ *    - SetDPI.exe 不存在时回退到注册表方式（需注销生效）
+ *      写 HKCU\Control Panel\Desktop\PerMonitorSettings\<DeviceID>\DpiValue
+ *    - 返回 JSON: {ok, display_id, scale, requires_sign_out} 或 {ok:false, error}
  */
 class DisplayModule : public ISidebandModule
 {
@@ -152,7 +152,7 @@ private:
         InvalidScale,
         RegistryFailed
     };
-    SetScaleResult SetDisplayScale(const std::string &displayId, int scale);
+    SetScaleResult SetDisplayScale(const std::string &displayId, int scale, bool *immediate = nullptr);
 
     // 获取当前主显示器信息（不含完整列表）
     bool GetCurrentPrimary(DisplayInfo &out) const;
