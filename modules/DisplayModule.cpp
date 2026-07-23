@@ -188,94 +188,88 @@ void DisplayModule::OnClientConnected(SidebandSession &session)
 //                      枚举显示器
 // ============================================================
 
+// EnumDisplayMonitors 回调上下文
+struct EnumMonitorContext
+{
+    std::vector<DisplayModule::DisplayInfo> *result;
+};
+
+// EnumDisplayMonitors 回调：枚举当前桌面中所有可见的物理监视器
+static BOOL CALLBACK MonitorEnumProc(HMONITOR hMonitor, HDC hdc, LPRECT lprcMonitor, LPARAM dwData)
+{
+    auto *ctx = reinterpret_cast<EnumMonitorContext *>(dwData);
+
+    MONITORINFOEXW mi = {};
+    mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoW(hMonitor, &mi))
+        return TRUE;  // 继续枚举下一个
+
+    DisplayModule::DisplayInfo info;
+    info.id = WideToUtf8(mi.szDevice);       // "\\.\DISPLAY1"
+    info.isActive = true;                     // EnumDisplayMonitors 只返回活跃监视器
+    info.isPrimary = (mi.dwFlags & MONITORINFOF_PRIMARY) != 0;
+    info.x = mi.rcMonitor.left;
+    info.y = mi.rcMonitor.top;
+    info.width = mi.rcMonitor.right - mi.rcMonitor.left;
+    info.height = mi.rcMonitor.bottom - mi.rcMonitor.top;
+
+    // 获取分辨率/刷新率/色深
+    DEVMODEW dm = {};
+    dm.dmSize = sizeof(dm);
+    dm.dmDriverExtra = 0;
+    if (EnumDisplaySettingsExW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm, 0))
+    {
+        info.width = (int)dm.dmPelsWidth;
+        info.height = (int)dm.dmPelsHeight;
+        info.refreshRate = (int)dm.dmDisplayFrequency;
+        info.bitsPerPel = (int)dm.dmBitsPerPel;
+    }
+
+    // 获取监视器名称和 DeviceID（用于 PerMonitorSettings 注册表）
+    DISPLAY_DEVICEW monitor = {};
+    monitor.cb = sizeof(monitor);
+    if (EnumDisplayDevicesW(mi.szDevice, 0, &monitor, 0))
+    {
+        info.name = WideToUtf8(monitor.DeviceString);
+        info.deviceId = WideToUtf8(monitor.DeviceID);
+    }
+    if (info.name.empty())
+        info.name = "Display " + std::to_string(ctx->result->size() + 1);
+
+    // 获取适配器名称
+    DISPLAY_DEVICEW adapter = {};
+    adapter.cb = sizeof(adapter);
+    for (DWORD i = 0; EnumDisplayDevicesW(nullptr, i, &adapter, 0); ++i)
+    {
+        if (_wcsicmp(adapter.DeviceName, mi.szDevice) == 0)
+        {
+            info.adapterName = WideToUtf8(adapter.DeviceString);
+            break;
+        }
+    }
+
+    // 获取 DPI（缩放）
+    UINT dpiX = 96, dpiY = 96;
+    if (SUCCEEDED(GetDpiForMonitor(hMonitor, MDT_EFFECTIVE_DPI, &dpiX, &dpiY)))
+    {
+        info.scale = (int)((dpiX * 100 + 48) / 96);
+    }
+
+    Logger::Get().Debug("DisplayModule: 监视器 ", info.id,
+                        " ", info.width, "x", info.height, "@", info.refreshRate,
+                        " scale=", info.scale, "% primary=", info.isPrimary);
+
+    ctx->result->push_back(info);
+    return TRUE;
+}
+
 std::vector<DisplayModule::DisplayInfo> DisplayModule::EnumerateDisplays() const
 {
     std::vector<DisplayInfo> result;
+    EnumMonitorContext ctx{&result};
+    EnumDisplayMonitors(NULL, NULL, MonitorEnumProc, reinterpret_cast<LPARAM>(&ctx));
 
-    DISPLAY_DEVICEW adapter = {};
-    adapter.cb = sizeof(adapter);
-
-    for (DWORD i = 0; EnumDisplayDevicesW(nullptr, i, &adapter, 0); ++i)
-    {
-        // 设备名形如 L"\\\\.\\DISPLAY1"
-        std::string adapterId = WideToUtf8(adapter.DeviceName);
-        std::string adapterName = WideToUtf8(adapter.DeviceString);
-
-        // 枚举该适配器下的监视器
-        DISPLAY_DEVICEW monitor = {};
-        monitor.cb = sizeof(monitor);
-
-        // 状态标志判断
-        bool adapterActive = (adapter.StateFlags & DISPLAY_DEVICE_ACTIVE) != 0;
-        bool adapterAttached = (adapter.StateFlags & DISPLAY_DEVICE_ATTACHED) != 0;
-
-        // 获取当前显示模式
-        DEVMODEW dm = {};
-        dm.dmSize = sizeof(dm);
-        dm.dmDriverExtra = 0;
-        bool hasMode = EnumDisplaySettingsExW(adapter.DeviceName, ENUM_CURRENT_SETTINGS,
-                                              &dm, 0) != FALSE;
-
-        Logger::Get().Info("DisplayModule: 枚举 [", i, "] ", adapterId,
-                           " active=", adapterActive, " attached=", adapterAttached,
-                           " hasMode=", hasMode,
-                           " flags=0x", std::hex, adapter.StateFlags, std::dec);
-
-        DisplayInfo info;
-        info.id = adapterId;
-        info.adapterName = adapterName;
-        info.isActive = adapterActive && hasMode;
-
-        // 尝试获取监视器名称（先取友好名称，失败再取接口名）
-        bool gotMonitor = EnumDisplayDevicesW(adapter.DeviceName, 0, &monitor, 0) != FALSE;
-        if (!gotMonitor)
-        {
-            monitor = {};
-            monitor.cb = sizeof(monitor);
-            gotMonitor = EnumDisplayDevicesW(adapter.DeviceName, 0, &monitor,
-                                              EDD_GET_DEVICE_INTERFACE_NAME) != FALSE;
-        }
-        if (gotMonitor)
-        {
-            info.name = WideToUtf8(monitor.DeviceString);
-            info.deviceId = WideToUtf8(monitor.DeviceID);
-            if (info.name.empty())
-                info.name = WideToUtf8(monitor.DeviceName);
-        }
-        if (info.name.empty())
-            info.name = "Display " + std::to_string(i + 1);
-
-        if (hasMode)
-        {
-            info.x = dm.dmPosition.x;
-            info.y = dm.dmPosition.y;
-            info.width = (int)dm.dmPelsWidth;
-            info.height = (int)dm.dmPelsHeight;
-            info.refreshRate = (int)dm.dmDisplayFrequency;
-            info.bitsPerPel = (int)dm.dmBitsPerPel;
-            // 主显示器 = 位于桌面原点 (0,0)
-            info.isPrimary = (dm.dmPosition.x == 0 && dm.dmPosition.y == 0);
-        }
-
-        // 获取 DPI（缩放）
-        if (info.isActive)
-        {
-            POINT pt = {dm.dmPosition.x + info.width / 2,
-                        dm.dmPosition.y + info.height / 2};
-            HMONITOR hMon = MonitorFromPoint(pt, MONITOR_DEFAULTTONULL);
-            if (hMon)
-            {
-                UINT dpiX = 96, dpiY = 96;
-                if (SUCCEEDED(GetDpiForMonitor(hMon, MDT_EFFECTIVE_DPI, &dpiX, &dpiY)))
-                {
-                    info.scale = (int)((dpiX * 100 + 48) / 96);
-                }
-            }
-        }
-
-        if (info.isActive)
-            result.push_back(info);
-    }
+    Logger::Get().Debug("DisplayModule: 枚举到 ", result.size(), " 个活跃监视器");
     return result;
 }
 
