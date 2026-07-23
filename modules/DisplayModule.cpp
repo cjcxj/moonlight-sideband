@@ -191,18 +191,19 @@ void DisplayModule::OnClientConnected(SidebandSession &session)
 
 // 用 CCD API 构建 GDI 设备名 → 显示器友好名称 的映射
 // 例如 "\\.\DISPLAY1" → "Dell U2720Q"
+// 只查询活跃路径，避免映射到未启用的显示器
 static std::map<std::wstring, std::wstring> BuildFriendlyNameMap()
 {
     std::map<std::wstring, std::wstring> result;
 
     UINT32 numPaths = 0, numModes = 0;
-    if (GetDisplayConfigBufferSizes(QDC_ALL_PATHS, &numPaths, &numModes) != ERROR_SUCCESS)
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &numPaths, &numModes) != ERROR_SUCCESS)
         return result;
 
     std::vector<DISPLAYCONFIG_PATH_INFO> paths(numPaths);
     std::vector<DISPLAYCONFIG_MODE_INFO> modes(numModes);
 
-    if (QueryDisplayConfig(QDC_ALL_PATHS, &numPaths, paths.data(),
+    if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &numPaths, paths.data(),
                            &numModes, modes.data(), nullptr) != ERROR_SUCCESS)
         return result;
 
