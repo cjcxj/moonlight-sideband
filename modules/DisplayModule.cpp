@@ -71,7 +71,7 @@ std::string EscapeJson(const std::string &s)
     return out;
 }
 
-// 从 JSON 字符串中提取字符串字段值（简易解析，不处理转义）
+// 从 JSON 字符串中提取字符串字段值（支持转义反转义）
 std::string ParseJsonStringField(const std::string &json, const std::string &key)
 {
     std::string needle = "\"" + key + "\"";
@@ -81,9 +81,47 @@ std::string ParseJsonStringField(const std::string &json, const std::string &key
     if (colon == std::string::npos) return "";
     size_t q1 = json.find('"', colon + 1);
     if (q1 == std::string::npos) return "";
-    size_t q2 = json.find('"', q1 + 1);
-    if (q2 == std::string::npos) return "";
-    return json.substr(q1 + 1, q2 - q1 - 1);
+
+    // 查找未转义的结束引号
+    size_t q2 = q1 + 1;
+    while (q2 < json.size())
+    {
+        if (json[q2] == '\\' && q2 + 1 < json.size())
+            q2 += 2;  // 跳过转义序列
+        else if (json[q2] == '"')
+            break;
+        else
+            ++q2;
+    }
+    if (q2 >= json.size()) return "";
+
+    // 提取并反转义 JSON 转义序列
+    std::string raw = json.substr(q1 + 1, q2 - q1 - 1);
+    std::string result;
+    result.reserve(raw.size());
+    for (size_t i = 0; i < raw.size(); ++i)
+    {
+        if (raw[i] == '\\' && i + 1 < raw.size())
+        {
+            switch (raw[i + 1])
+            {
+            case '"': result += '"';  ++i; break;
+            case '\\': result += '\\'; ++i; break;
+            case '/': result += '/';  ++i; break;
+            case 'n': result += '\n'; ++i; break;
+            case 't': result += '\t'; ++i; break;
+            case 'r': result += '\r'; ++i; break;
+            case 'b': result += '\b'; ++i; break;
+            case 'f': result += '\f'; ++i; break;
+            default: result += raw[i]; break;  // 未知转义，保留原字符
+            }
+        }
+        else
+        {
+            result += raw[i];
+        }
+    }
+    return result;
 }
 
 // 从 JSON 字符串中提取整数字段值（简易解析）
@@ -169,6 +207,7 @@ std::vector<DisplayModule::DisplayInfo> DisplayModule::EnumerateDisplays() const
 
         // 状态标志判断
         bool adapterActive = (adapter.StateFlags & DISPLAY_DEVICE_ACTIVE) != 0;
+        bool adapterAttached = (adapter.StateFlags & DISPLAY_DEVICE_ATTACHED) != 0;
 
         // 获取当前显示模式
         DEVMODEW dm = {};
@@ -176,6 +215,11 @@ std::vector<DisplayModule::DisplayInfo> DisplayModule::EnumerateDisplays() const
         dm.dmDriverExtra = 0;
         bool hasMode = EnumDisplaySettingsExW(adapter.DeviceName, ENUM_CURRENT_SETTINGS,
                                               &dm, 0) != FALSE;
+
+        Logger::Get().Info("DisplayModule: 枚举 [", i, "] ", adapterId,
+                           " active=", adapterActive, " attached=", adapterAttached,
+                           " hasMode=", hasMode,
+                           " flags=0x", std::hex, adapter.StateFlags, std::dec);
 
         DisplayInfo info;
         info.id = adapterId;
@@ -658,20 +702,7 @@ void DisplayModule::OnCommand(SidebandSession &session,
                                payload ? payload_len : 0);
         Logger::Get().Info("DisplayModule: DISPLAY_SWITCH payload=", payloadStr);
 
-        // 简易 JSON 解析：找 "display_id" 字段
-        std::string displayId;
-        size_t key = payloadStr.find("\"display_id\"");
-        if (key != std::string::npos)
-        {
-            size_t colon = payloadStr.find(':', key);
-            if (colon != std::string::npos)
-            {
-                size_t q1 = payloadStr.find('"', colon + 1);
-                size_t q2 = payloadStr.find('"', q1 + 1);
-                if (q1 != std::string::npos && q2 != std::string::npos)
-                    displayId = payloadStr.substr(q1 + 1, q2 - q1 - 1);
-            }
-        }
+        std::string displayId = ParseJsonStringField(payloadStr, "display_id");
 
         std::string respJson;
         if (displayId.empty())
