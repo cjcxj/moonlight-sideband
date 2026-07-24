@@ -374,9 +374,10 @@ std::vector<DisplayModule::DisplayInfo> DisplayModule::EnumerateDisplays() const
             dedupKey = std::to_wstring(targetName.edidManufactureId) + L"_" +
                        std::to_wstring(targetName.edidProductCodeId);
         }
-        else if (targetName.monitorDevicePath[0] != L'\0')
+        else if (!friendlyName.empty() && friendlyName != L"Generic PnP Monitor")
         {
-            dedupKey = targetName.monitorDevicePath;
+            // EDID 不可用但有友好名称：用友好名称去重
+            dedupKey = friendlyName;
         }
         else
         {
@@ -429,7 +430,9 @@ std::vector<DisplayModule::DisplayInfo> DisplayModule::EnumerateDisplays() const
             info.height = (int)dm.dmPelsHeight;
             info.refreshRate = (int)dm.dmDisplayFrequency;
             info.bitsPerPel = (int)dm.dmBitsPerPel;
-            info.isPrimary = (dm.dmPosition.x == 0 && dm.dmPosition.y == 0);
+            // isPrimary 只对活跃显示器判断（未启用显示器可能也返回 (0,0)）
+            if (info.isActive)
+                info.isPrimary = (dm.dmPosition.x == 0 && dm.dmPosition.y == 0);
         }
         else if (EnumDisplaySettingsExW(gdiName.c_str(), ENUM_REGISTRY_SETTINGS, &dm, 0))
         {
@@ -443,6 +446,13 @@ std::vector<DisplayModule::DisplayInfo> DisplayModule::EnumerateDisplays() const
 
         // 用 CCD API 获取 DPI 缩放（对活跃和未启用的显示器都有效）
         info.scale = GetDpiScalingPercent(path.sourceInfo.adapterId, path.sourceInfo.id);
+
+        // 过滤掉未启用且没有真实友好名称的显示器（虚拟设备/无效路径）
+        if (!info.isActive && (info.name.empty() || info.name == "Generic PnP Monitor"))
+        {
+            Logger::Get().Debug("DisplayModule: 跳过虚拟设备 ", info.id, " name=", info.name);
+            continue;
+        }
 
         Logger::Get().Debug("DisplayModule: ", info.id, " active=", info.isActive,
                             " ", info.width, "x", info.height, "@", info.refreshRate,
