@@ -43,12 +43,10 @@
  *    - 返回 JSON: {ok, display_id, w, h, refresh} 或 {ok:false, error}
  *
  * 6. 设置缩放（CmdID=17）
- *    - 优先调用 SetDPI.exe（即时生效，无需注销）
- *      用法: SetDPI.exe <scale> <monitor_index>
- *      例如: SetDPI.exe 150 2  设置第2个显示器为150%
- *    - SetDPI.exe 不存在时回退到注册表方式（需注销生效）
- *      写 HKCU\Control Panel\Desktop\PerMonitorSettings\<DeviceID>\DpiValue
- *    - 返回 JSON: {ok, display_id, scale, requires_sign_out} 或 {ok:false, error}
+ *    - 使用 CCD API DisplayConfigSetDeviceInfo 即时生效（无需注销）
+ *    - 移植自 SetDPI 工具（github.com/imniko/SetDPI）
+ *    - 支持的缩放值：100,125,150,175,200,225,250,300,350,400,450,500
+ *    - 返回 JSON: {ok, display_id, scale, requires_sign_out:false} 或 {ok:false, error}
  */
 class DisplayModule : public ISidebandModule
 {

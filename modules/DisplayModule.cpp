@@ -152,6 +152,130 @@ int ParseJsonIntField(const std::string &json, const std::string &key)
 }
 
 // ============================================================
+//                      CCD DPI 缩放（移植自 SetDPI）
+// ============================================================
+
+// DPI 缩放值表（与 Windows 设置一致）
+static const UINT32 kDpiVals[] = { 100, 125, 150, 175, 200, 225, 250, 300, 350, 400, 450, 500 };
+
+// CCD 未公开的 DPI 查询/设置类型
+constexpr DISPLAYCONFIG_DEVICE_INFO_TYPE DISPLAYCONFIG_DEVICE_INFO_GET_DPI_SCALE =
+    (DISPLAYCONFIG_DEVICE_INFO_TYPE)(-3);
+constexpr DISPLAYCONFIG_DEVICE_INFO_TYPE DISPLAYCONFIG_DEVICE_INFO_SET_DPI_SCALE =
+    (DISPLAYCONFIG_DEVICE_INFO_TYPE)(-4);
+
+struct DISPLAYCONFIG_SOURCE_DPI_SCALE_GET
+{
+    DISPLAYCONFIG_DEVICE_INFO_HEADER header;
+    int32_t minScaleRel;   // 相对于推荐值的最小偏移
+    int32_t curScaleRel;   // 相对于推荐值的当前偏移
+    int32_t maxScaleRel;   // 相对于推荐值的最大偏移
+};
+
+struct DISPLAYCONFIG_SOURCE_DPI_SCALE_SET
+{
+    DISPLAYCONFIG_DEVICE_INFO_HEADER header;
+    int32_t scaleRel;      // 相对于推荐值的偏移
+};
+
+// 通过 GDI 设备名查找 CCD source 的 adapterId 和 sourceId
+static bool FindSourceByGdiName(const std::wstring &gdiName,
+                                LUID &outAdapterId, UINT32 &outSourceId)
+{
+    UINT32 numPaths = 0, numModes = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ALL_PATHS, &numPaths, &numModes) != ERROR_SUCCESS)
+        return false;
+
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths(numPaths);
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes(numModes);
+
+    if (QueryDisplayConfig(QDC_ALL_PATHS, &numPaths, paths.data(),
+                           &numModes, modes.data(), nullptr) != ERROR_SUCCESS)
+        return false;
+
+    for (const auto &path : paths)
+    {
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME srcName = {};
+        srcName.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+        srcName.header.size = sizeof(srcName);
+        srcName.header.adapterId = path.sourceInfo.adapterId;
+        srcName.header.id = path.sourceInfo.id;
+        if (DisplayConfigGetDeviceInfo(&srcName.header) != ERROR_SUCCESS)
+            continue;
+
+        if (_wcsicmp(srcName.viewGdiDeviceName, gdiName.c_str()) == 0)
+        {
+            outAdapterId = path.sourceInfo.adapterId;
+            outSourceId = path.sourceInfo.id;
+            return true;
+        }
+    }
+    return false;
+}
+
+// 获取当前 DPI 缩放百分比
+static int GetDpiScalingPercent(LUID adapterId, UINT32 sourceId)
+{
+    DISPLAYCONFIG_SOURCE_DPI_SCALE_GET req = {};
+    req.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_DPI_SCALE;
+    req.header.size = sizeof(req);
+    req.header.adapterId = adapterId;
+    req.header.id = sourceId;
+
+    if (DisplayConfigGetDeviceInfo(&req.header) != ERROR_SUCCESS)
+        return 100;
+
+    // 修正越界值
+    if (req.curScaleRel < req.minScaleRel) req.curScaleRel = req.minScaleRel;
+    if (req.curScaleRel > req.maxScaleRel) req.curScaleRel = req.maxScaleRel;
+
+    int32_t minAbs = abs((int)req.minScaleRel);
+    size_t idx = (size_t)(minAbs + req.curScaleRel);
+    if (idx < sizeof(kDpiVals) / sizeof(kDpiVals[0]))
+        return (int)kDpiVals[idx];
+
+    return 100;
+}
+
+// 设置 DPI 缩放（即时生效）
+static bool SetDpiScaling(LUID adapterId, UINT32 sourceId, int dpiPercent)
+{
+    // 获取当前 DPI 信息
+    DISPLAYCONFIG_SOURCE_DPI_SCALE_GET req = {};
+    req.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_DPI_SCALE;
+    req.header.size = sizeof(req);
+    req.header.adapterId = adapterId;
+    req.header.id = sourceId;
+
+    if (DisplayConfigGetDeviceInfo(&req.header) != ERROR_SUCCESS)
+        return false;
+
+    int32_t minAbs = abs((int)req.minScaleRel);
+
+    // 查找目标百分比和推荐百分比在表中的索引
+    int idxTarget = -1, idxRecommended = -1;
+    for (int i = 0; i < (int)(sizeof(kDpiVals) / sizeof(kDpiVals[0])); ++i)
+    {
+        if ((int)kDpiVals[i] == dpiPercent) idxTarget = i;
+        if (i == minAbs) idxRecommended = i;
+    }
+
+    if (idxTarget < 0 || idxRecommended < 0)
+        return false;
+
+    int32_t scaleRel = idxTarget - idxRecommended;
+
+    DISPLAYCONFIG_SOURCE_DPI_SCALE_SET setReq = {};
+    setReq.header.type = DISPLAYCONFIG_DEVICE_INFO_SET_DPI_SCALE;
+    setReq.header.size = sizeof(setReq);
+    setReq.header.adapterId = adapterId;
+    setReq.header.id = sourceId;
+    setReq.scaleRel = scaleRel;
+
+    return DisplayConfigSetDeviceInfo(&setReq.header) == ERROR_SUCCESS;
+}
+
+// ============================================================
 //                      DisplayModule
 // ============================================================
 
@@ -290,20 +414,8 @@ std::vector<DisplayModule::DisplayInfo> DisplayModule::EnumerateDisplays() const
             info.bitsPerPel = (int)dm.dmBitsPerPel;
         }
 
-        // 获取 DPI（缩放）——只对活跃显示器获取
-        if (info.isActive && info.width > 0 && info.height > 0)
-        {
-            POINT pt = {info.x + info.width / 2, info.y + info.height / 2};
-            HMONITOR hMon = MonitorFromPoint(pt, MONITOR_DEFAULTTONULL);
-            if (hMon)
-            {
-                UINT dpiX = 96, dpiY = 96;
-                if (SUCCEEDED(GetDpiForMonitor(hMon, MDT_EFFECTIVE_DPI, &dpiX, &dpiY)))
-                {
-                    info.scale = (int)((dpiX * 100 + 48) / 96);
-                }
-            }
-        }
+        // 用 CCD API 获取 DPI 缩放（对活跃和未启用的显示器都有效）
+        info.scale = GetDpiScalingPercent(path.sourceInfo.adapterId, path.sourceInfo.id);
 
         Logger::Get().Debug("DisplayModule: ", info.id, " active=", info.isActive,
                             " ", info.width, "x", info.height, "@", info.refreshRate,
@@ -556,166 +668,45 @@ DisplayModule::SetModeResult DisplayModule::SetDisplayMode(const std::string &di
 }
 
 // ============================================================
-//                      设置缩放
+//                      设置缩放（CCD API 即时生效）
 // ============================================================
 
-// scale 百分比 -> PerMonitorSettings 的 DpiValue 枚举值
-// 0=100%, 1=125%, 2=150%, 3=175%, 4=200%, 5=225%, 6=250%, 7=300%
-static int ScaleToDpiValue(int scale)
+// 校验缩放值是否在支持列表中
+static bool IsValidDpiScale(int scale)
 {
-    switch (scale)
+    for (auto v : kDpiVals)
     {
-    case 100: return 0;
-    case 125: return 1;
-    case 150: return 2;
-    case 175: return 3;
-    case 200: return 4;
-    case 225: return 5;
-    case 250: return 6;
-    case 300: return 7;
-    default:  return -1;
+        if ((int)v == scale) return true;
     }
-}
-
-// 从 "\\.\DISPLAY1" 提取显示器序号 1
-static int ExtractMonitorIndex(const std::string &displayId)
-{
-    size_t i = displayId.size();
-    while (i > 0 && displayId[i - 1] >= '0' && displayId[i - 1] <= '9')
-        --i;
-    if (i < displayId.size())
-        return std::atoi(displayId.c_str() + i);
-    return -1;
-}
-
-// 获取程序所在目录（含末尾 '\'）
-static std::wstring GetExeDir()
-{
-    wchar_t exePath[MAX_PATH] = {};
-    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
-    std::wstring path(exePath);
-    size_t pos = path.find_last_of(L'\\');
-    if (pos != std::wstring::npos)
-        return path.substr(0, pos + 1);
-    return L".\\";
-}
-
-// 调用 SetDPI.exe 设置缩放，返回 true 表示成功
-// 用法: SetDPI.exe <scale> <monitor_index>
-static bool CallSetDPI(int scale, int monitorIndex)
-{
-    std::wstring exeDir = GetExeDir();
-    std::wstring setDpiPath = exeDir + L"SetDPI.exe";
-
-    // 检测 SetDPI.exe 是否存在
-    if (GetFileAttributesW(setDpiPath.c_str()) == INVALID_FILE_ATTRIBUTES)
-    {
-        Logger::Get().Info("DisplayModule: SetDPI.exe 不存在于 ", WideToUtf8(exeDir),
-                           "，回退到注册表方式");
-        return false;
-    }
-
-    // 构造命令行: SetDPI.exe <scale> <monitorIndex>
-    std::wstring cmd = L"\"" + setDpiPath + L"\" " + std::to_wstring(scale);
-    if (monitorIndex > 0)
-        cmd += L" " + std::to_wstring(monitorIndex);
-
-    Logger::Get().Info("DisplayModule: 调用 ", WideToUtf8(cmd));
-
-    STARTUPINFOW si = {};
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
-    PROCESS_INFORMATION pi = {};
-
-    if (!CreateProcessW(nullptr, const_cast<LPWSTR>(cmd.c_str()),
-                        nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi))
-    {
-        Logger::Get().Error("DisplayModule: CreateProcess(SetDPI) 失败 code=", GetLastError());
-        return false;
-    }
-
-    WaitForSingleObject(pi.hProcess, 10000);  // 最多等 10 秒
-    DWORD exitCode = 1;
-    GetExitCodeProcess(pi.hProcess, &exitCode);
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
-
-    if (exitCode != 0)
-    {
-        Logger::Get().Error("DisplayModule: SetDPI.exe 退出码=", exitCode);
-        return false;
-    }
-
-    Logger::Get().Info("DisplayModule: SetDPI.exe 设置成功 scale=", scale, " monitor=", monitorIndex);
-    return true;
+    return false;
 }
 
 DisplayModule::SetScaleResult DisplayModule::SetDisplayScale(const std::string &displayId, int scale, bool *immediate)
 {
-    // 校验缩放值
-    int dpiValue = ScaleToDpiValue(scale);
-    if (dpiValue < 0) return SetScaleResult::InvalidScale;
+    if (!IsValidDpiScale(scale))
+        return SetScaleResult::InvalidScale;
 
-    auto displays = EnumerateDisplays();
-    const DisplayInfo *target = nullptr;
-    for (const auto &d : displays)
+    // 通过 GDI 设备名查找 CCD source
+    std::wstring devName(displayId.begin(), displayId.end());
+    LUID adapterId = {};
+    UINT32 sourceId = 0;
+    if (!FindSourceByGdiName(devName, adapterId, sourceId))
     {
-        if (d.id == displayId) { target = &d; break; }
+        Logger::Get().Error("DisplayModule: 找不到显示器 ", displayId, " 的 CCD source");
+        return SetScaleResult::NotFound;
     }
-    if (!target) return SetScaleResult::NotFound;
 
-    // 优先尝试 SetDPI.exe（即时生效，无需注销）
-    int monitorIndex = ExtractMonitorIndex(displayId);
-    if (CallSetDPI(scale, monitorIndex))
+    if (SetDpiScaling(adapterId, sourceId, scale))
     {
         if (immediate) *immediate = true;
+        Logger::Get().Info("DisplayModule: 已设置缩放 ", displayId, " -> ", scale,
+                           "% (CCD API, 即时生效)");
         return SetScaleResult::Ok;
     }
 
-    // 回退到注册表方式（需要注销生效）
+    Logger::Get().Error("DisplayModule: CCD API 设置缩放失败 ", displayId, " -> ", scale, "%");
     if (immediate) *immediate = false;
-
-    if (target->deviceId.empty())
-    {
-        Logger::Get().Error("DisplayModule: 显示器 deviceId 为空，无法设置 per-monitor 缩放");
-        return SetScaleResult::RegistryFailed;
-    }
-
-    // DeviceID 中的 '\' 替换为 '#' 作为注册表键名
-    std::string regKey = target->deviceId;
-    for (char &c : regKey)
-    {
-        if (c == '\\') c = '#';
-    }
-
-    std::wstring regPath = L"Control Panel\\Desktop\\PerMonitorSettings\\";
-    regPath += std::wstring(regKey.begin(), regKey.end());
-
-    HKEY hKey = nullptr;
-    DWORD disposition = 0;
-    LONG r = RegCreateKeyExW(HKEY_CURRENT_USER, regPath.c_str(),
-                             0, nullptr, 0, KEY_SET_VALUE, nullptr, &hKey, &disposition);
-    if (r != ERROR_SUCCESS)
-    {
-        Logger::Get().Error("DisplayModule: 打开/创建 PerMonitorSettings 注册表失败 code=", r,
-                            " path=", regKey);
-        return SetScaleResult::RegistryFailed;
-    }
-
-    DWORD val = (DWORD)dpiValue;
-    r = RegSetValueExW(hKey, L"DpiValue", 0, REG_DWORD,
-                       reinterpret_cast<const BYTE *>(&val), sizeof(val));
-    RegCloseKey(hKey);
-    if (r != ERROR_SUCCESS)
-    {
-        Logger::Get().Error("DisplayModule: 写入 DpiValue 失败 code=", r);
-        return SetScaleResult::RegistryFailed;
-    }
-
-    Logger::Get().Info("DisplayModule: 已设置缩放(注册表) ", displayId, " -> ", scale,
-                       "% (DpiValue=", dpiValue, ", key=", regKey, ", 需注销生效)");
-    return SetScaleResult::Ok;
+    return SetScaleResult::RegistryFailed;
 }
 
 // ============================================================
@@ -949,7 +940,7 @@ void DisplayModule::OnCommand(SidebandSession &session,
                 respJson = R"({"ok":false,"error":"not_found"})";
                 break;
             case SetScaleResult::InvalidScale:
-                respJson = R"({"ok":false,"error":"invalid_scale","msg":"allowed: 100,125,150,175,200,225,250,300"})";
+                respJson = R"({"ok":false,"error":"invalid_scale","msg":"allowed: 100,125,150,175,200,225,250,300,350,400,450,500"})";
                 break;
             case SetScaleResult::RegistryFailed:
                 respJson = R"({"ok":false,"error":"registry_failed"})";
