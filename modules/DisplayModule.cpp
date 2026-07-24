@@ -187,6 +187,9 @@ static bool FindSourceByGdiName(const std::wstring &gdiName,
     if (GetDisplayConfigBufferSizes(QDC_ALL_PATHS, &numPaths, &numModes) != ERROR_SUCCESS)
         return false;
 
+    if (numPaths > 256 || numModes > 1024)
+        return false;
+
     std::vector<DISPLAYCONFIG_PATH_INFO> paths(numPaths);
     std::vector<DISPLAYCONFIG_MODE_INFO> modes(numModes);
 
@@ -319,10 +322,30 @@ std::vector<DisplayModule::DisplayInfo> DisplayModule::EnumerateDisplays() const
 {
     std::vector<DisplayInfo> result;
 
+    // 用 EnumDisplayMonitors 获取真正在桌面中的显示器列表
+    std::set<std::wstring> desktopMonitors;
+    EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR hMon, HDC, LPRECT, LPARAM dwData) -> BOOL {
+        MONITORINFOEXW info = {};
+        info.cbSize = sizeof(info);
+        if (GetMonitorInfoW(hMon, &info))
+        {
+            auto *set = reinterpret_cast<std::set<std::wstring>*>(dwData);
+            set->insert(info.szDevice);
+        }
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&desktopMonitors));
+
     // 用 CCD API 获取所有显示路径（只返回实际存在的物理路径，不含虚拟设备）
     UINT32 numPaths = 0, numModes = 0;
     if (GetDisplayConfigBufferSizes(QDC_ALL_PATHS, &numPaths, &numModes) != ERROR_SUCCESS)
         return result;
+
+    // 防御性检查：避免异常大的缓冲区导致 "vector too long"
+    if (numPaths > 256 || numModes > 1024)
+    {
+        Logger::Get().Error("DisplayModule: CCD 缓冲区异常大 paths=", numPaths, " modes=", numModes);
+        return result;
+    }
 
     std::vector<DISPLAYCONFIG_PATH_INFO> paths(numPaths);
     std::vector<DISPLAYCONFIG_MODE_INFO> modes(numModes);
@@ -391,8 +414,9 @@ std::vector<DisplayModule::DisplayInfo> DisplayModule::EnumerateDisplays() const
         DisplayInfo info;
         info.id = WideToUtf8(gdiName);
         info.name = WideToUtf8(friendlyName);
-        // modeInfoIdx == INVALID 表示该 target 没有活跃模式（未启用）
-        info.isActive = (path.targetInfo.modeInfoIdx != DISPLAYCONFIG_PATH_MODE_IDX_INVALID);
+        // isActive 基于 EnumDisplayMonitors（真正在桌面中的显示器）
+        // CCD 的 modeInfoIdx 可能对未在桌面中的显示器也返回有效值
+        info.isActive = (desktopMonitors.count(gdiName) > 0);
 
         // 用 EnumDisplayDevicesW 获取适配器名称和监视器 DeviceID
         DISPLAY_DEVICEW adapter = {};
@@ -487,6 +511,9 @@ static bool IsInternalDisplay(const std::wstring &gdiName)
 {
     UINT32 numPaths = 0, numModes = 0;
     if (GetDisplayConfigBufferSizes(QDC_ALL_PATHS, &numPaths, &numModes) != ERROR_SUCCESS)
+        return false;
+
+    if (numPaths > 256 || numModes > 1024)
         return false;
 
     std::vector<DISPLAYCONFIG_PATH_INFO> paths(numPaths);
