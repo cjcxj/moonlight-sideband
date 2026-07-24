@@ -482,6 +482,39 @@ bool DisplayModule::GetCurrentPrimary(DisplayInfo &out) const
 //                      切换主显示器（单显示器模式）
 // ============================================================
 
+// 判断 GDI 设备名对应的显示器是否是内部显示器（笔记本屏幕）
+static bool IsInternalDisplay(const std::wstring &gdiName)
+{
+    UINT32 numPaths = 0, numModes = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ALL_PATHS, &numPaths, &numModes) != ERROR_SUCCESS)
+        return false;
+
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths(numPaths);
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes(numModes);
+
+    if (QueryDisplayConfig(QDC_ALL_PATHS, &numPaths, paths.data(),
+                           &numModes, modes.data(), nullptr) != ERROR_SUCCESS)
+        return false;
+
+    for (const auto &path : paths)
+    {
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME srcName = {};
+        srcName.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+        srcName.header.size = sizeof(srcName);
+        srcName.header.adapterId = path.sourceInfo.adapterId;
+        srcName.header.id = path.sourceInfo.id;
+        if (DisplayConfigGetDeviceInfo(&srcName.header) != ERROR_SUCCESS)
+            continue;
+
+        if (_wcsicmp(srcName.viewGdiDeviceName, gdiName.c_str()) == 0)
+        {
+            // DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL 表示内部显示器
+            return (path.targetInfo.outputTechnology == DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL);
+        }
+    }
+    return false;
+}
+
 DisplayModule::SwitchResult DisplayModule::SwitchPrimaryDisplay(const std::string &displayId)
 {
     auto displays = EnumerateDisplays();
@@ -496,24 +529,46 @@ DisplayModule::SwitchResult DisplayModule::SwitchPrimaryDisplay(const std::strin
     if (!target)
         return SwitchResult::NotFound;
 
-    if (target->isPrimary && target->isActive)
+    // 只有活跃显示器才能判断 already_primary
+    if (target->isActive && target->isPrimary)
         return SwitchResult::AlreadyPrimary;
-
-    Logger::Get().Info("DisplayModule: 切换到单显示器模式 ", displayId);
 
     std::wstring targetDevName(displayId.begin(), displayId.end());
 
-    // 策略：仅启用目标显示器，禁用其他所有显示器
-    // 1. 启用目标显示器，设为 (0,0) + CDS_SET_PRIMARY
-    // 2. 禁用其他显示器（dmPelsWidth=0, dmPelsHeight=0）
-    // 3. 应用所有更改
+    // 如果目标未启用，用 SetDisplayConfig 切换（Win+P 效果）
+    // ChangeDisplaySettingsExW 无法启用未激活的显示器
+    if (!target->isActive)
+    {
+        bool isInternal = IsInternalDisplay(targetDevName);
+        uint32_t flags = SDC_APPLY | SDC_NO_OPTIMIZATION;
+        if (isInternal)
+            flags |= SDC_TOPOLOGY_INTERNAL;
+        else
+            flags |= SDC_TOPOLOGY_EXTERNAL;
 
-    // 1. 启用目标显示器
+        LONG result = SetDisplayConfig(0, nullptr, 0, nullptr, flags);
+        if (result == ERROR_SUCCESS)
+        {
+            Logger::Get().Info("DisplayModule: SetDisplayConfig 切换到",
+                               (isInternal ? "内部" : "外部"), "显示器 ", displayId);
+            std::lock_guard<std::mutex> l(m_mutex);
+            m_lastPrimaryId.clear();
+            return SwitchResult::Ok;
+        }
+
+        Logger::Get().Error("DisplayModule: SetDisplayConfig 失败 code=", result,
+                            "，尝试 ChangeDisplaySettingsExW");
+        // 继续尝试 ChangeDisplaySettingsExW
+    }
+
+    // 目标已启用：用 ChangeDisplaySettingsExW 切换主显示器
+    Logger::Get().Info("DisplayModule: 切换主显示器 ", displayId);
+
+    // 1. 启用目标显示器，设为 (0,0) + CDS_SET_PRIMARY
     DEVMODEW targetDm = {};
     targetDm.dmSize = sizeof(targetDm);
     targetDm.dmDriverExtra = 0;
 
-    // 优先用当前模式，失败则用注册表模式（适用于从未启用状态切换）
     if (!EnumDisplaySettingsExW(targetDevName.c_str(), ENUM_CURRENT_SETTINGS, &targetDm, 0))
     {
         if (!EnumDisplaySettingsExW(targetDevName.c_str(), ENUM_REGISTRY_SETTINGS, &targetDm, 0))
@@ -547,11 +602,9 @@ DisplayModule::SwitchResult DisplayModule::SwitchPrimaryDisplay(const std::strin
         dm.dmSize = sizeof(dm);
         dm.dmDriverExtra = 0;
 
-        // 获取当前或注册表模式作为基础（保留分辨率信息，只改位置和状态）
         if (!EnumDisplaySettingsExW(devName.c_str(), ENUM_CURRENT_SETTINGS, &dm, 0))
             EnumDisplaySettingsExW(devName.c_str(), ENUM_REGISTRY_SETTINGS, &dm, 0);
 
-        // 设置为禁用状态：PelsWidth=0, PelsHeight=0
         dm.dmFields = DM_POSITION | DM_PELSWIDTH | DM_PELSHEIGHT;
         dm.dmPelsWidth = 0;
         dm.dmPelsHeight = 0;
@@ -572,12 +625,8 @@ DisplayModule::SwitchResult DisplayModule::SwitchPrimaryDisplay(const std::strin
 
     Logger::Get().Info("DisplayModule: 已切换到 ", displayId, " (其他显示器已禁用)");
 
-    // 强制刷新缓存，下次 MonitorLoop 会推送新状态
-    {
-        std::lock_guard<std::mutex> l(m_mutex);
-        m_lastPrimaryId.clear();
-    }
-
+    std::lock_guard<std::mutex> l(m_mutex);
+    m_lastPrimaryId.clear();
     return SwitchResult::Ok;
 }
 
