@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <map>
 #include <set>
+#include <algorithm>
 #include <cstring>
 
 #pragma comment(lib, "shcore.lib")  // GetDpiForMonitor
@@ -330,8 +331,15 @@ std::vector<DisplayModule::DisplayInfo> DisplayModule::EnumerateDisplays() const
                            &numModes, modes.data(), nullptr) != ERROR_SUCCESS)
         return result;
 
+    // 活跃路径排前面，确保去重时优先保留活跃路径
+    std::sort(paths.begin(), paths.end(), [](const DISPLAYCONFIG_PATH_INFO &a, const DISPLAYCONFIG_PATH_INFO &b) {
+        bool aActive = (a.targetInfo.modeInfoIdx != DISPLAYCONFIG_PATH_MODE_IDX_INVALID);
+        bool bActive = (b.targetInfo.modeInfoIdx != DISPLAYCONFIG_PATH_MODE_IDX_INVALID);
+        return aActive && !bActive;
+    });
+
     // 遍历 CCD 路径，提取显示器信息
-    std::set<std::wstring> seenDevices;  // 去重（同一 GDI 设备名只保留一个）
+    std::set<std::wstring> seenDevices;  // EDID 去重
     for (const auto &path : paths)
     {
         // 获取 source GDI 设备名（如 "\\.\DISPLAY1"）
@@ -344,11 +352,10 @@ std::vector<DisplayModule::DisplayInfo> DisplayModule::EnumerateDisplays() const
             continue;
 
         std::wstring gdiName = sourceName.viewGdiDeviceName;
-        if (gdiName.empty() || seenDevices.count(gdiName))
+        if (gdiName.empty())
             continue;
-        seenDevices.insert(gdiName);
 
-        // 获取 target 友好名称（如 "Dell U2720Q"）
+        // 获取 target 友好名称和 EDID 信息
         DISPLAYCONFIG_TARGET_DEVICE_NAME targetName = {};
         targetName.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
         targetName.header.size = sizeof(targetName);
@@ -359,6 +366,26 @@ std::vector<DisplayModule::DisplayInfo> DisplayModule::EnumerateDisplays() const
         {
             friendlyName = targetName.monitorFriendlyDeviceName;
         }
+
+        // 用 EDID 去重（同一物理显示器的不同接口路径 EDID 相同）
+        std::wstring dedupKey;
+        if (targetName.edidManufactureId != 0 || targetName.edidProductCodeId != 0)
+        {
+            dedupKey = std::to_wstring(targetName.edidManufactureId) + L"_" +
+                       std::to_wstring(targetName.edidProductCodeId);
+        }
+        else if (targetName.monitorDevicePath[0] != L'\0')
+        {
+            dedupKey = targetName.monitorDevicePath;
+        }
+        else
+        {
+            dedupKey = gdiName;  // 回退到 GDI 设备名
+        }
+
+        if (seenDevices.count(dedupKey))
+            continue;
+        seenDevices.insert(dedupKey);
 
         DisplayInfo info;
         info.id = WideToUtf8(gdiName);
