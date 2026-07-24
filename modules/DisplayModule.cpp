@@ -20,6 +20,7 @@
 #include <chrono>
 #include <cstdio>
 #include <map>
+#include <set>
 #include <cstring>
 
 #pragma comment(lib, "shcore.lib")  // GetDpiForMonitor
@@ -189,27 +190,27 @@ void DisplayModule::OnClientConnected(SidebandSession &session)
 //                      枚举显示器
 // ============================================================
 
-// 用 CCD API 构建 GDI 设备名 → 显示器友好名称 的映射
-// 例如 "\\.\DISPLAY1" → "Dell U2720Q"
-// 只查询活跃路径，避免映射到未启用的显示器
-static std::map<std::wstring, std::wstring> BuildFriendlyNameMap()
+std::vector<DisplayModule::DisplayInfo> DisplayModule::EnumerateDisplays() const
 {
-    std::map<std::wstring, std::wstring> result;
+    std::vector<DisplayInfo> result;
 
+    // 用 CCD API 获取所有显示路径（只返回实际存在的物理路径，不含虚拟设备）
     UINT32 numPaths = 0, numModes = 0;
-    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &numPaths, &numModes) != ERROR_SUCCESS)
+    if (GetDisplayConfigBufferSizes(QDC_ALL_PATHS, &numPaths, &numModes) != ERROR_SUCCESS)
         return result;
 
     std::vector<DISPLAYCONFIG_PATH_INFO> paths(numPaths);
     std::vector<DISPLAYCONFIG_MODE_INFO> modes(numModes);
 
-    if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &numPaths, paths.data(),
+    if (QueryDisplayConfig(QDC_ALL_PATHS, &numPaths, paths.data(),
                            &numModes, modes.data(), nullptr) != ERROR_SUCCESS)
         return result;
 
+    // 遍历 CCD 路径，提取显示器信息
+    std::set<std::wstring> seenDevices;  // 去重（同一 GDI 设备名只保留一个）
     for (const auto &path : paths)
     {
-        // 获取源设备名（GDI 设备名，如 "\\.\DISPLAY1"）
+        // 获取 source GDI 设备名（如 "\\.\DISPLAY1"）
         DISPLAYCONFIG_SOURCE_DEVICE_NAME sourceName = {};
         sourceName.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
         sourceName.header.size = sizeof(sourceName);
@@ -218,79 +219,58 @@ static std::map<std::wstring, std::wstring> BuildFriendlyNameMap()
         if (DisplayConfigGetDeviceInfo(&sourceName.header) != ERROR_SUCCESS)
             continue;
 
-        // 获取目标设备名（显示器友好名称，如 "Dell U2720Q"）
+        std::wstring gdiName = sourceName.viewGdiDeviceName;
+        if (gdiName.empty() || seenDevices.count(gdiName))
+            continue;
+        seenDevices.insert(gdiName);
+
+        // 获取 target 友好名称（如 "Dell U2720Q"）
         DISPLAYCONFIG_TARGET_DEVICE_NAME targetName = {};
         targetName.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
         targetName.header.size = sizeof(targetName);
         targetName.header.adapterId = path.targetInfo.adapterId;
         targetName.header.id = path.targetInfo.id;
-        if (DisplayConfigGetDeviceInfo(&targetName.header) != ERROR_SUCCESS)
-            continue;
-
-        if (targetName.monitorFriendlyDeviceName[0] != L'\0')
+        std::wstring friendlyName;
+        if (DisplayConfigGetDeviceInfo(&targetName.header) == ERROR_SUCCESS)
         {
-            result[sourceName.viewGdiDeviceName] = targetName.monitorFriendlyDeviceName;
+            friendlyName = targetName.monitorFriendlyDeviceName;
         }
-    }
-
-    return result;
-}
-
-std::vector<DisplayModule::DisplayInfo> DisplayModule::EnumerateDisplays() const
-{
-    std::vector<DisplayInfo> result;
-
-    // CCD API 友好名称映射（只含活跃路径）
-    auto nameMap = BuildFriendlyNameMap();
-
-    DISPLAY_DEVICEW adapter = {};
-    adapter.cb = sizeof(adapter);
-
-    for (DWORD i = 0; EnumDisplayDevicesW(nullptr, i, &adapter, 0); ++i)
-    {
-        std::string adapterId = WideToUtf8(adapter.DeviceName);
-
-        // 尝试获取监视器信息——只有物理连接了显示器的才显示
-        DISPLAY_DEVICEW monitor = {};
-        monitor.cb = sizeof(monitor);
-        bool gotMonitor = EnumDisplayDevicesW(adapter.DeviceName, 0, &monitor, 0) != FALSE;
-        if (!gotMonitor)
-        {
-            // 尝试获取设备接口名
-            monitor = {};
-            monitor.cb = sizeof(monitor);
-            gotMonitor = EnumDisplayDevicesW(adapter.DeviceName, 0, &monitor,
-                                             EDD_GET_DEVICE_INTERFACE_NAME) != FALSE;
-        }
-        if (!gotMonitor)
-            continue;  // 没有连接监视器，跳过
-
-        bool adapterActive = (adapter.StateFlags & DISPLAY_DEVICE_ACTIVE) != 0;
 
         DisplayInfo info;
-        info.id = adapterId;
-        info.adapterName = WideToUtf8(adapter.DeviceString);
-        info.isActive = adapterActive;
-        info.name = WideToUtf8(monitor.DeviceString);
-        info.deviceId = WideToUtf8(monitor.DeviceID);
+        info.id = WideToUtf8(gdiName);
+        info.name = WideToUtf8(friendlyName);
+        // modeInfoIdx == INVALID 表示该 target 没有活跃模式（未启用）
+        info.isActive = (path.targetInfo.modeInfoIdx != DISPLAYCONFIG_PATH_MODE_IDX_INVALID);
 
-        // CCD 友好名称优先（如 "Dell U2720Q"），仅对活跃显示器有效
-        auto it = nameMap.find(adapter.DeviceName);
-        if (it != nameMap.end() && it->second[0] != L'\0')
+        // 用 EnumDisplayDevicesW 获取适配器名称和监视器 DeviceID
+        DISPLAY_DEVICEW adapter = {};
+        adapter.cb = sizeof(adapter);
+        for (DWORD i = 0; EnumDisplayDevicesW(nullptr, i, &adapter, 0); ++i)
         {
-            std::string friendly = WideToUtf8(it->second);
-            if (!friendly.empty())
-                info.name = friendly;
+            if (_wcsicmp(adapter.DeviceName, gdiName.c_str()) == 0)
+            {
+                info.adapterName = WideToUtf8(adapter.DeviceString);
+                break;
+            }
+        }
+
+        DISPLAY_DEVICEW monitor = {};
+        monitor.cb = sizeof(monitor);
+        if (EnumDisplayDevicesW(gdiName.c_str(), 0, &monitor, 0))
+        {
+            info.deviceId = WideToUtf8(monitor.DeviceID);
+            if (info.name.empty())
+                info.name = WideToUtf8(monitor.DeviceString);
         }
 
         if (info.name.empty())
             info.name = "Display " + std::to_string(result.size() + 1);
 
-        // 获取当前显示模式
+        // 获取分辨率/刷新率
         DEVMODEW dm = {};
         dm.dmSize = sizeof(dm);
         dm.dmDriverExtra = 0;
-        if (EnumDisplaySettingsExW(adapter.DeviceName, ENUM_CURRENT_SETTINGS, &dm, 0))
+        if (EnumDisplaySettingsExW(gdiName.c_str(), ENUM_CURRENT_SETTINGS, &dm, 0))
         {
             info.x = dm.dmPosition.x;
             info.y = dm.dmPosition.y;
@@ -300,18 +280,14 @@ std::vector<DisplayModule::DisplayInfo> DisplayModule::EnumerateDisplays() const
             info.bitsPerPel = (int)dm.dmBitsPerPel;
             info.isPrimary = (dm.dmPosition.x == 0 && dm.dmPosition.y == 0);
         }
-        else
+        else if (EnumDisplaySettingsExW(gdiName.c_str(), ENUM_REGISTRY_SETTINGS, &dm, 0))
         {
-            // 未启用显示器：尝试从注册表获取上次保存的模式
-            if (EnumDisplaySettingsExW(adapter.DeviceName, ENUM_REGISTRY_SETTINGS, &dm, 0))
-            {
-                info.x = dm.dmPosition.x;
-                info.y = dm.dmPosition.y;
-                info.width = (int)dm.dmPelsWidth;
-                info.height = (int)dm.dmPelsHeight;
-                info.refreshRate = (int)dm.dmDisplayFrequency;
-                info.bitsPerPel = (int)dm.dmBitsPerPel;
-            }
+            info.x = dm.dmPosition.x;
+            info.y = dm.dmPosition.y;
+            info.width = (int)dm.dmPelsWidth;
+            info.height = (int)dm.dmPelsHeight;
+            info.refreshRate = (int)dm.dmDisplayFrequency;
+            info.bitsPerPel = (int)dm.dmBitsPerPel;
         }
 
         // 获取 DPI（缩放）——只对活跃显示器获取
