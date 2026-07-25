@@ -322,18 +322,23 @@ std::vector<DisplayModule::DisplayInfo> DisplayModule::EnumerateDisplays() const
 {
     std::vector<DisplayInfo> result;
 
-    // 用 EnumDisplayMonitors 获取真正在桌面中的显示器列表
-    std::set<std::wstring> desktopMonitors;
+    // 用 EnumDisplayMonitors 获取真正在桌面中的显示器列表 + 主显示器
+    struct DesktopMonitorsData {
+        std::set<std::wstring> activeMonitors;
+        std::wstring primaryMonitor;
+    } dmData;
     EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR hMon, HDC, LPRECT, LPARAM dwData) -> BOOL {
         MONITORINFOEXW info = {};
         info.cbSize = sizeof(info);
         if (GetMonitorInfoW(hMon, &info))
         {
-            auto *set = reinterpret_cast<std::set<std::wstring>*>(dwData);
-            set->insert(info.szDevice);
+            auto *data = reinterpret_cast<DesktopMonitorsData*>(dwData);
+            data->activeMonitors.insert(info.szDevice);
+            if (info.dwFlags & MONITORINFOF_PRIMARY)
+                data->primaryMonitor = info.szDevice;
         }
         return TRUE;
-    }, reinterpret_cast<LPARAM>(&desktopMonitors));
+    }, reinterpret_cast<LPARAM>(&dmData));
 
     // 用 CCD API 获取所有显示路径（只返回实际存在的物理路径，不含虚拟设备）
     UINT32 numPaths = 0, numModes = 0;
@@ -415,8 +420,7 @@ std::vector<DisplayModule::DisplayInfo> DisplayModule::EnumerateDisplays() const
         info.id = WideToUtf8(gdiName);
         info.name = WideToUtf8(friendlyName);
         // isActive 基于 EnumDisplayMonitors（真正在桌面中的显示器）
-        // CCD 的 modeInfoIdx 可能对未在桌面中的显示器也返回有效值
-        info.isActive = (desktopMonitors.count(gdiName) > 0);
+        info.isActive = (dmData.activeMonitors.count(gdiName) > 0);
 
         // 用 EnumDisplayDevicesW 获取适配器名称和监视器 DeviceID
         DISPLAY_DEVICEW adapter = {};
@@ -454,9 +458,9 @@ std::vector<DisplayModule::DisplayInfo> DisplayModule::EnumerateDisplays() const
             info.height = (int)dm.dmPelsHeight;
             info.refreshRate = (int)dm.dmDisplayFrequency;
             info.bitsPerPel = (int)dm.dmBitsPerPel;
-            // isPrimary 只对活跃显示器判断（未启用显示器可能也返回 (0,0)）
+            // isPrimary 基于 MONITORINFOF_PRIMARY 标志（镜像模式下多个显示器位置都是 (0,0)）
             if (info.isActive)
-                info.isPrimary = (dm.dmPosition.x == 0 && dm.dmPosition.y == 0);
+                info.isPrimary = (dmData.primaryMonitor == gdiName);
         }
         else if (EnumDisplaySettingsExW(gdiName.c_str(), ENUM_REGISTRY_SETTINGS, &dm, 0))
         {
