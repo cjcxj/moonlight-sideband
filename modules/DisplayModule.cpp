@@ -340,6 +340,11 @@ std::vector<DisplayModule::DisplayInfo> DisplayModule::EnumerateDisplays() const
         return TRUE;
     }, reinterpret_cast<LPARAM>(&dmData));
 
+    Logger::Get().Info("DisplayModule: 桌面显示器 count=", dmData.activeMonitors.size(),
+                       " 主显示器=", WideToUtf8(dmData.primaryMonitor));
+    for (const auto &m : dmData.activeMonitors)
+        Logger::Get().Info("DisplayModule:   桌面: ", WideToUtf8(m));
+
     // 用 CCD API 获取所有显示路径（只返回实际存在的物理路径，不含虚拟设备）
     UINT32 numPaths = 0, numModes = 0;
     if (GetDisplayConfigBufferSizes(QDC_ALL_PATHS, &numPaths, &numModes) != ERROR_SUCCESS)
@@ -482,9 +487,10 @@ std::vector<DisplayModule::DisplayInfo> DisplayModule::EnumerateDisplays() const
             continue;
         }
 
-        Logger::Get().Debug("DisplayModule: ", info.id, " active=", info.isActive,
-                            " ", info.width, "x", info.height, "@", info.refreshRate,
-                            " name=", info.name);
+        Logger::Get().Info("DisplayModule: 枚举 ", info.id, " active=", info.isActive,
+                           " primary=", info.isPrimary,
+                           " ", info.width, "x", info.height, "@", info.refreshRate,
+                           " name=", info.name);
 
         result.push_back(info);
     }
