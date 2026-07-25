@@ -152,6 +152,28 @@ int ParseJsonIntField(const std::string &json, const std::string &key)
     return negative ? -value : value;
 }
 
+// 从 displayId 解析 GDI 设备名（去掉 #targetId 后缀）
+// displayId 格式: "\\.\DISPLAY1#12345" → "\\.\DISPLAY1"
+static std::string ParseGdiName(const std::string &displayId)
+{
+    size_t hashPos = displayId.find('#');
+    if (hashPos != std::string::npos)
+        return displayId.substr(0, hashPos);
+    return displayId;
+}
+
+// 从 displayId 解析 targetId
+static uint32_t ParseTargetId(const std::string &displayId)
+{
+    size_t hashPos = displayId.find('#');
+    if (hashPos != std::string::npos)
+    {
+        try { return (uint32_t)std::stoull(displayId.substr(hashPos + 1)); }
+        catch (...) { return 0xFFFFFFFF; }
+    }
+    return 0xFFFFFFFF;
+}
+
 // ============================================================
 //                      CCD DPI 缩放（移植自 SetDPI）
 // ============================================================
@@ -434,7 +456,9 @@ std::vector<DisplayModule::DisplayInfo> DisplayModule::EnumerateDisplays() const
         seenDevices.insert(dedupKey);
 
         DisplayInfo info;
-        info.id = WideToUtf8(gdiName);
+        // id 格式: gdiName#targetId（唯一标识每个 target）
+        // 同一 GDI 设备名可能有多个 target（如 HDMI1/HDMI2/DP）
+        info.id = WideToUtf8(gdiName) + "#" + std::to_string(path.targetInfo.id);
         info.name = WideToUtf8(friendlyName);
         // isActive 基于 QDC_ONLY_ACTIVE_PATHS（该 target 是否在桌面中）
         info.isActive = activeTargets.count({adapterKey, path.targetInfo.id}) > 0;
@@ -528,8 +552,8 @@ bool DisplayModule::GetCurrentPrimary(DisplayInfo &out) const
 //                      切换主显示器（单显示器模式）
 // ============================================================
 
-// 查找 GDI 设备名匹配且未活跃的 target，返回其是否为内部显示器
-static bool FindInactiveTargetIsInternal(const std::wstring &gdiName)
+// 查找 GDI 设备名 + targetId 匹配且未活跃的 target，返回其是否为内部显示器
+static bool FindInactiveTargetIsInternal(const std::wstring &gdiName, uint32_t targetId)
 {
     auto makeAdapterKey = [](const LUID &luid) -> uint64_t {
         return ((uint64_t)luid.HighPart << 32) | (uint64_t)luid.LowPart;
@@ -567,6 +591,10 @@ static bool FindInactiveTargetIsInternal(const std::wstring &gdiName)
 
     for (const auto &path : paths)
     {
+        // 先匹配 targetId（快速过滤）
+        if (path.targetInfo.id != targetId)
+            continue;
+
         DISPLAYCONFIG_SOURCE_DEVICE_NAME srcName = {};
         srcName.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
         srcName.header.size = sizeof(srcName);
@@ -613,13 +641,15 @@ DisplayModule::SwitchResult DisplayModule::SwitchPrimaryDisplay(const std::strin
     if (target->isActive && target->isPrimary)
         return SwitchResult::AlreadyPrimary;
 
-    std::wstring targetDevName(displayId.begin(), displayId.end());
+    std::string gdiNameStr = ParseGdiName(displayId);
+    uint32_t targetId = ParseTargetId(displayId);
+    std::wstring targetDevName(gdiNameStr.begin(), gdiNameStr.end());
 
     // 如果目标未启用，用 SetDisplayConfig 切换（Win+P 效果）
     // ChangeDisplaySettingsExW 无法启用未激活的显示器
     if (!target->isActive)
     {
-        bool isInternal = FindInactiveTargetIsInternal(targetDevName);
+        bool isInternal = FindInactiveTargetIsInternal(targetDevName, targetId);
         uint32_t flags = SDC_APPLY | SDC_NO_OPTIMIZATION;
         if (isInternal)
             flags |= SDC_TOPOLOGY_INTERNAL;
@@ -717,7 +747,8 @@ DisplayModule::SwitchResult DisplayModule::SwitchPrimaryDisplay(const std::strin
 std::vector<DisplayModule::DisplayMode> DisplayModule::EnumerateModes(const std::string &displayId) const
 {
     std::vector<DisplayMode> result;
-    std::wstring devName(displayId.begin(), displayId.end());
+    std::string gdiNameStr = ParseGdiName(displayId);
+    std::wstring devName(gdiNameStr.begin(), gdiNameStr.end());
 
     DEVMODEW dm = {};
     dm.dmSize = sizeof(dm);
@@ -798,7 +829,8 @@ DisplayModule::SetModeResult DisplayModule::SetDisplayMode(const std::string &di
         return SetModeResult::ModeNotFound;
     }
 
-    std::wstring devName(displayId.begin(), displayId.end());
+    std::string gdiNameStr = ParseGdiName(displayId);
+    std::wstring devName(gdiNameStr.begin(), gdiNameStr.end());
     DEVMODEW dm = {};
     dm.dmSize = sizeof(dm);
     dm.dmDriverExtra = 0;
@@ -853,7 +885,8 @@ DisplayModule::SetScaleResult DisplayModule::SetDisplayScale(const std::string &
         return SetScaleResult::InvalidScale;
 
     // 通过 GDI 设备名查找 CCD source
-    std::wstring devName(displayId.begin(), displayId.end());
+    std::string gdiNameStr = ParseGdiName(displayId);
+    std::wstring devName(gdiNameStr.begin(), gdiNameStr.end());
     LUID adapterId = {};
     UINT32 sourceId = 0;
     if (!FindSourceByGdiName(devName, adapterId, sourceId))
