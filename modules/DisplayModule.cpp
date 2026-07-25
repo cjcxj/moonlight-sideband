@@ -345,6 +345,29 @@ std::vector<DisplayModule::DisplayInfo> DisplayModule::EnumerateDisplays() const
     for (const auto &m : dmData.activeMonitors)
         Logger::Get().Info("DisplayModule:   桌面: ", WideToUtf8(m));
 
+    // 获取活跃路径的 target 集合（QDC_ONLY_ACTIVE_PATHS 只返回桌面中的路径）
+    auto makeAdapterKey = [](const LUID &luid) -> uint64_t {
+        return ((uint64_t)luid.HighPart << 32) | (uint64_t)luid.LowPart;
+    };
+    std::set<std::pair<uint64_t, uint32_t>> activeTargets;
+    {
+        UINT32 numActivePaths = 0, numActiveModes = 0;
+        if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &numActivePaths, &numActiveModes) == ERROR_SUCCESS &&
+            numActivePaths <= 256 && numActiveModes <= 1024)
+        {
+            std::vector<DISPLAYCONFIG_PATH_INFO> activePaths(numActivePaths);
+            std::vector<DISPLAYCONFIG_MODE_INFO> activeModes(numActiveModes);
+            if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &numActivePaths, activePaths.data(),
+                                   &numActiveModes, activeModes.data(), nullptr) == ERROR_SUCCESS)
+            {
+                for (const auto &ap : activePaths)
+                {
+                    activeTargets.insert({makeAdapterKey(ap.targetInfo.adapterId), ap.targetInfo.id});
+                }
+            }
+        }
+    }
+
     // 用 CCD API 获取所有显示路径（只返回实际存在的物理路径，不含虚拟设备）
     UINT32 numPaths = 0, numModes = 0;
     if (GetDisplayConfigBufferSizes(QDC_ALL_PATHS, &numPaths, &numModes) != ERROR_SUCCESS)
@@ -400,22 +423,11 @@ std::vector<DisplayModule::DisplayInfo> DisplayModule::EnumerateDisplays() const
             friendlyName = targetName.monitorFriendlyDeviceName;
         }
 
-        // 用 EDID 去重（同一物理显示器的不同接口路径 EDID 相同）
-        std::wstring dedupKey;
-        if (targetName.edidManufactureId != 0 || targetName.edidProductCodeId != 0)
-        {
-            dedupKey = std::to_wstring(targetName.edidManufactureId) + L"_" +
-                       std::to_wstring(targetName.edidProductCodeId);
-        }
-        else if (!friendlyName.empty() && friendlyName != L"Generic PnP Monitor")
-        {
-            // EDID 不可用但有友好名称：用友好名称去重
-            dedupKey = friendlyName;
-        }
-        else
-        {
-            dedupKey = gdiName;  // 回退到 GDI 设备名
-        }
+        // 按 target 的 adapterId+id 去重（每个物理接口是唯一的）
+        // 同一 GDI 设备名可能有多个 target（如 HDMI1/HDMI2/DP），但它们是不同的物理接口
+        uint64_t adapterKey = makeAdapterKey(path.targetInfo.adapterId);
+        std::wstring dedupKey = std::to_wstring(adapterKey) + L"_" +
+                                std::to_wstring(path.targetInfo.id);
 
         if (seenDevices.count(dedupKey))
             continue;
@@ -424,8 +436,8 @@ std::vector<DisplayModule::DisplayInfo> DisplayModule::EnumerateDisplays() const
         DisplayInfo info;
         info.id = WideToUtf8(gdiName);
         info.name = WideToUtf8(friendlyName);
-        // isActive 基于 EnumDisplayMonitors（真正在桌面中的显示器）
-        info.isActive = (dmData.activeMonitors.count(gdiName) > 0);
+        // isActive 基于 QDC_ONLY_ACTIVE_PATHS（该 target 是否在桌面中）
+        info.isActive = activeTargets.count({adapterKey, path.targetInfo.id}) > 0;
 
         // 用 EnumDisplayDevicesW 获取适配器名称和监视器 DeviceID
         DISPLAY_DEVICEW adapter = {};
@@ -516,9 +528,29 @@ bool DisplayModule::GetCurrentPrimary(DisplayInfo &out) const
 //                      切换主显示器（单显示器模式）
 // ============================================================
 
-// 判断 GDI 设备名对应的显示器是否是内部显示器（笔记本屏幕）
-static bool IsInternalDisplay(const std::wstring &gdiName)
+// 查找 GDI 设备名匹配且未活跃的 target，返回其是否为内部显示器
+static bool FindInactiveTargetIsInternal(const std::wstring &gdiName)
 {
+    auto makeAdapterKey = [](const LUID &luid) -> uint64_t {
+        return ((uint64_t)luid.HighPart << 32) | (uint64_t)luid.LowPart;
+    };
+
+    // 获取活跃 target 集合
+    std::set<std::pair<uint64_t, uint32_t>> activeTargets;
+    UINT32 numAP = 0, numAM = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &numAP, &numAM) == ERROR_SUCCESS &&
+        numAP <= 256 && numAM <= 1024)
+    {
+        std::vector<DISPLAYCONFIG_PATH_INFO> ap(numAP);
+        std::vector<DISPLAYCONFIG_MODE_INFO> am(numAM);
+        if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &numAP, ap.data(),
+                               &numAM, am.data(), nullptr) == ERROR_SUCCESS)
+        {
+            for (const auto &p : ap)
+                activeTargets.insert({makeAdapterKey(p.targetInfo.adapterId), p.targetInfo.id});
+        }
+    }
+
     UINT32 numPaths = 0, numModes = 0;
     if (GetDisplayConfigBufferSizes(QDC_ALL_PATHS, &numPaths, &numModes) != ERROR_SUCCESS)
         return false;
@@ -543,10 +575,17 @@ static bool IsInternalDisplay(const std::wstring &gdiName)
         if (DisplayConfigGetDeviceInfo(&srcName.header) != ERROR_SUCCESS)
             continue;
 
-        if (_wcsicmp(srcName.viewGdiDeviceName, gdiName.c_str()) == 0)
+        if (_wcsicmp(srcName.viewGdiDeviceName, gdiName.c_str()) != 0)
+            continue;
+
+        uint64_t aKey = makeAdapterKey(path.targetInfo.adapterId);
+        bool isActive = activeTargets.count({aKey, path.targetInfo.id}) > 0;
+        if (!isActive)
         {
-            // DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL 表示内部显示器
-            return (path.targetInfo.outputTechnology == DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL);
+            bool isInternal = (path.targetInfo.outputTechnology == DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL);
+            Logger::Get().Info("DisplayModule: 找到未活跃 target isInternal=", isInternal,
+                               " outputTech=", (int)path.targetInfo.outputTechnology);
+            return isInternal;
         }
     }
     return false;
@@ -576,7 +615,7 @@ DisplayModule::SwitchResult DisplayModule::SwitchPrimaryDisplay(const std::strin
     // ChangeDisplaySettingsExW 无法启用未激活的显示器
     if (!target->isActive)
     {
-        bool isInternal = IsInternalDisplay(targetDevName);
+        bool isInternal = FindInactiveTargetIsInternal(targetDevName);
         uint32_t flags = SDC_APPLY | SDC_NO_OPTIMIZATION;
         if (isInternal)
             flags |= SDC_TOPOLOGY_INTERNAL;
