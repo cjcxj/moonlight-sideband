@@ -605,6 +605,10 @@ DisplayModule::SwitchResult DisplayModule::SwitchPrimaryDisplay(const std::strin
     if (!target)
         return SwitchResult::NotFound;
 
+    Logger::Get().Info("DisplayModule: 切换目标 ", displayId,
+                       " active=", target->isActive, " primary=", target->isPrimary,
+                       " name=", target->name);
+
     // 只有活跃显示器才能判断 already_primary
     if (target->isActive && target->isPrimary)
         return SwitchResult::AlreadyPrimary;
