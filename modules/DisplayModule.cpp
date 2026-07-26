@@ -258,6 +258,21 @@ bool DisplayModule::CommandRequiresAuth(uint32_t cmd_id) const
     }
 }
 
+uint32_t DisplayModule::ResponseCommandFor(uint32_t cmd_id) const
+{
+    using namespace SidebandProtocol;
+    // 与 OnCommand 里各分支实际用来回包的 cmd 保持一致
+    switch (cmd_id)
+    {
+    case Cmd::DISPLAY_LIST_REQ:      return Cmd::DISPLAY_LIST_RESP;       // 10 -> 11
+    case Cmd::DISPLAY_SWITCH:        return Cmd::DISPLAY_CURRENT;         // 12 -> 13
+    case Cmd::DISPLAY_MODE_LIST_REQ: return Cmd::DISPLAY_MODE_LIST_RESP;  // 14 -> 15
+    case Cmd::DISPLAY_MODE_SET:      return Cmd::DISPLAY_CURRENT;         // 16 -> 13
+    case Cmd::DISPLAY_SCALE_SET:     return Cmd::DISPLAY_SCALE_SET;       // 17 -> 17（同 ID 回复）
+    default:                         return 0;
+    }
+}
+
 void DisplayModule::RequestPush()
 {
     m_forcePush.store(true);

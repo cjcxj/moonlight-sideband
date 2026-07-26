@@ -104,6 +104,9 @@ public:
     // 切换显示器 / 设置分辨率 / 设置缩放。只读查询不需要。
     bool CommandRequiresAuth(uint32_t cmd_id) const override;
 
+    // 各请求指令对应的响应指令（供服务器在鉴权失败时回一条客户端能配对的响应）
+    uint32_t ResponseCommandFor(uint32_t cmd_id) const override;
+
     // 收到 WM_DISPLAYCHANGE（UI 线程）——只唤醒工作线程，不在此枚举
     void OnDisplayChanged() override;
 

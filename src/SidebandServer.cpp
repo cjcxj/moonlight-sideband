@@ -368,10 +368,18 @@ void SidebandServer::DispatchCommand(SidebandSession &session,
     {
         Logger::Get().Error("SidebandServer: 未认证的客户端尝试执行 cmd=", cmd_id,
                             " 来自 ", session.PeerAddress());
+
+        // 用该请求本该收到的响应 cmd 回复，这样客户端按 reqId 挂起的请求能立即
+        // 配对到一条 ok:false 的失败，而不是一直等到超时才报个笼统错误。
+        // 模块没有声明固定响应 cmd 时才退回 AUTH_RESP。
+        uint32_t respCmd = handler->ResponseCommandFor(cmd_id);
+        if (respCmd == 0)
+            respCmd = Cmd::AUTH_RESP;
+
         std::string resp = R"({"ok":false,"error":"unauthorized","cmd":)" +
                            std::to_string(cmd_id) + "}";
         std::vector<uint8_t> p(resp.begin(), resp.end());
-        session.SendCommand(Cmd::AUTH_RESP, req_id, p);
+        session.SendCommand(respCmd, req_id, p);
         return;
     }
 

@@ -45,6 +45,17 @@ public:
     // 这样老客户端（只收光标、不发指令）完全不受认证影响。
     virtual bool CommandRequiresAuth(uint32_t /*cmd_id*/) const { return false; }
 
+    // 该请求指令对应的响应指令 ID。
+    //
+    // 用途：鉴权失败时服务器需要替模块回一条错误响应。如果统一回 AUTH_RESP，
+    // 客户端那边按「reqId + 期望响应 cmd」配对的挂起请求就对不上号，只能干等到
+    // 超时，用户看到的是笼统的"请求超时"而不是"未授权"。
+    // 让模块声明"这条请求本该用哪个 cmd 回"，拒绝响应就能被正确配对，
+    // 连未升级的老客户端也会立刻弹出可读的错误。
+    //
+    // 返回 0 表示没有固定响应指令，此时服务器回 AUTH_RESP。
+    virtual uint32_t ResponseCommandFor(uint32_t /*cmd_id*/) const { return 0; }
+
     // === 回调 ===
 
     // 客户端连接/断开。注意：由 SidebandServer 在**未持有客户端列表锁**时调用，
