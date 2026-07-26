@@ -994,6 +994,26 @@ DisplayModule::SetScaleResult DisplayModule::SetDisplayScale(const std::string &
     if (!IsValidDpiScale(scale))
         return SetScaleResult::InvalidScale;
 
+    // 未启用的显示器不允许改缩放。
+    // 之前没有这道检查：CCD target 查找会成功（QDC_ALL_PATHS 里也包含未激活路径），
+    // 但随后的私有 DPI 接口对不在桌面中的 target 会失败，于是返回 registry_failed ——
+    // 一个和真实原因毫无关系的错误码。这里提前判定，与 SetDisplayMode 保持一致。
+    {
+        auto displays = EnumerateDisplays();
+        const DisplayInfo *target = nullptr;
+        for (const auto &d : displays)
+        {
+            if (d.id == displayId) { target = &d; break; }
+        }
+        if (!target)
+            return SetScaleResult::NotFound;
+        if (!target->isActive)
+        {
+            Logger::Get().Warning("DisplayModule: 显示器未启用，拒绝设置缩放 ", displayId);
+            return SetScaleResult::NotActive;
+        }
+    }
+
     // 通过 GDI 设备名 + targetId 查找 CCD target
     std::string gdiNameStr = ParseGdiName(displayId);
     uint32_t targetId = ParseTargetId(displayId);
@@ -1247,6 +1267,9 @@ void DisplayModule::OnCommand(SidebandSession &session,
                 break;
             case SetScaleResult::NotFound:
                 respJson = R"({"ok":false,"error":"not_found"})";
+                break;
+            case SetScaleResult::NotActive:
+                respJson = R"({"ok":false,"error":"not_active"})";
                 break;
             case SetScaleResult::InvalidScale:
                 respJson = R"({"ok":false,"error":"invalid_scale","msg":"allowed: 100,125,150,175,200,225,250,300,350,400,450,500"})";

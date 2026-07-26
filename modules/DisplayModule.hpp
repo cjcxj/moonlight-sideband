@@ -164,11 +164,12 @@ private:
     };
     SetModeResult SetDisplayMode(const std::string &displayId, int w, int h, int refresh);
 
-    // 设置缩放（写注册表）
+    // 设置缩放（CCD API，即时生效）
     enum class SetScaleResult
     {
         Ok,
         NotFound,
+        NotActive,        // 显示器不在桌面中，缩放无从谈起
         InvalidScale,
         RegistryFailed
     };
