@@ -46,7 +46,13 @@ if(MSVC)
         "/MANIFEST:EMBED"
         "/MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/moonlight_sideband.manifest"
     )
-    target_compile_options(moonlight_sideband PRIVATE /W4)
+    # /utf-8 必须加：本仓库所有源文件都是 UTF-8 无 BOM，而 MSVC 默认按系统 ANSI
+    # 代码页解释源文件。在英文系统上（GitHub Actions runner 就是，ACP=1252）
+    # L"打开日志" 这类宽字符字面量会被逐字节从 CP1252 转成 UTF-16，托盘菜单显示成
+    # "æ‰"å¼€æ—¥å¿—"。窄字符串之所以看起来没事，是因为源代码页与执行代码页相同、
+    # 字节原样透传，只有宽字面量需要真实转码才暴露出来。
+    # /utf-8 等价于 /source-charset:utf-8 /execution-charset:utf-8。
+    target_compile_options(moonlight_sideband PRIVATE /W4 /utf-8)
 endif()
 
 # Windows 子系统 (无控制台黑框)。
@@ -94,6 +100,9 @@ if(SIDEBAND_BUILD_TESTS)
     enable_testing()
     add_executable(sideband_tests tests/test_units.cpp)
     target_include_directories(sideband_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    if(MSVC)
+        target_compile_options(sideband_tests PRIVATE /utf-8)
+    endif()
     # 测试目标是控制台程序，不套用上面的 /SUBSYSTEM:WINDOWS
     add_test(NAME sideband_tests COMMAND sideband_tests)
 endif()
