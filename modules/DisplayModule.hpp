@@ -85,7 +85,8 @@ public:
     const char *GetName() const override { return "Display"; }
 
     void OnClientConnected(SidebandSession &session) override;
-    void OnClientDisconnected(SidebandSession &session) override {}
+    // 单客户端断开不影响其他客户端，无需处理（参数不具名以免 /W4 报 C4100）
+    void OnClientDisconnected(SidebandSession &) override {}
     void OnCommand(SidebandSession &session,
                    uint32_t cmd_id,
                    uint32_t req_id,

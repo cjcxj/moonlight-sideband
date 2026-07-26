@@ -276,7 +276,7 @@ void DisplayModule::OnDisplayChanged()
     RequestPush();
 }
 
-void DisplayModule::OnClientConnected(SidebandSession &session)
+void DisplayModule::OnClientConnected(SidebandSession &)
 {
     // 不在主循环线程中调用 EnumerateDisplays（会阻塞 ~50ms），
     // 唤醒监控线程去异步推送

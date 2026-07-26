@@ -57,13 +57,20 @@ set_target_properties(moonlight_sideband PROPERTIES
 )
 
 # Unicode 支持 + 目标 Windows 版本。
-# _WIN32_WINNT 0x0601 (Windows 7) 是 WSAPoll / SIO_KEEPALIVE_VALS 所需的最低值。
+#
+# 0x0A00 = Windows 10。各项下限：
+#   WSAPoll / SIO_KEEPALIVE_VALS   需要 0x0600 (Vista)
+#   GetDpiForMonitor               需要 0x0603 (8.1) —— 低于此值 shellscalingapi.h
+#                                  不声明它，CursorModule 会报 C3861
+#   manifest 里声明的 PerMonitorV2 需要 Windows 10 1703+
+# 取最高的那个，与 manifest 保持一致。
 add_compile_definitions(
     UNICODE _UNICODE
     NOMINMAX WIN32_LEAN_AND_MEAN
     _WINSOCK_DEPRECATED_NO_WARNINGS
-    _WIN32_WINNT=0x0601
-    WINVER=0x0601
+    _WIN32_WINNT=0x0A00
+    WINVER=0x0A00
+    NTDDI_VERSION=0x0A000000
 )
 
 # 输出目录

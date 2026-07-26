@@ -589,7 +589,7 @@ void CursorModule::HookLoop()
     Logger::Get().Info("CursorModule: 钩子线程退出");
 }
 
-void CursorModule::OnClientConnected(SidebandSession &session)
+void CursorModule::OnClientConnected(SidebandSession &)
 {
     // 新客户端连入，强制刷新光标状态
     if (m_engine)
@@ -604,7 +604,7 @@ void CursorModule::OnClientConnected(SidebandSession &session)
     m_cvCursorChanged.notify_one();
 }
 
-void CursorModule::OnClientDisconnected(SidebandSession &session)
+void CursorModule::OnClientDisconnected(SidebandSession &)
 {
     // 单客户端断开不影响其他客户端；不需要特殊处理
 }
