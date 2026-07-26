@@ -473,6 +473,13 @@ std::vector<DisplayModule::DisplayInfo> DisplayModule::EnumerateDisplays() const
         if (gdiName.empty())
             continue;
 
+        // 过滤非 GDI 显示设备（如断开占位的 "WinDisc"、间接显示器占位设备）
+        if (gdiName.rfind(L"\\\\.\\DISPLAY", 0) != 0)
+        {
+            Logger::Get().Debug("DisplayModule: 跳过非 GDI 设备 ", WideToUtf8(gdiName));
+            continue;
+        }
+
         // 获取 target 友好名称和 EDID 信息
         DISPLAYCONFIG_TARGET_DEVICE_NAME targetName = {};
         targetName.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
@@ -659,6 +666,113 @@ static bool FindInactiveTargetIsInternal(const std::wstring &gdiName, uint32_t t
     return false;
 }
 
+// 用 CCD 供给配置精确激活指定 target，并停用其他所有 target。
+//
+// 说明：SDC_TOPOLOGY_INTERNAL/EXTERNAL 只能切换"拓扑类别"，无法指定激活哪个
+// target。当两个显示器挂在同一 GDI source（如 \\.\DISPLAY1 下 4352/4353 两个
+// target）时，当前拓扑已是 EXTERNAL，再调 SDC_TOPOLOGY_EXTERNAL 是 no-op：
+// 返回成功但什么都没变。这里改为提供显式 path 数组：只包含目标 target 的
+// path，其余 path 一律不提供（即停用），让 Windows 重算模式。
+static bool ActivateTargetExclusive(const std::wstring &gdiName, uint32_t targetId)
+{
+    UINT32 numPaths = 0, numModes = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ALL_PATHS, &numPaths, &numModes) != ERROR_SUCCESS)
+        return false;
+
+    if (numPaths > 256 || numModes > 1024)
+        return false;
+
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths(numPaths);
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes(numModes);
+
+    if (QueryDisplayConfig(QDC_ALL_PATHS, &numPaths, paths.data(),
+                           &numModes, modes.data(), nullptr) != ERROR_SUCCESS)
+        return false;
+    paths.resize(numPaths);
+
+    // 找到目标 path：targetId 匹配 + source GDI 名匹配 + target 可用
+    // （找不到 GDI 名匹配时，退而求其次接受仅 targetId 匹配的可用 path，
+    //   因为拓扑切换后同一 target 可能被映射到别的 source）
+    int exactIdx = -1, looseIdx = -1;
+    for (int i = 0; i < (int)paths.size(); ++i)
+    {
+        if (paths[i].targetInfo.id != targetId)
+            continue;
+        if (!paths[i].targetInfo.targetAvailable)
+            continue;
+
+        if (looseIdx < 0)
+            looseIdx = i;
+
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME srcName = {};
+        srcName.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+        srcName.header.size = sizeof(srcName);
+        srcName.header.adapterId = paths[i].sourceInfo.adapterId;
+        srcName.header.id = paths[i].sourceInfo.id;
+        if (DisplayConfigGetDeviceInfo(&srcName.header) != ERROR_SUCCESS)
+            continue;
+
+        if (_wcsicmp(srcName.viewGdiDeviceName, gdiName.c_str()) == 0)
+        {
+            exactIdx = i;
+            break;
+        }
+    }
+
+    int idx = (exactIdx >= 0) ? exactIdx : looseIdx;
+    if (idx < 0)
+    {
+        Logger::Get().Error("DisplayModule: ActivateTargetExclusive 找不到 targetId=", targetId);
+        return false;
+    }
+
+    DISPLAYCONFIG_PATH_INFO p = paths[idx];
+    p.flags = DISPLAYCONFIG_PATH_ACTIVE;
+    // 模式索引置无效，让系统重新选择该显示器的最佳/上次模式
+    p.sourceInfo.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
+    p.targetInfo.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
+    p.sourceInfo.statusFlags = 0;
+    p.targetInfo.statusFlags = 0;
+    // 未激活 path 上这些字段可能是 0/无效值，给出合法缺省让系统自选
+    p.targetInfo.refreshRate.Numerator = 0;
+    p.targetInfo.refreshRate.Denominator = 0;
+    p.targetInfo.scanLineOrdering = DISPLAYCONFIG_SCANLINE_ORDERING_UNSPECIFIED;
+    if (p.targetInfo.rotation < DISPLAYCONFIG_ROTATION_IDENTITY ||
+        p.targetInfo.rotation > DISPLAYCONFIG_ROTATION_ROTATE270)
+        p.targetInfo.rotation = DISPLAYCONFIG_ROTATION_IDENTITY;
+    p.targetInfo.scaling = DISPLAYCONFIG_SCALING_PREFERRED;
+
+    LONG r = SetDisplayConfig(1, &p, 0, nullptr,
+                              SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG |
+                              SDC_ALLOW_CHANGES | SDC_SAVE_TO_DATABASE);
+    if (r != ERROR_SUCCESS)
+    {
+        Logger::Get().Error("DisplayModule: ActivateTargetExclusive SetDisplayConfig 失败 code=", r,
+                            " targetId=", targetId, (exactIdx >= 0 ? " (精确匹配)" : " (宽松匹配)"));
+        return false;
+    }
+
+    Logger::Get().Info("DisplayModule: ActivateTargetExclusive 已提交 targetId=", targetId,
+                       (exactIdx >= 0 ? " (精确匹配)" : " (宽松匹配)"));
+    return true;
+}
+
+// 轮询验证指定 target 已激活（拓扑切换是异步生效的）
+bool DisplayModule::VerifyTargetActive(uint32_t targetId, int attempts, int intervalMs) const
+{
+    for (int i = 0; i < attempts; ++i)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(intervalMs));
+        auto now = EnumerateDisplays();
+        for (const auto &d : now)
+        {
+            if (ParseTargetId(d.id) == targetId && d.isActive)
+                return true;
+        }
+    }
+    return false;
+}
+
 DisplayModule::SwitchResult DisplayModule::SwitchPrimaryDisplay(const std::string &displayId)
 {
     auto displays = EnumerateDisplays();
@@ -685,8 +799,24 @@ DisplayModule::SwitchResult DisplayModule::SwitchPrimaryDisplay(const std::strin
     uint32_t targetId = ParseTargetId(displayId);
     std::wstring targetDevName(gdiNameStr.begin(), gdiNameStr.end());
 
-    // 如果目标未启用，用 SetDisplayConfig 切换（Win+P 效果）
-    // ChangeDisplaySettingsExW 无法启用未激活的显示器
+    // 方法 1：CCD 供给配置——显式只激活目标 target（其余全部停用）。
+    // 这是唯一能在"同一 source 多个 target"（如 DISPLAY1#4352 / DISPLAY1#4353）
+    // 之间来回切换的方法；SDC_TOPOLOGY_* 无法指定 target（见 ActivateTargetExclusive 注释）。
+    if (targetId != 0xFFFFFFFF && ActivateTargetExclusive(targetDevName, targetId))
+    {
+        // 验证真的生效：SetDisplayConfig 可能返回成功但拓扑实际未变，
+        // 不验证就会给客户端假的 ok:true
+        if (VerifyTargetActive(targetId, 8, 250))
+        {
+            Logger::Get().Info("DisplayModule: 已切换到 ", displayId, " (CCD 供给配置, 已验证)");
+            std::lock_guard<std::mutex> l(m_mutex);
+            m_lastPrimaryId.clear();
+            return SwitchResult::Ok;
+        }
+        Logger::Get().Warning("DisplayModule: CCD 供给配置提交成功但未生效，尝试回退方案");
+    }
+
+    // 方法 2（回退）：目标未启用时用拓扑切换（Win+P 效果，无法指定具体 target）
     if (!target->isActive)
     {
         bool isInternal = FindInactiveTargetIsInternal(targetDevName, targetId);
@@ -697,16 +827,16 @@ DisplayModule::SwitchResult DisplayModule::SwitchPrimaryDisplay(const std::strin
             flags |= SDC_TOPOLOGY_EXTERNAL;
 
         LONG result = SetDisplayConfig(0, nullptr, 0, nullptr, flags);
-        if (result == ERROR_SUCCESS)
+        if (result == ERROR_SUCCESS && VerifyTargetActive(targetId, 8, 250))
         {
-            Logger::Get().Info("DisplayModule: SetDisplayConfig 切换到",
-                               (isInternal ? "内部" : "外部"), "显示器 ", displayId);
+            Logger::Get().Info("DisplayModule: SetDisplayConfig 拓扑切换到",
+                               (isInternal ? "内部" : "外部"), "显示器 ", displayId, " (已验证)");
             std::lock_guard<std::mutex> l(m_mutex);
             m_lastPrimaryId.clear();
             return SwitchResult::Ok;
         }
 
-        Logger::Get().Error("DisplayModule: SetDisplayConfig 失败 code=", result,
+        Logger::Get().Error("DisplayModule: 拓扑切换失败或未生效 code=", result,
                             "，尝试 ChangeDisplaySettingsExW");
         // 继续尝试 ChangeDisplaySettingsExW
     }
@@ -742,12 +872,20 @@ DisplayModule::SwitchResult DisplayModule::SwitchPrimaryDisplay(const std::strin
     }
 
     // 2. 禁用其他所有显示器
+    // 注意：d.id 形如 "\\.\DISPLAY2#4353"，必须先去掉 #targetId 后缀才是
+    // ChangeDisplaySettingsExW 能识别的 GDI 设备名；同一 GDI source 只处理一次
+    std::set<std::string> handledGdi;
     for (const auto &d : displays)
     {
-        if (d.id == displayId)
-            continue;
+        std::string otherGdi = ParseGdiName(d.id);
+        if (_stricmp(otherGdi.c_str(), gdiNameStr.c_str()) == 0)
+            continue;  // 目标所在的 source 不能禁
+        if (!handledGdi.insert(otherGdi).second)
+            continue;  // 该 source 已处理过
+        if (!d.isActive)
+            continue;  // 本来就没启用
 
-        std::wstring devName(d.id.begin(), d.id.end());
+        std::wstring devName(otherGdi.begin(), otherGdi.end());
         DEVMODEW dm = {};
         dm.dmSize = sizeof(dm);
         dm.dmDriverExtra = 0;
@@ -761,8 +899,10 @@ DisplayModule::SwitchResult DisplayModule::SwitchPrimaryDisplay(const std::strin
         dm.dmPosition.x = 0;
         dm.dmPosition.y = 0;
 
-        ChangeDisplaySettingsExW(devName.c_str(), &dm, nullptr,
-                                 CDS_UPDATEREGISTRY | CDS_NORESET, nullptr);
+        LONG rd = ChangeDisplaySettingsExW(devName.c_str(), &dm, nullptr,
+                                           CDS_UPDATEREGISTRY | CDS_NORESET, nullptr);
+        if (rd != DISP_CHANGE_SUCCESSFUL)
+            Logger::Get().Warning("DisplayModule: 禁用 ", otherGdi, " 失败 code=", rd);
     }
 
     // 3. 应用所有更改
@@ -770,6 +910,13 @@ DisplayModule::SwitchResult DisplayModule::SwitchPrimaryDisplay(const std::strin
     if (r2 != DISP_CHANGE_SUCCESSFUL)
     {
         Logger::Get().Error("DisplayModule: 应用更改失败, code=", r2);
+        return SwitchResult::ApiFailed;
+    }
+
+    // 最终验证：确保目标 target 真的处于激活状态，绝不给客户端假的 ok:true
+    if (targetId != 0xFFFFFFFF && !VerifyTargetActive(targetId, 4, 250))
+    {
+        Logger::Get().Error("DisplayModule: 切换流程走完但目标 target 未激活 ", displayId);
         return SwitchResult::ApiFailed;
     }
 

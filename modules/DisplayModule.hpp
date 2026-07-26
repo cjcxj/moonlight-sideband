@@ -156,6 +156,9 @@ private:
     // 获取当前主显示器信息（不含完整列表）
     bool GetCurrentPrimary(DisplayInfo &out) const;
 
+    // 轮询验证指定 target 已激活（切换是异步生效的，用于避免假成功）
+    bool VerifyTargetActive(uint32_t targetId, int attempts, int intervalMs) const;
+
     // 把 DisplayInfo 列表序列化为 JSON
     std::string DisplaysToJson(const std::vector<DisplayInfo> &displays) const;
 
