@@ -63,7 +63,7 @@ bool SidebandSession::SendOrQueue(const std::vector<uint8_t> &packet,
 
             if (m_sendQueue.size() + packet.size() > SidebandProtocol::MAX_SEND_QUEUE_BYTES)
             {
-                Logger::Get().Error("SidebandSession: 发送队列超限(",
+                Logger::Get().Warning("SidebandSession: 发送队列超限(",
                                     m_sendQueue.size(), " 字节)，判定客户端失速并断开 ", m_peer);
                 m_connected.store(false, std::memory_order_release);
                 m_sendQueue.clear();
@@ -102,7 +102,7 @@ bool SidebandSession::SendOrQueue(const std::vector<uint8_t> &packet,
             if (m_sendQueue.size() + (packet.size() - offset) >
                 SidebandProtocol::MAX_SEND_QUEUE_BYTES)
             {
-                Logger::Get().Error("SidebandSession: 发送队列超限，断开 ", m_peer);
+                Logger::Get().Warning("SidebandSession: 发送队列超限，断开 ", m_peer);
                 m_connected.store(false, std::memory_order_release);
                 m_sendQueue.clear();
                 return false;
@@ -274,7 +274,7 @@ bool SidebandSession::TryReceive(bool &outDidWork)
         // 接收缓冲区总量兜底（正常情况下 ProcessRxBuffer 会及时消费）
         if (m_rxBuffer.size() > SidebandProtocol::MAX_BODY_LEN + 4096)
         {
-            Logger::Get().Error("SidebandSession: 接收缓冲区异常膨胀，断开 ", m_peer);
+            Logger::Get().Warning("SidebandSession: 接收缓冲区异常膨胀，断开 ", m_peer);
             m_connected.store(false, std::memory_order_release);
             m_rxBuffer.clear();
             return false;
@@ -311,7 +311,7 @@ void SidebandSession::ProcessRxBuffer()
         // 合理性检查：避免恶意大包导致内存爆炸
         if (bodyLen > SidebandProtocol::MAX_BODY_LEN)
         {
-            Logger::Get().Error("SidebandSession: 收到超大包 BodyLen=", bodyLen,
+            Logger::Get().Warning("SidebandSession: 收到超大包 BodyLen=", bodyLen,
                                 "，断开连接 ", m_peer);
             m_connected.store(false, std::memory_order_release);
             m_rxBuffer.clear();

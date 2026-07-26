@@ -154,7 +154,7 @@ int main(int, char *[])
     HANDLE hInstanceMutex = CreateMutexW(nullptr, TRUE, kInstanceMutexName);
     if (!hInstanceMutex || GetLastError() == ERROR_ALREADY_EXISTS)
     {
-        Logger::Get().Error("已有一份 moonlight-sideband 正在运行，本次启动退出");
+        Logger::Get().Info("已有一份 moonlight-sideband 正在运行，本次启动退出");
         if (hInstanceMutex)
             CloseHandle(hInstanceMutex);
         return 0;

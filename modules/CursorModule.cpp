@@ -250,7 +250,7 @@ void CursorEngine::CaptureAndSend()
             if (std::chrono::duration_cast<std::chrono::milliseconds>(now - m_dpiChangeStartTime).count() > 500)
             {
                 // DPI 变化重启逻辑交给上层处理；这里仅跳过本帧
-                Logger::Get().Info("CursorEngine: 检测到 DPI 变化，跳过本帧");
+                Logger::Get().Debug("CursorEngine: 检测到 DPI 变化，跳过本帧");
             }
         }
         return;
@@ -412,7 +412,7 @@ void CursorEngine::CaptureAndSend()
                                               PixelFormat32bppARGB, &bd);
         if (st != Gdiplus::Ok || !bd.Scan0)
         {
-            Logger::Get().Error("CursorEngine: LockBits 失败 status=", (int)st);
+            Logger::Get().Warning("CursorEngine: LockBits 失败 status=", (int)st);
             return;
         }
         memcpy(bd.Scan0, m_rawPixels.data(), rawDataSize);
@@ -421,20 +421,20 @@ void CursorEngine::CaptureAndSend()
         IStream *s = NULL;
         if (FAILED(CreateStreamOnHGlobal(NULL, TRUE, &s)) || !s)
         {
-            Logger::Get().Error("CursorEngine: 创建 PNG 流失败");
+            Logger::Get().Warning("CursorEngine: 创建 PNG 流失败");
             return;
         }
         CLSID pngId = {};
         if (GetEncoderClsid(L"image/png", &pngId) < 0)
         {
-            Logger::Get().Error("CursorEngine: 找不到 PNG 编码器");
+            Logger::Get().Warning("CursorEngine: 找不到 PNG 编码器");
             s->Release();
             return;
         }
         st = gdiBmp.Save(s, &pngId, NULL);
         if (st != Gdiplus::Ok)
         {
-            Logger::Get().Error("CursorEngine: PNG 编码失败 status=", (int)st);
+            Logger::Get().Warning("CursorEngine: PNG 编码失败 status=", (int)st);
             s->Release();
             return;
         }
@@ -586,7 +586,7 @@ void CursorModule::HookLoop()
         UnhookWindowsHookEx(m_hKeyboardHook);
         m_hKeyboardHook = NULL;
     }
-    Logger::Get().Info("CursorModule: 钩子线程退出");
+    Logger::Get().Debug("CursorModule: 钩子线程退出");
 }
 
 void CursorModule::OnClientConnected(SidebandSession &)
@@ -595,7 +595,7 @@ void CursorModule::OnClientConnected(SidebandSession &)
     if (m_engine)
     {
         m_engine->ResetState();
-        Logger::Get().Info("CursorModule: 新客户端连接，强制刷新光标状态");
+        Logger::Get().Debug("CursorModule: 新客户端连接，强制刷新光标状态");
     }
     {
         std::lock_guard<std::mutex> l(m_mutexCursor);
@@ -651,7 +651,7 @@ void CursorModule::PokeTextCursor(bool force)
 
 void CursorModule::TextCursorMonitorLoop()
 {
-    Logger::Get().Info("CursorModule: 文本光标监控线程已启动");
+    Logger::Get().Debug("CursorModule: 文本光标监控线程已启动");
 
     while (!m_exit)
     {

@@ -27,11 +27,36 @@
 
 #include "Win32Util.hpp"
 
+/**
+ * 日志级别，从低到高。设置为某一级时，该级及以上的都会输出。
+ *
+ * 分级约定（新增日志时请照此判断，避免 INFO 变成垃圾场）：
+ *
+ *   TRACE  逐帧/逐包级别的细节。默认永远不开。
+ *
+ *   DEBUG  诊断细节：显示器枚举明细、收到的每条指令、内部机制步骤
+ *          （"已提交 SetDisplayConfig"）、各工作线程的启停。
+ *          特征是**频率跟随事件而不是跟随状态变化** —— 一次显示器切换会
+ *          触发多次枚举，这类信息放 INFO 会把有用的行淹掉。
+ *
+ *   INFO   低频的状态变化，以及用户发起的操作的**结果**：
+ *          进程和模块启停、客户端连接/断开、认证通过、
+ *          "已切换到 XXX"、"已设置 1920x1080@60"。
+ *          判断标准：运维/用户回头查"刚才发生了什么"时想看到的那几行。
+ *
+ *   WARN   异常但已经处理掉了：API 失败但有回退方案、客户端行为异常
+ *          （认证失败、超大包、发送队列超限被断开）、可选功能不可用。
+ *          特征是**服务仍在正常工作**。
+ *
+ *   ERROR  功能真的坏了：初始化失败、模块启动失败、用户请求执行失败、崩溃。
+ *          设成 ERROR 级别的人只想看到需要他动手的事。
+ */
 enum class LogLevel
 {
     TRACE,
     DEBUG,
     INFO,
+    WARN,
     LOG_ERROR
 };
 
@@ -61,10 +86,12 @@ public:
 
     static bool ParseLevel(const std::string &s, LogLevel &out)
     {
-        if (s == "TRACE") { out = LogLevel::TRACE;     return true; }
-        if (s == "DEBUG") { out = LogLevel::DEBUG;     return true; }
-        if (s == "INFO")  { out = LogLevel::INFO;      return true; }
-        if (s == "ERROR") { out = LogLevel::LOG_ERROR; return true; }
+        if (s == "TRACE")   { out = LogLevel::TRACE;     return true; }
+        if (s == "DEBUG")   { out = LogLevel::DEBUG;     return true; }
+        if (s == "INFO")    { out = LogLevel::INFO;      return true; }
+        if (s == "WARN" ||
+            s == "WARNING") { out = LogLevel::WARN;      return true; }
+        if (s == "ERROR")   { out = LogLevel::LOG_ERROR; return true; }
         return false;
     }
 
@@ -83,7 +110,9 @@ public:
     template <typename... Args>
     void Warning(Args &&...args)
     {
-        if (m_level.load(std::memory_order_relaxed) <= LogLevel::INFO)
+        // 之前这里挂的是 INFO 门槛，等于没有独立的 WARN 级别可选：
+        // 想过滤掉 INFO 噪音就只能设成 ERROR，连警告一起丢掉。
+        if (m_level.load(std::memory_order_relaxed) <= LogLevel::WARN)
             Log("[WARN] ", std::forward<Args>(args)...);
     }
     template <typename... Args>

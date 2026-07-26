@@ -19,7 +19,7 @@ struct Config
     // 只监听 127.0.0.1 / ::1。开启后手机无法直连，需要 SSH/adb 端口转发。
     bool loopbackOnly = false;
 
-    // TRACE / DEBUG / INFO / ERROR
+    // TRACE / DEBUG / INFO / WARN / ERROR
     std::string logLevel = "INFO";
 
     // 单个日志文件上限，超过后轮转为 .1（0 表示不限制）

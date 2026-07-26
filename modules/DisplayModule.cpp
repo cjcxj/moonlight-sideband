@@ -325,10 +325,10 @@ std::vector<DisplayModule::DisplayInfo> DisplayModule::EnumerateDisplays() const
         return TRUE;
     }, reinterpret_cast<LPARAM>(&dmData));
 
-    Logger::Get().Info("DisplayModule: 桌面显示器 count=", dmData.activeMonitors.size(),
+    Logger::Get().Debug("DisplayModule: 桌面显示器 count=", dmData.activeMonitors.size(),
                        " 主显示器=", WideToUtf8(dmData.primaryMonitor));
     for (const auto &m : dmData.activeMonitors)
-        Logger::Get().Info("DisplayModule:   桌面: ", WideToUtf8(m));
+        Logger::Get().Debug("DisplayModule:   桌面: ", WideToUtf8(m));
 
     // 获取活跃路径的 target 集合（QDC_ONLY_ACTIVE_PATHS 只返回桌面中的路径）
     auto makeAdapterKey = [](const LUID &luid) -> uint64_t {
@@ -361,7 +361,7 @@ std::vector<DisplayModule::DisplayInfo> DisplayModule::EnumerateDisplays() const
     // 防御性检查：避免异常大的缓冲区导致 "vector too long"
     if (numPaths > 256 || numModes > 1024)
     {
-        Logger::Get().Error("DisplayModule: CCD 缓冲区异常大 paths=", numPaths, " modes=", numModes);
+        Logger::Get().Warning("DisplayModule: CCD 缓冲区异常大 paths=", numPaths, " modes=", numModes);
         return result;
     }
 
@@ -493,7 +493,7 @@ std::vector<DisplayModule::DisplayInfo> DisplayModule::EnumerateDisplays() const
             continue;
         }
 
-        Logger::Get().Info("DisplayModule: 枚举 ", info.id, " active=", info.isActive,
+        Logger::Get().Debug("DisplayModule: 枚举 ", info.id, " active=", info.isActive,
                            " primary=", info.isPrimary,
                            " ", info.width, "x", info.height, "@", info.refreshRate,
                            " name=", info.name);
@@ -581,7 +581,7 @@ static bool FindInactiveTargetIsInternal(const std::wstring &gdiName, uint32_t t
         if (!isActive)
         {
             bool isInternal = (path.targetInfo.outputTechnology == DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL);
-            Logger::Get().Info("DisplayModule: 找到未活跃 target isInternal=", isInternal,
+            Logger::Get().Debug("DisplayModule: 找到未活跃 target isInternal=", isInternal,
                                " outputTech=", (int)path.targetInfo.outputTechnology);
             return isInternal;
         }
@@ -645,7 +645,7 @@ static bool ActivateTargetExclusive(const std::wstring &gdiName, uint32_t target
     int idx = (exactIdx >= 0) ? exactIdx : looseIdx;
     if (idx < 0)
     {
-        Logger::Get().Error("DisplayModule: ActivateTargetExclusive 找不到 targetId=", targetId);
+        Logger::Get().Warning("DisplayModule: ActivateTargetExclusive 找不到 targetId=", targetId);
         return false;
     }
 
@@ -670,12 +670,12 @@ static bool ActivateTargetExclusive(const std::wstring &gdiName, uint32_t target
                               SDC_ALLOW_CHANGES | SDC_SAVE_TO_DATABASE);
     if (r != ERROR_SUCCESS)
     {
-        Logger::Get().Error("DisplayModule: ActivateTargetExclusive SetDisplayConfig 失败 code=", r,
+        Logger::Get().Warning("DisplayModule: ActivateTargetExclusive SetDisplayConfig 失败 code=", r,
                             " targetId=", targetId, (exactIdx >= 0 ? " (精确匹配)" : " (宽松匹配)"));
         return false;
     }
 
-    Logger::Get().Info("DisplayModule: ActivateTargetExclusive 已提交 targetId=", targetId,
+    Logger::Get().Debug("DisplayModule: ActivateTargetExclusive 已提交 targetId=", targetId,
                        (exactIdx >= 0 ? " (精确匹配)" : " (宽松匹配)"));
     return true;
 }
@@ -759,13 +759,13 @@ DisplayModule::SwitchResult DisplayModule::SwitchPrimaryDisplay(const std::strin
             return SwitchResult::Ok;
         }
 
-        Logger::Get().Error("DisplayModule: 拓扑切换失败或未生效 code=", result,
+        Logger::Get().Warning("DisplayModule: 拓扑切换失败或未生效 code=", result,
                             "，尝试 ChangeDisplaySettingsExW");
         // 继续尝试 ChangeDisplaySettingsExW
     }
 
     // 目标已启用：用 ChangeDisplaySettingsExW 切换主显示器
-    Logger::Get().Info("DisplayModule: 切换主显示器 ", displayId);
+    Logger::Get().Debug("DisplayModule: 切换主显示器 ", displayId);
 
     // 1. 启用目标显示器，设为 (0,0) + CDS_SET_PRIMARY
     DEVMODEW targetDm = {};
@@ -1097,7 +1097,7 @@ void DisplayModule::OnCommand(SidebandSession &session,
         std::string json = DisplaysToJson(displays);
         std::vector<uint8_t> p(json.begin(), json.end());
         session.SendCommand(Cmd::DISPLAY_LIST_RESP, req_id, p);
-        Logger::Get().Info("DisplayModule: 列出显示器 (count=", displays.size(), ")");
+        Logger::Get().Debug("DisplayModule: 列出显示器 (count=", displays.size(), ")");
         break;
     }
     case Cmd::DISPLAY_SWITCH:
@@ -1105,7 +1105,7 @@ void DisplayModule::OnCommand(SidebandSession &session,
         // payload 期望是 JSON: {"display_id":"\\\\.\\DISPLAY2"}
         std::string payloadStr(payload ? (const char *)payload : "",
                                payload ? payload_len : 0);
-        Logger::Get().Info("DisplayModule: DISPLAY_SWITCH payload=", payloadStr);
+        Logger::Get().Debug("DisplayModule: DISPLAY_SWITCH payload=", payloadStr);
 
         std::string displayId = Json::GetString(payloadStr, "display_id");
 
@@ -1167,7 +1167,7 @@ void DisplayModule::OnCommand(SidebandSession &session,
         }
         std::vector<uint8_t> p(respJson.begin(), respJson.end());
         session.SendCommand(Cmd::DISPLAY_MODE_LIST_RESP, req_id, p);
-        Logger::Get().Info("DisplayModule: 查询模式列表 ", displayId);
+        Logger::Get().Debug("DisplayModule: 查询模式列表 ", displayId);
         break;
     }
     case Cmd::DISPLAY_MODE_SET:
@@ -1274,7 +1274,7 @@ void DisplayModule::OnCommand(SidebandSession &session,
 
 void DisplayModule::MonitorLoop()
 {
-    Logger::Get().Info("DisplayModule: 监控线程已启动");
+    Logger::Get().Debug("DisplayModule: 监控线程已启动");
 
     while (!m_exit)
     {
@@ -1364,7 +1364,7 @@ void DisplayModule::MonitorLoop()
         }
     }
 
-    Logger::Get().Info("DisplayModule: 监控线程退出");
+    Logger::Get().Debug("DisplayModule: 监控线程退出");
 }
 
 void DisplayModule::PushCurrentDisplayState(uint32_t req_id)

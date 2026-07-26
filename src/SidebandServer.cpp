@@ -126,7 +126,7 @@ void SidebandServer::RegisterModule(std::unique_ptr<ISidebandModule> module)
 {
     if (module)
     {
-        Logger::Get().Info("SidebandServer: 注册模块 ", module->GetName());
+        Logger::Get().Debug("SidebandServer: 注册模块 ", module->GetName());
         m_modules.push_back(std::move(module));
     }
 }
@@ -290,7 +290,7 @@ void SidebandServer::HandleAuth(SidebandSession &session, uint32_t req_id,
     else
     {
         int fails = session.BumpAuthFailures();
-        Logger::Get().Error("SidebandServer: 客户端认证失败(", fails, "/", kMaxAuthFailures,
+        Logger::Get().Warning("SidebandServer: 客户端认证失败(", fails, "/", kMaxAuthFailures,
                             ") ", session.PeerAddress());
         resp = R"({"ok":false,"error":"bad_token"})";
 
@@ -298,7 +298,7 @@ void SidebandServer::HandleAuth(SidebandSession &session, uint32_t req_id,
         {
             std::vector<uint8_t> p(resp.begin(), resp.end());
             session.SendCommand(SidebandProtocol::Cmd::AUTH_RESP, req_id, p);
-            Logger::Get().Error("SidebandServer: 认证失败次数超限，断开 ", session.PeerAddress());
+            Logger::Get().Warning("SidebandServer: 认证失败次数超限，断开 ", session.PeerAddress());
             session.Close();
             return;
         }
@@ -366,7 +366,7 @@ void SidebandServer::DispatchCommand(SidebandSession &session,
     // === 分级授权：只有会改变系统状态的指令才要求认证 ===
     if (handler->CommandRequiresAuth(cmd_id) && !session.IsAuthenticated())
     {
-        Logger::Get().Error("SidebandServer: 未认证的客户端尝试执行 cmd=", cmd_id,
+        Logger::Get().Warning("SidebandServer: 未认证的客户端尝试执行 cmd=", cmd_id,
                             " 来自 ", session.PeerAddress());
 
         // 用该请求本该收到的响应 cmd 回复，这样客户端按 reqId 挂起的请求能立即
@@ -478,7 +478,7 @@ void SidebandServer::ReapDisconnected()
 void SidebandServer::Run()
 {
     m_running = true;
-    Logger::Get().Info("SidebandServer: 主循环开始");
+    Logger::Get().Debug("SidebandServer: 主循环开始");
 
     auto lastTick = std::chrono::steady_clock::now();
     constexpr auto kTickInterval = std::chrono::milliseconds(33); // ~30Hz
@@ -569,5 +569,5 @@ void SidebandServer::Run()
         }
     }
 
-    Logger::Get().Info("SidebandServer: 主循环退出");
+    Logger::Get().Debug("SidebandServer: 主循环退出");
 }

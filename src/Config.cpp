@@ -129,7 +129,8 @@ bool Config::LoadOrCreate()
             {
                 std::transform(val.begin(), val.end(), val.begin(),
                                [](unsigned char c) { return (char)std::toupper(c); });
-                if (val == "TRACE" || val == "DEBUG" || val == "INFO" || val == "ERROR")
+                if (val == "TRACE" || val == "DEBUG" || val == "INFO" ||
+                    val == "WARN" || val == "ERROR")
                     logLevel = val;
             }
             else if (key == "log_max_bytes")
@@ -174,7 +175,8 @@ bool Config::Save() const
         << "# false = 局域网可直连；此时改系统状态的指令由下面的 token 保护\n"
         << "loopback_only=" << (loopbackOnly ? "true" : "false") << "\n"
         << "\n"
-        << "# 日志级别：TRACE / DEBUG / INFO / ERROR\n"
+        << "# 日志级别：TRACE / DEBUG / INFO / WARN / ERROR\n"
+        << "# 日常用 INFO 即可；排查显示器切换问题时设 DEBUG。\n"
         << "log_level=" << logLevel << "\n"
         << "\n"
         << "# 单个日志文件字节上限，超出后轮转为 .1（0 = 不限制）\n"

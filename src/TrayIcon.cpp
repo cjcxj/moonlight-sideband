@@ -78,7 +78,7 @@ bool TrayIcon::Create(const std::wstring &tooltip)
     m_hIcon = LoadIconW(nullptr, IDI_APPLICATION);
 
     if (!AddIcon())
-        Logger::Get().Error("TrayIcon: 托盘图标添加失败（程序仍可运行）");
+        Logger::Get().Warning("TrayIcon: 托盘图标添加失败（程序仍可运行）");
 
     Logger::Get().Info("TrayIcon: 隐藏窗口与托盘图标已创建");
     return true;
