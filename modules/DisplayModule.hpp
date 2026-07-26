@@ -10,6 +10,7 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <condition_variable>
 
 /**
  * DisplayModule - 显示器控制模块
@@ -91,18 +92,34 @@ public:
                    const uint8_t *payload,
                    uint32_t payload_len) override;
 
-    // 启动/停止（由 main 调用）
-    bool Start();
-    void Stop();
+    // 生命周期（现在是 ISidebandModule 接口的一部分）
+    bool Start() override;
+    void Stop() override;
+
+    // 本模块负责的指令
+    bool HandlesCommand(uint32_t cmd_id) const override;
+
+    // 会改变系统状态的指令要求客户端已认证：
+    // 切换显示器 / 设置分辨率 / 设置缩放。只读查询不需要。
+    bool CommandRequiresAuth(uint32_t cmd_id) const override;
+
+    // 收到 WM_DISPLAYCHANGE（UI 线程）——只唤醒工作线程，不在此枚举
+    void OnDisplayChanged() override;
 
 private:
 
     SidebandServer &m_server;
     std::atomic<bool> m_exit{false};
-    std::atomic<bool> m_forcePush{false};  // 客户端连接时置位，由 MonitorLoop 异步推送
+    std::atomic<bool> m_forcePush{false};  // 客户端连接/切换完成时置位，由 MonitorLoop 异步推送
 
-    // 显示器监控线程
+    // 显示器监控线程。
+    // 早期实现是每 2 秒无条件枚举一次所有显示器（单次约 50ms）来发现变化；
+    // 现在改为等待条件变量：由 WM_DISPLAYCHANGE 或 m_forcePush 唤醒，
+    // 另有一个 10 秒的兜底超时以防漏掉某些不发广播的变更（如仅缩放改变）。
     std::thread m_monitorThread;
+    std::mutex m_wakeMutex;
+    std::condition_variable m_wakeCv;
+    bool m_wakeRequested = false;
     mutable std::mutex m_mutex;
 
     // 上次已知的主显示器信息（用于变化检测）
@@ -171,20 +188,14 @@ private:
     // 监控主显示器变化的循环
     void MonitorLoop();
 
+    // 唤醒监控线程（置 m_forcePush 并 notify）
+    void RequestPush();
+
     // 推送当前主显示器状态（通过 BroadcastCommand）
     void PushCurrentDisplayState(uint32_t req_id = 0);
 };
 
-// === 全局辅助函数 ===
-
-// 宽字符转 UTF-8
-std::string WideToUtf8(const std::wstring &w);
-
-// JSON 字符串转义
-std::string EscapeJson(const std::string &s);
-
-// 从 JSON 字符串中提取字符串字段值（简易解析）
-std::string ParseJsonStringField(const std::string &json, const std::string &key);
-
-// 从 JSON 字符串中提取整数字段值
-int ParseJsonIntField(const std::string &json, const std::string &key);
+// 说明：早期版本在这里导出了一组**全局命名空间**的自由函数
+//（WideToUtf8 / EscapeJson / ParseJsonStringField / ParseJsonIntField），
+// 既有撞名风险，JSON 解析本身也很脆（会匹配到出现在值内部的键名）。
+// 现已拆走：字符串转换见 include/Win32Util.hpp，JSON 见 include/Json.hpp。

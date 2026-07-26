@@ -105,9 +105,9 @@ public:
     void OnClientConnected(SidebandSession &session) override;
     void OnClientDisconnected(SidebandSession &session) override;
 
-    // 启动/停止（由 main 调用，不是 ISidebandModule 接口的一部分）
-    bool Start();
-    void Stop();
+    // 生命周期（现在是 ISidebandModule 接口的一部分，由 SidebandServer 统一调用）
+    bool Start() override;
+    void Stop() override;
 
 private:
     SidebandServer &m_server;
@@ -134,12 +134,27 @@ private:
     std::atomic<int> m_lastSentState{-2};
     std::atomic<bool> m_textCursorActive{false};
 
+    // 文本光标唤醒信号。
+    // 低级钩子回调（WH_MOUSE_LL / WH_KEYBOARD_LL）跑在全系统每一个输入事件上，
+    // 单次耗时超过 LowLevelHooksTimeout（默认 300ms）Windows 就会静默把钩子摘掉，
+    // 表现为"用着用着文本光标追踪就失效了"，期间全系统输入还会发涩。
+    // 所以钩子里只置标志并唤醒本条件变量，真正的取词工作交给 m_textCursorThread。
+    // 顺带也消除了 UpdateTextCursorState 里那两个函数级 static 变量
+    // 被三个线程同时读写的数据竞争。
+    std::mutex m_mutexTextCursor;
+    std::condition_variable m_cvTextCursor;
+    bool m_textCursorPoke = false;       // 有输入事件，需要刷新
+    bool m_textCursorPokeForce = false;  // 需要强制刷新（鼠标左键抬起）
+
     // 工作循环
     void WorkerLoop();
     void TextCursorMonitorLoop();
     void HookLoop();   // 钩子线程：安装钩子 + 消息循环
     void UpdateTextCursorState(bool forceUpdate = false);
     bool GetCaretScreenPosition(int &outX, int &outY);
+
+    // 供钩子回调调用：只置标志 + 唤醒，必须立即返回
+    void PokeTextCursor(bool force);
 
     // 钩子回调（静态，转发到实例）
     static void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD, HWND, LONG id, LONG, DWORD, DWORD);

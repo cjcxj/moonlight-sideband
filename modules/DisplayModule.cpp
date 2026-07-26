@@ -2,16 +2,18 @@
  * DisplayModule 实现
  *
  * 实现：
- * - EnumDisplayDevicesW 枚举显示器
+ * - CCD (QueryDisplayConfig) 枚举显示器路径，支持同一 GDI source 下多个 target
  * - EnumDisplaySettingsExW 获取分辨率/刷新率
- * - GetDpiForMonitor 获取缩放
- * - ChangeDisplaySettingsExW 切换主显示器
- * - 周期性监控主显示器变化
+ * - CCD DisplayConfigGetDeviceInfo 获取/设置缩放（即时生效）
+ * - SetDisplayConfig 供给配置精确切换到指定 target，并轮询验证确已生效
+ * - 事件驱动地监控显示配置变化（WM_DISPLAYCHANGE 唤醒，10 秒兜底轮询）
  */
 
 #include "DisplayModule.hpp"
 #include "Logger.hpp"
 #include "SidebandProtocol.hpp"
+#include "Json.hpp"
+#include "Win32Util.hpp"
 
 #include <windows.h>
 #include <shellscalingapi.h>
@@ -24,133 +26,16 @@
 #include <algorithm>
 #include <cstring>
 
+// 字符串/JSON 辅助已拆到 Win32Util.hpp / Json.hpp。
+// 这里做局部引入，避免大面积改动调用点。
+using Win32Util::WideToUtf8;
+
 #pragma comment(lib, "shcore.lib")  // GetDpiForMonitor
 #pragma comment(lib, "user32.lib")
 
 // ============================================================
 //                      辅助函数
 // ============================================================
-
-std::string WideToUtf8(const std::wstring &w)
-{
-    if (w.empty())
-        return "";
-    int len = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(),
-                                  nullptr, 0, nullptr, nullptr);
-    std::string out(len, '\0');
-    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(),
-                        &out[0], len, nullptr, nullptr);
-    return out;
-}
-
-std::string EscapeJson(const std::string &s)
-{
-    std::string out;
-    out.reserve(s.size() + 8);
-    for (char c : s)
-    {
-        switch (c)
-        {
-        case '"':  out += "\\\""; break;
-        case '\\': out += "\\\\"; break;
-        case '\b': out += "\\b"; break;
-        case '\f': out += "\\f"; break;
-        case '\n': out += "\\n"; break;
-        case '\r': out += "\\r"; break;
-        case '\t': out += "\\t"; break;
-        default:
-            if ((unsigned char)c < 0x20)
-            {
-                char buf[8];
-                std::snprintf(buf, sizeof(buf), "\\u%04x", (unsigned char)c);
-                out += buf;
-            }
-            else
-            {
-                out += c;
-            }
-        }
-    }
-    return out;
-}
-
-// 从 JSON 字符串中提取字符串字段值（支持转义反转义）
-std::string ParseJsonStringField(const std::string &json, const std::string &key)
-{
-    std::string needle = "\"" + key + "\"";
-    size_t keyPos = json.find(needle);
-    if (keyPos == std::string::npos) return "";
-    size_t colon = json.find(':', keyPos + needle.size());
-    if (colon == std::string::npos) return "";
-    size_t q1 = json.find('"', colon + 1);
-    if (q1 == std::string::npos) return "";
-
-    // 查找未转义的结束引号
-    size_t q2 = q1 + 1;
-    while (q2 < json.size())
-    {
-        if (json[q2] == '\\' && q2 + 1 < json.size())
-            q2 += 2;  // 跳过转义序列
-        else if (json[q2] == '"')
-            break;
-        else
-            ++q2;
-    }
-    if (q2 >= json.size()) return "";
-
-    // 提取并反转义 JSON 转义序列
-    std::string raw = json.substr(q1 + 1, q2 - q1 - 1);
-    std::string result;
-    result.reserve(raw.size());
-    for (size_t i = 0; i < raw.size(); ++i)
-    {
-        if (raw[i] == '\\' && i + 1 < raw.size())
-        {
-            switch (raw[i + 1])
-            {
-            case '"': result += '"';  ++i; break;
-            case '\\': result += '\\'; ++i; break;
-            case '/': result += '/';  ++i; break;
-            case 'n': result += '\n'; ++i; break;
-            case 't': result += '\t'; ++i; break;
-            case 'r': result += '\r'; ++i; break;
-            case 'b': result += '\b'; ++i; break;
-            case 'f': result += '\f'; ++i; break;
-            default: result += raw[i]; break;  // 未知转义，保留原字符
-            }
-        }
-        else
-        {
-            result += raw[i];
-        }
-    }
-    return result;
-}
-
-// 从 JSON 字符串中提取整数字段值（简易解析）
-int ParseJsonIntField(const std::string &json, const std::string &key)
-{
-    std::string needle = "\"" + key + "\"";
-    size_t keyPos = json.find(needle);
-    if (keyPos == std::string::npos) return 0;
-    size_t colon = json.find(':', keyPos + needle.size());
-    if (colon == std::string::npos) return 0;
-    size_t start = colon + 1;
-    while (start < json.size() && (json[start] == ' ' || json[start] == '\t')) ++start;
-    if (start >= json.size()) return 0;
-    bool negative = false;
-    if (json[start] == '-') { negative = true; ++start; }
-    int value = 0;
-    bool anyDigit = false;
-    while (start < json.size() && json[start] >= '0' && json[start] <= '9')
-    {
-        value = value * 10 + (json[start] - '0');
-        ++start;
-        anyDigit = true;
-    }
-    if (!anyDigit) return 0;
-    return negative ? -value : value;
-}
 
 // 从 displayId 解析 GDI 设备名（去掉 #targetId 后缀）
 // displayId 格式: "\\.\DISPLAY1#12345" → "\\.\DISPLAY1"
@@ -200,44 +85,6 @@ struct DISPLAYCONFIG_SOURCE_DPI_SCALE_SET
     DISPLAYCONFIG_DEVICE_INFO_HEADER header;
     int32_t scaleRel;      // 相对于推荐值的偏移
 };
-
-// 通过 GDI 设备名查找 CCD source 的 adapterId 和 sourceId
-static bool FindSourceByGdiName(const std::wstring &gdiName,
-                                LUID &outAdapterId, UINT32 &outSourceId)
-{
-    UINT32 numPaths = 0, numModes = 0;
-    if (GetDisplayConfigBufferSizes(QDC_ALL_PATHS, &numPaths, &numModes) != ERROR_SUCCESS)
-        return false;
-
-    if (numPaths > 256 || numModes > 1024)
-        return false;
-
-    std::vector<DISPLAYCONFIG_PATH_INFO> paths(numPaths);
-    std::vector<DISPLAYCONFIG_MODE_INFO> modes(numModes);
-
-    if (QueryDisplayConfig(QDC_ALL_PATHS, &numPaths, paths.data(),
-                           &numModes, modes.data(), nullptr) != ERROR_SUCCESS)
-        return false;
-
-    for (const auto &path : paths)
-    {
-        DISPLAYCONFIG_SOURCE_DEVICE_NAME srcName = {};
-        srcName.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
-        srcName.header.size = sizeof(srcName);
-        srcName.header.adapterId = path.sourceInfo.adapterId;
-        srcName.header.id = path.sourceInfo.id;
-        if (DisplayConfigGetDeviceInfo(&srcName.header) != ERROR_SUCCESS)
-            continue;
-
-        if (_wcsicmp(srcName.viewGdiDeviceName, gdiName.c_str()) == 0)
-        {
-            outAdapterId = path.sourceInfo.adapterId;
-            outSourceId = path.sourceInfo.id;
-            return true;
-        }
-    }
-    return false;
-}
 
 // 通过 GDI 设备名 + targetId 查找 CCD target 的 adapterId
 static bool FindTargetByGdiNameAndId(const std::wstring &gdiName, uint32_t targetId,
@@ -354,6 +201,9 @@ DisplayModule::~DisplayModule()
 
 bool DisplayModule::Start()
 {
+    if (m_monitorThread.joinable())
+        return true;  // 已启动
+
     m_exit = false;
     m_monitorThread = std::thread([this]()
                                   { MonitorLoop(); });
@@ -364,15 +214,73 @@ bool DisplayModule::Start()
 void DisplayModule::Stop()
 {
     m_exit = true;
+    {
+        std::lock_guard<std::mutex> l(m_wakeMutex);
+        m_wakeRequested = true;
+    }
+    m_wakeCv.notify_all();
+
     if (m_monitorThread.joinable())
         m_monitorThread.join();
+
+    Logger::Get().Info("DisplayModule: 已停止");
+}
+
+bool DisplayModule::HandlesCommand(uint32_t cmd_id) const
+{
+    using namespace SidebandProtocol;
+    switch (cmd_id)
+    {
+    case Cmd::DISPLAY_LIST_REQ:
+    case Cmd::DISPLAY_SWITCH:
+    case Cmd::DISPLAY_MODE_LIST_REQ:
+    case Cmd::DISPLAY_MODE_SET:
+    case Cmd::DISPLAY_SCALE_SET:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool DisplayModule::CommandRequiresAuth(uint32_t cmd_id) const
+{
+    using namespace SidebandProtocol;
+    // 只读查询（列表 / 模式列表）无需认证，老客户端与只看状态的场景不受影响；
+    // 会改变系统状态的三条必须已认证
+    switch (cmd_id)
+    {
+    case Cmd::DISPLAY_SWITCH:
+    case Cmd::DISPLAY_MODE_SET:
+    case Cmd::DISPLAY_SCALE_SET:
+        return true;
+    default:
+        return false;
+    }
+}
+
+void DisplayModule::RequestPush()
+{
+    m_forcePush.store(true);
+    {
+        std::lock_guard<std::mutex> l(m_wakeMutex);
+        m_wakeRequested = true;
+    }
+    m_wakeCv.notify_one();
+}
+
+void DisplayModule::OnDisplayChanged()
+{
+    // 由主窗口的 WM_DISPLAYCHANGE 在 UI 线程调用 ——
+    // 这里只唤醒工作线程，枚举显示器（约 50ms）绝不能放在 UI 线程上做
+    Logger::Get().Debug("DisplayModule: 收到 WM_DISPLAYCHANGE");
+    RequestPush();
 }
 
 void DisplayModule::OnClientConnected(SidebandSession &session)
 {
-    // 不在主线程中调用 EnumerateDisplays（会阻塞 ~50ms），
-    // 设置标志位让 MonitorLoop 异步推送
-    m_forcePush.store(true);
+    // 不在主循环线程中调用 EnumerateDisplays（会阻塞 ~50ms），
+    // 唤醒监控线程去异步推送
+    RequestPush();
     Logger::Get().Debug("DisplayModule: 新客户端连接，已请求推送当前显示器状态");
 }
 
@@ -1103,10 +1011,10 @@ std::string DisplayModule::DisplayToJson(const DisplayInfo &d) const
 {
     std::ostringstream ss;
     ss << "{";
-    ss << "\"id\":\"" << EscapeJson(d.id) << "\",";
-    ss << "\"device_id\":\"" << EscapeJson(d.deviceId) << "\",";
-    ss << "\"name\":\"" << EscapeJson(d.name) << "\",";
-    ss << "\"adapter\":\"" << EscapeJson(d.adapterName) << "\",";
+    ss << "\"id\":\"" << Json::Escape(d.id) << "\",";
+    ss << "\"device_id\":\"" << Json::Escape(d.deviceId) << "\",";
+    ss << "\"name\":\"" << Json::Escape(d.name) << "\",";
+    ss << "\"adapter\":\"" << Json::Escape(d.adapterName) << "\",";
     ss << "\"x\":" << d.x << ",";
     ss << "\"y\":" << d.y << ",";
     ss << "\"w\":" << d.width << ",";
@@ -1139,7 +1047,7 @@ std::string DisplayModule::ModesToJson(const std::string &displayId,
 {
     std::ostringstream ss;
     ss << "{";
-    ss << "\"display_id\":\"" << EscapeJson(displayId) << "\",";
+    ss << "\"display_id\":\"" << Json::Escape(displayId) << "\",";
     ss << "\"modes\":[";
     for (size_t i = 0; i < modes.size(); ++i)
     {
@@ -1184,7 +1092,7 @@ void DisplayModule::OnCommand(SidebandSession &session,
                                payload ? payload_len : 0);
         Logger::Get().Info("DisplayModule: DISPLAY_SWITCH payload=", payloadStr);
 
-        std::string displayId = ParseJsonStringField(payloadStr, "display_id");
+        std::string displayId = Json::GetString(payloadStr, "display_id");
 
         std::string respJson;
         if (displayId.empty())
@@ -1197,19 +1105,19 @@ void DisplayModule::OnCommand(SidebandSession &session,
             switch (r)
             {
             case SwitchResult::Ok:
-                respJson = R"({"ok":true,"display_id":")" + EscapeJson(displayId) + R"("})";
+                respJson = R"({"ok":true,"display_id":")" + Json::Escape(displayId) + R"("})";
                 break;
             case SwitchResult::NotFound:
-                respJson = R"({"ok":false,"error":"not_found","display_id":")" + EscapeJson(displayId) + R"("})";
+                respJson = R"({"ok":false,"error":"not_found","display_id":")" + Json::Escape(displayId) + R"("})";
                 break;
             case SwitchResult::AlreadyPrimary:
-                respJson = R"({"ok":false,"error":"already_primary","display_id":")" + EscapeJson(displayId) + R"("})";
+                respJson = R"({"ok":false,"error":"already_primary","display_id":")" + Json::Escape(displayId) + R"("})";
                 break;
             case SwitchResult::NotActive:
-                respJson = R"({"ok":false,"error":"not_active","display_id":")" + EscapeJson(displayId) + R"("})";
+                respJson = R"({"ok":false,"error":"not_active","display_id":")" + Json::Escape(displayId) + R"("})";
                 break;
             case SwitchResult::ApiFailed:
-                respJson = R"({"ok":false,"error":"api_failed","display_id":")" + EscapeJson(displayId) + R"("})";
+                respJson = R"({"ok":false,"error":"api_failed","display_id":")" + Json::Escape(displayId) + R"("})";
                 break;
             }
         }
@@ -1217,11 +1125,11 @@ void DisplayModule::OnCommand(SidebandSession &session,
         std::vector<uint8_t> p(respJson.begin(), respJson.end());
         session.SendCommand(Cmd::DISPLAY_CURRENT, req_id, p);
 
-        // 切换成功后请求 MonitorLoop 异步广播新状态给所有客户端
-        // （不直接调用 BroadcastCommand，因为 OnCommand 在 m_clientsMutex 持有期间被调用）
+        // 切换成功后唤醒监控线程异步广播新状态。
+        // （不在这里直接 BroadcastCommand：切换是耗时操作，且状态需要重新枚举后才准确）
         if (respJson.find("\"ok\":true") != std::string::npos)
         {
-            m_forcePush.store(true);
+            RequestPush();
         }
         break;
     }
@@ -1230,7 +1138,7 @@ void DisplayModule::OnCommand(SidebandSession &session,
         // payload: JSON: {"display_id":"\\\\.\\DISPLAY1"}
         std::string payloadStr(payload ? (const char *)payload : "",
                                payload ? payload_len : 0);
-        std::string displayId = ParseJsonStringField(payloadStr, "display_id");
+        std::string displayId = Json::GetString(payloadStr, "display_id");
 
         std::string respJson;
         if (displayId.empty())
@@ -1252,10 +1160,10 @@ void DisplayModule::OnCommand(SidebandSession &session,
         // payload: JSON: {"display_id":"...","w":1920,"h":1080,"refresh":60}
         std::string payloadStr(payload ? (const char *)payload : "",
                                payload ? payload_len : 0);
-        std::string displayId = ParseJsonStringField(payloadStr, "display_id");
-        int w = ParseJsonIntField(payloadStr, "w");
-        int h = ParseJsonIntField(payloadStr, "h");
-        int refresh = ParseJsonIntField(payloadStr, "refresh");
+        std::string displayId = Json::GetString(payloadStr, "display_id");
+        int w = Json::GetInt(payloadStr, "w");
+        int h = Json::GetInt(payloadStr, "h");
+        int refresh = Json::GetInt(payloadStr, "refresh");
 
         std::string respJson;
         if (displayId.empty() || w <= 0 || h <= 0 || refresh <= 0)
@@ -1268,7 +1176,7 @@ void DisplayModule::OnCommand(SidebandSession &session,
             switch (r)
             {
             case SetModeResult::Ok:
-                respJson = "{\"ok\":true,\"display_id\":\"" + EscapeJson(displayId) +
+                respJson = "{\"ok\":true,\"display_id\":\"" + Json::Escape(displayId) +
                            "\",\"w\":" + std::to_string(w) +
                            ",\"h\":" + std::to_string(h) +
                            ",\"refresh\":" + std::to_string(refresh) + "}";
@@ -1294,7 +1202,7 @@ void DisplayModule::OnCommand(SidebandSession &session,
         // 分辨率变化后异步推送新状态
         if (respJson.find("\"ok\":true") != std::string::npos)
         {
-            m_forcePush.store(true);
+            RequestPush();
         }
         break;
     }
@@ -1303,8 +1211,8 @@ void DisplayModule::OnCommand(SidebandSession &session,
         // payload: JSON: {"display_id":"...","scale":125}
         std::string payloadStr(payload ? (const char *)payload : "",
                                payload ? payload_len : 0);
-        std::string displayId = ParseJsonStringField(payloadStr, "display_id");
-        int scale = ParseJsonIntField(payloadStr, "scale");
+        std::string displayId = Json::GetString(payloadStr, "display_id");
+        int scale = Json::GetInt(payloadStr, "scale");
 
         std::string respJson;
         if (displayId.empty() || scale <= 0)
@@ -1318,7 +1226,7 @@ void DisplayModule::OnCommand(SidebandSession &session,
             switch (r)
             {
             case SetScaleResult::Ok:
-                respJson = "{\"ok\":true,\"display_id\":\"" + EscapeJson(displayId) +
+                respJson = "{\"ok\":true,\"display_id\":\"" + Json::Escape(displayId) +
                            "\",\"scale\":" + std::to_string(scale) +
                            ",\"requires_sign_out\":" + (immediate ? "false" : "true") + "}";
                 break;
@@ -1419,9 +1327,17 @@ void DisplayModule::MonitorLoop()
             }
         }
 
-        // 每 2 秒检查一次（频繁枚举显示器开销较大）
-        for (int i = 0; i < 20 && !m_exit; ++i)
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        // 等待下一次唤醒。
+        // 早期实现是每 2 秒无条件枚举一次所有显示器（单次约 50ms）来轮询变化，
+        // 相当于常态占用约 2.5% 的一个核，纯属白烧。现在改为事件驱动：
+        // 主窗口收到 WM_DISPLAYCHANGE、或客户端连接/切换完成时唤醒；
+        // 另留 10 秒兜底超时，覆盖不发广播的变更（例如仅 DPI 缩放改变）。
+        {
+            std::unique_lock<std::mutex> l(m_wakeMutex);
+            m_wakeCv.wait_for(l, std::chrono::seconds(10),
+                              [this] { return m_wakeRequested || m_exit; });
+            m_wakeRequested = false;
+        }
         }
         catch (const std::exception &e)
         {
@@ -1451,8 +1367,8 @@ void DisplayModule::PushCurrentDisplayState(uint32_t req_id)
     std::ostringstream ss;
     ss << "{";
     ss << "\"ok\":true,";
-    ss << "\"display_id\":\"" << EscapeJson(primary.id) << "\",";
-    ss << "\"name\":\"" << EscapeJson(primary.name) << "\",";
+    ss << "\"display_id\":\"" << Json::Escape(primary.id) << "\",";
+    ss << "\"name\":\"" << Json::Escape(primary.name) << "\",";
     ss << "\"w\":" << primary.width << ",";
     ss << "\"h\":" << primary.height << ",";
     ss << "\"refresh\":" << primary.refreshRate << ",";

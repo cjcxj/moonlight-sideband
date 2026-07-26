@@ -16,6 +16,13 @@ constexpr uint16_t DEFAULT_PORT = 5005;
 // 协议版本
 constexpr uint32_t PROTO_VERSION = 1;
 
+// 单个包 Body 长度上限（防止恶意/损坏的长度前缀撑爆内存）
+constexpr uint32_t MAX_BODY_LEN = 16u * 1024 * 1024;
+
+// 单连接发送队列上限。客户端长时间不读时队列会堆积，
+// 超过此值判定为客户端失速并断开，避免内存无限增长。
+constexpr size_t MAX_SEND_QUEUE_BYTES = 4u * 1024 * 1024;
+
 // 控制指令 CmdID 命名空间
 namespace Cmd {
     // === 已有指令（向后兼容，老格式） ===
@@ -23,23 +30,31 @@ namespace Cmd {
     constexpr uint32_t TEXT_CURSOR_STATE = 2;
 
     // === 通用 ===
-    constexpr uint32_t HEARTBEAT = 1;   // 双向, 空 payload
+    constexpr uint32_t HEARTBEAT = 1;   // 双向, 空 payload（收到即原样回一条）
     constexpr uint32_t HELLO = 3;       // 双向, JSON: {"proto_ver":1,"caps":["cursor","display"]}
 
+    // === 认证（分级授权）===
+    // 光标推送、显示器列表/模式查询等只读操作**不需要**认证，
+    // 因此老客户端无需任何改动即可继续工作。
+    // 只有会改变系统状态的指令（DISPLAY_SWITCH / DISPLAY_MODE_SET / DISPLAY_SCALE_SET）
+    // 要求该连接先通过 AUTH_REQ 提交令牌。令牌见 exe 同目录的 moonlight_sideband.ini。
+    constexpr uint32_t AUTH_REQ = 4;    // Android -> PC, JSON: {"token":"..."}
+    constexpr uint32_t AUTH_RESP = 5;   // PC -> Android, JSON: {"ok":true} 或 {"ok":false,"error":"bad_token"}
+
     // === Display 控制 (阶段 2 实现) ===
-    constexpr uint32_t DISPLAY_LIST_REQ = 10;     // Android -> PC, 空
+    constexpr uint32_t DISPLAY_LIST_REQ = 10;     // Android -> PC, 空                    [只读]
     constexpr uint32_t DISPLAY_LIST_RESP = 11;    // PC -> Android, JSON: [{id,name,w,h,is_primary},...]
-    constexpr uint32_t DISPLAY_SWITCH = 12;       // Android -> PC, JSON: {display_id}
+    constexpr uint32_t DISPLAY_SWITCH = 12;       // Android -> PC, JSON: {display_id}     [需认证]
     constexpr uint32_t DISPLAY_CURRENT = 13;      // PC -> Android (事件通知), JSON: {display_id,w,h,refresh,scale}
 
     // === Display 模式 / 缩放修改 ===
     // 查询某显示器支持的所有显示模式
-    constexpr uint32_t DISPLAY_MODE_LIST_REQ = 14;  // Android -> PC, JSON: {display_id}
+    constexpr uint32_t DISPLAY_MODE_LIST_REQ = 14;  // Android -> PC, JSON: {display_id}   [只读]
     constexpr uint32_t DISPLAY_MODE_LIST_RESP = 15; // PC -> Android, JSON: {display_id, modes:[{w,h,refresh,bpp},...]}
     // 设置分辨率/刷新率（立即生效）
-    constexpr uint32_t DISPLAY_MODE_SET = 16;       // Android -> PC, JSON: {display_id,w,h,refresh}
-    // 设置缩放（写注册表，需要注销/登录生效）
-    constexpr uint32_t DISPLAY_SCALE_SET = 17;      // Android -> PC, JSON: {display_id,scale}
+    constexpr uint32_t DISPLAY_MODE_SET = 16;       // Android -> PC, JSON: {display_id,w,h,refresh}  [需认证]
+    // 设置缩放（CCD API，即时生效）
+    constexpr uint32_t DISPLAY_SCALE_SET = 17;      // Android -> PC, JSON: {display_id,scale}        [需认证]
 
     // === Sunshine 配置 (阶段 3) ===
     constexpr uint32_t SUNSHINE_CONFIG_READ = 20;

@@ -511,6 +511,7 @@ void CursorModule::Stop()
 
     m_exit = true;
     m_cvCursorChanged.notify_all();
+    m_cvTextCursor.notify_all();
 
     // 通知钩子线程退出消息循环
     if (m_hookThreadId != 0)
@@ -636,18 +637,43 @@ void CursorModule::WorkerLoop()
     }
 }
 
+void CursorModule::PokeTextCursor(bool force)
+{
+    // 由低级钩子回调调用 —— 只允许做常数时间的工作然后立刻返回
+    {
+        std::lock_guard<std::mutex> l(m_mutexTextCursor);
+        m_textCursorPoke = true;
+        if (force)
+            m_textCursorPokeForce = true;
+    }
+    m_cvTextCursor.notify_one();
+}
+
 void CursorModule::TextCursorMonitorLoop()
 {
     Logger::Get().Info("CursorModule: 文本光标监控线程已启动");
+
     while (!m_exit)
     {
         try
         {
-            if (m_server.HasClients())
+            bool force = false;
             {
-                UpdateTextCursorState();
+                // 有输入事件就立刻醒，否则每 100ms 兜底轮询一次
+                std::unique_lock<std::mutex> l(m_mutexTextCursor);
+                m_cvTextCursor.wait_for(l, std::chrono::milliseconds(100),
+                                        [this] { return m_textCursorPoke || m_exit; });
+                if (m_exit)
+                    break;
+                force = m_textCursorPokeForce;
+                m_textCursorPoke = false;
+                m_textCursorPokeForce = false;
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+            // UpdateTextCursorState 现在只在本线程调用，
+            // 其内部的 static 缓存不再有跨线程竞争
+            if (m_server.HasClients())
+                UpdateTextCursorState(force);
         }
         catch (const std::exception &e)
         {
@@ -766,11 +792,17 @@ void CALLBACK CursorModule::WinEventProc(HWINEVENTHOOK, DWORD, HWND, LONG id, LO
     }
 }
 
+// 低级钩子回调铁律：常数时间内返回。
+// 它跑在全系统每一次鼠标事件上，一旦单次超过 LowLevelHooksTimeout
+//（HKCU\Control Panel\Desktop\LowLevelHooksTimeout，默认 300ms），
+// Windows 会不声不响地把这个钩子摘掉，而且期间整个系统的输入都会卡顿。
+// 原实现在这里同步调用 UpdateTextCursorState()，里面有 GetGUIThreadInfo /
+// GetWindowRect 等可能阻塞在别的进程上的调用 —— 现在只置标志并唤醒工作线程。
 LRESULT CALLBACK CursorModule::MouseProc(int nCode, WPARAM wParam, LPARAM lParam)
 {
     if (nCode == HC_ACTION && s_instance && wParam == WM_LBUTTONUP)
     {
-        s_instance->UpdateTextCursorState(true);
+        s_instance->PokeTextCursor(true);
     }
     return CallNextHookEx(s_instance ? s_instance->m_hMouseHook : NULL, nCode, wParam, lParam);
 }
@@ -781,7 +813,7 @@ LRESULT CALLBACK CursorModule::KeyboardProc(int nCode, WPARAM wParam, LPARAM lPa
     {
         if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)
         {
-            s_instance->UpdateTextCursorState();
+            s_instance->PokeTextCursor(false);
         }
     }
     return CallNextHookEx(s_instance ? s_instance->m_hKeyboardHook : NULL, nCode, wParam, lParam);
