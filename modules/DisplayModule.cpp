@@ -305,6 +305,9 @@ void DisplayModule::OnClientConnected(SidebandSession &)
 
 std::vector<DisplayModule::DisplayInfo> DisplayModule::EnumerateDisplays() const
 {
+    // 防止与 ChangeDisplaySettingsExW / SetDisplayConfig 并发导致 CCD 缓冲区溢出
+    std::lock_guard<std::mutex> lock(m_displayMutex);
+
     std::vector<DisplayInfo> result;
 
     // 用 EnumDisplayMonitors 获取真正在桌面中的显示器列表 + 主显示器
@@ -725,35 +728,50 @@ DisplayModule::SwitchResult DisplayModule::SwitchPrimaryDisplay(const std::strin
     // 方法 1：CCD 供给配置——显式只激活目标 target（其余全部停用）。
     // 这是唯一能在"同一 source 多个 target"（如 DISPLAY1#4352 / DISPLAY1#4353）
     // 之间来回切换的方法；SDC_TOPOLOGY_* 无法指定 target（见 ActivateTargetExclusive 注释）。
-    if (targetId != 0xFFFFFFFF && ActivateTargetExclusive(targetDevName, targetId))
+    if (targetId != 0xFFFFFFFF)
     {
-        // 验证真的生效：SetDisplayConfig 可能返回成功但拓扑实际未变，
-        // 不验证就会给客户端假的 ok:true
-        if (VerifyTargetActive(targetId, 8, 250))
+        bool activated;
         {
-            Logger::Get().Info("DisplayModule: 已切换到 ", displayId, " (CCD 供给配置, 已验证)");
-            std::lock_guard<std::mutex> l(m_mutex);
-            m_lastPrimaryId.clear();
-            return SwitchResult::Ok;
+            // 持锁防止与 EnumerateDisplays 并发导致 CCD 缓冲区溢出
+            std::lock_guard<std::mutex> dl(m_displayMutex);
+            activated = ActivateTargetExclusive(targetDevName, targetId);
         }
-        Logger::Get().Warning("DisplayModule: CCD 供给配置提交成功但未生效，尝试回退方案");
+        if (activated)
+        {
+            // 验证真的生效：SetDisplayConfig 可能返回成功但拓扑实际未变，
+            // 不验证就会给客户端假的 ok:true
+            if (VerifyTargetActive(targetId, 8, 250))
+            {
+                Logger::Get().Info("DisplayModule: 已切换到 ", displayId, " (CCD 供给配置, 已验证)");
+                std::lock_guard<std::mutex> l(m_mutex);
+                m_lastPrimaryId.clear();
+                return SwitchResult::Ok;
+            }
+            Logger::Get().Warning("DisplayModule: CCD 供给配置提交成功但未生效，尝试回退方案");
+        }
     }
 
     // 方法 2（回退）：目标未启用时用拓扑切换（Win+P 效果，无法指定具体 target）
     if (!target->isActive)
     {
-        bool isInternal = FindInactiveTargetIsInternal(targetDevName, targetId);
-        uint32_t flags = SDC_APPLY | SDC_NO_OPTIMIZATION;
-        if (isInternal)
-            flags |= SDC_TOPOLOGY_INTERNAL;
-        else
-            flags |= SDC_TOPOLOGY_EXTERNAL;
+        LONG result;
+        bool isInternal;
+        {
+            // 持锁保护 FindInactiveTargetIsInternal 与 SetDisplayConfig 的 CCD 查询
+            std::lock_guard<std::mutex> dl(m_displayMutex);
+            isInternal = FindInactiveTargetIsInternal(targetDevName, targetId);
+            uint32_t flags = SDC_APPLY | SDC_NO_OPTIMIZATION;
+            if (isInternal)
+                flags |= SDC_TOPOLOGY_INTERNAL;
+            else
+                flags |= SDC_TOPOLOGY_EXTERNAL;
 
-        LONG result = SetDisplayConfig(0, nullptr, 0, nullptr, flags);
+            result = SetDisplayConfig(0, nullptr, 0, nullptr, flags);
+        }
         if (result == ERROR_SUCCESS && VerifyTargetActive(targetId, 8, 250))
         {
             Logger::Get().Info("DisplayModule: SetDisplayConfig 拓扑切换到",
-                               (isInternal ? "内部" : "外部"), "显示器 ", displayId, " (已验证)");
+                                (isInternal ? "内部" : "外部"), "显示器 ", displayId, " (已验证)");
             std::lock_guard<std::mutex> l(m_mutex);
             m_lastPrimaryId.clear();
             return SwitchResult::Ok;
@@ -767,73 +785,78 @@ DisplayModule::SwitchResult DisplayModule::SwitchPrimaryDisplay(const std::strin
     // 目标已启用：用 ChangeDisplaySettingsExW 切换主显示器
     Logger::Get().Debug("DisplayModule: 切换主显示器 ", displayId);
 
-    // 1. 启用目标显示器，设为 (0,0) + CDS_SET_PRIMARY
-    DEVMODEW targetDm = {};
-    targetDm.dmSize = sizeof(targetDm);
-    targetDm.dmDriverExtra = 0;
-
-    if (!EnumDisplaySettingsExW(targetDevName.c_str(), ENUM_CURRENT_SETTINGS, &targetDm, 0))
     {
-        if (!EnumDisplaySettingsExW(targetDevName.c_str(), ENUM_REGISTRY_SETTINGS, &targetDm, 0))
+        // 持锁防止与 EnumerateDisplays 并发
+        std::lock_guard<std::mutex> dl(m_displayMutex);
+
+        // 1. 启用目标显示器，设为 (0,0) + CDS_SET_PRIMARY
+        DEVMODEW targetDm = {};
+        targetDm.dmSize = sizeof(targetDm);
+        targetDm.dmDriverExtra = 0;
+
+        if (!EnumDisplaySettingsExW(targetDevName.c_str(), ENUM_CURRENT_SETTINGS, &targetDm, 0))
         {
-            Logger::Get().Error("DisplayModule: 获取目标显示器模式失败");
+            if (!EnumDisplaySettingsExW(targetDevName.c_str(), ENUM_REGISTRY_SETTINGS, &targetDm, 0))
+            {
+                Logger::Get().Error("DisplayModule: 获取目标显示器模式失败");
+                return SwitchResult::ApiFailed;
+            }
+        }
+
+        targetDm.dmFields = DM_POSITION | DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
+        targetDm.dmPosition.x = 0;
+        targetDm.dmPosition.y = 0;
+
+        LONG r1 = ChangeDisplaySettingsExW(targetDevName.c_str(), &targetDm, nullptr,
+                                           CDS_SET_PRIMARY | CDS_UPDATEREGISTRY | CDS_NORESET,
+                                           nullptr);
+        if (r1 != DISP_CHANGE_SUCCESSFUL)
+        {
+            Logger::Get().Error("DisplayModule: 设置主显示器失败, code=", r1);
             return SwitchResult::ApiFailed;
         }
-    }
 
-    targetDm.dmFields = DM_POSITION | DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
-    targetDm.dmPosition.x = 0;
-    targetDm.dmPosition.y = 0;
+        // 2. 禁用其他所有显示器
+        // 注意：d.id 形如 "\\.\DISPLAY2#4353"，必须先去掉 #targetId 后缀才是
+        // ChangeDisplaySettingsExW 能识别的 GDI 设备名；同一 GDI source 只处理一次
+        std::set<std::string> handledGdi;
+        for (const auto &d : displays)
+        {
+            std::string otherGdi = ParseGdiName(d.id);
+            if (_stricmp(otherGdi.c_str(), gdiNameStr.c_str()) == 0)
+                continue;  // 目标所在的 source 不能禁
+            if (!handledGdi.insert(otherGdi).second)
+                continue;  // 该 source 已处理过
+            if (!d.isActive)
+                continue;  // 本来就没启用
 
-    LONG r1 = ChangeDisplaySettingsExW(targetDevName.c_str(), &targetDm, nullptr,
-                                       CDS_SET_PRIMARY | CDS_UPDATEREGISTRY | CDS_NORESET,
-                                       nullptr);
-    if (r1 != DISP_CHANGE_SUCCESSFUL)
-    {
-        Logger::Get().Error("DisplayModule: 设置主显示器失败, code=", r1);
-        return SwitchResult::ApiFailed;
-    }
+            std::wstring devName(otherGdi.begin(), otherGdi.end());
+            DEVMODEW dm = {};
+            dm.dmSize = sizeof(dm);
+            dm.dmDriverExtra = 0;
 
-    // 2. 禁用其他所有显示器
-    // 注意：d.id 形如 "\\.\DISPLAY2#4353"，必须先去掉 #targetId 后缀才是
-    // ChangeDisplaySettingsExW 能识别的 GDI 设备名；同一 GDI source 只处理一次
-    std::set<std::string> handledGdi;
-    for (const auto &d : displays)
-    {
-        std::string otherGdi = ParseGdiName(d.id);
-        if (_stricmp(otherGdi.c_str(), gdiNameStr.c_str()) == 0)
-            continue;  // 目标所在的 source 不能禁
-        if (!handledGdi.insert(otherGdi).second)
-            continue;  // 该 source 已处理过
-        if (!d.isActive)
-            continue;  // 本来就没启用
+            if (!EnumDisplaySettingsExW(devName.c_str(), ENUM_CURRENT_SETTINGS, &dm, 0))
+                EnumDisplaySettingsExW(devName.c_str(), ENUM_REGISTRY_SETTINGS, &dm, 0);
 
-        std::wstring devName(otherGdi.begin(), otherGdi.end());
-        DEVMODEW dm = {};
-        dm.dmSize = sizeof(dm);
-        dm.dmDriverExtra = 0;
+            dm.dmFields = DM_POSITION | DM_PELSWIDTH | DM_PELSHEIGHT;
+            dm.dmPelsWidth = 0;
+            dm.dmPelsHeight = 0;
+            dm.dmPosition.x = 0;
+            dm.dmPosition.y = 0;
 
-        if (!EnumDisplaySettingsExW(devName.c_str(), ENUM_CURRENT_SETTINGS, &dm, 0))
-            EnumDisplaySettingsExW(devName.c_str(), ENUM_REGISTRY_SETTINGS, &dm, 0);
+            LONG rd = ChangeDisplaySettingsExW(devName.c_str(), &dm, nullptr,
+                                               CDS_UPDATEREGISTRY | CDS_NORESET, nullptr);
+            if (rd != DISP_CHANGE_SUCCESSFUL)
+                Logger::Get().Warning("DisplayModule: 禁用 ", otherGdi, " 失败 code=", rd);
+        }
 
-        dm.dmFields = DM_POSITION | DM_PELSWIDTH | DM_PELSHEIGHT;
-        dm.dmPelsWidth = 0;
-        dm.dmPelsHeight = 0;
-        dm.dmPosition.x = 0;
-        dm.dmPosition.y = 0;
-
-        LONG rd = ChangeDisplaySettingsExW(devName.c_str(), &dm, nullptr,
-                                           CDS_UPDATEREGISTRY | CDS_NORESET, nullptr);
-        if (rd != DISP_CHANGE_SUCCESSFUL)
-            Logger::Get().Warning("DisplayModule: 禁用 ", otherGdi, " 失败 code=", rd);
-    }
-
-    // 3. 应用所有更改
-    LONG r2 = ChangeDisplaySettingsExW(nullptr, nullptr, nullptr, 0, nullptr);
-    if (r2 != DISP_CHANGE_SUCCESSFUL)
-    {
-        Logger::Get().Error("DisplayModule: 应用更改失败, code=", r2);
-        return SwitchResult::ApiFailed;
+        // 3. 应用所有更改
+        LONG r2 = ChangeDisplaySettingsExW(nullptr, nullptr, nullptr, 0, nullptr);
+        if (r2 != DISP_CHANGE_SUCCESSFUL)
+        {
+            Logger::Get().Error("DisplayModule: 应用更改失败, code=", r2);
+            return SwitchResult::ApiFailed;
+        }
     }
 
     // 最终验证：确保目标 target 真的处于激活状态，绝不给客户端假的 ok:true
@@ -856,6 +879,8 @@ DisplayModule::SwitchResult DisplayModule::SwitchPrimaryDisplay(const std::strin
 
 std::vector<DisplayModule::DisplayMode> DisplayModule::EnumerateModes(const std::string &displayId) const
 {
+    std::lock_guard<std::mutex> lock(m_displayMutex);
+
     std::vector<DisplayMode> result;
     std::string gdiNameStr = ParseGdiName(displayId);
     std::wstring devName(gdiNameStr.begin(), gdiNameStr.end());
@@ -955,20 +980,28 @@ DisplayModule::SetModeResult DisplayModule::SetDisplayMode(const std::string &di
     dm.dmDisplayFrequency = (DWORD)refresh;
     dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
 
-    LONG r = ChangeDisplaySettingsExW(devName.c_str(), &dm, nullptr,
-                                       CDS_UPDATEREGISTRY | CDS_NORESET, nullptr);
-    if (r != DISP_CHANGE_SUCCESSFUL)
+    // 持有互斥锁以防止 CCD 查询（EnumerateDisplays）在模式变更期间并发执行，
+    // 避免 GetDisplayConfigBufferSizes / QueryDisplayConfig 之间的 TOCTOU 竞争。
+    // EnumerateDisplays / EnumerateModes 已在函数开头各自获取了同一把锁，
+    // 但在它们返回后锁已释放，这里重新获取不影响。
     {
-        Logger::Get().Error("DisplayModule: 设置模式失败 code=", r);
-        return SetModeResult::ApiFailed;
-    }
+        std::lock_guard<std::mutex> lock(m_displayMutex);
 
-    // 应用
-    r = ChangeDisplaySettingsExW(nullptr, nullptr, nullptr, 0, nullptr);
-    if (r != DISP_CHANGE_SUCCESSFUL)
-    {
-        Logger::Get().Error("DisplayModule: 应用模式失败 code=", r);
-        return SetModeResult::ApiFailed;
+        LONG r = ChangeDisplaySettingsExW(devName.c_str(), &dm, nullptr,
+                                           CDS_UPDATEREGISTRY | CDS_NORESET, nullptr);
+        if (r != DISP_CHANGE_SUCCESSFUL)
+        {
+            Logger::Get().Error("DisplayModule: 设置模式失败 code=", r);
+            return SetModeResult::ApiFailed;
+        }
+
+        // 应用
+        r = ChangeDisplaySettingsExW(nullptr, nullptr, nullptr, 0, nullptr);
+        if (r != DISP_CHANGE_SUCCESSFUL)
+        {
+            Logger::Get().Error("DisplayModule: 应用模式失败 code=", r);
+            return SetModeResult::ApiFailed;
+        }
     }
 
     Logger::Get().Info("DisplayModule: 已设置 ", displayId, " -> ", w, "x", h, "@", refresh);
@@ -1019,18 +1052,23 @@ DisplayModule::SetScaleResult DisplayModule::SetDisplayScale(const std::string &
     uint32_t targetId = ParseTargetId(displayId);
     std::wstring devName(gdiNameStr.begin(), gdiNameStr.end());
     LUID adapterId = {};
-    if (targetId == 0xFFFFFFFF || !FindTargetByGdiNameAndId(devName, targetId, adapterId))
-    {
-        Logger::Get().Error("DisplayModule: 找不到显示器 ", displayId, " 的 CCD target");
-        return SetScaleResult::NotFound;
-    }
 
-    if (SetDpiScaling(adapterId, targetId, scale))
+    // 持锁防止与 EnumerateDisplays 并发导致 CCD 查询结果不一致
     {
-        if (immediate) *immediate = true;
-        Logger::Get().Info("DisplayModule: 已设置缩放 ", displayId, " -> ", scale,
-                           "% (CCD API, 即时生效)");
-        return SetScaleResult::Ok;
+        std::lock_guard<std::mutex> dl(m_displayMutex);
+        if (targetId == 0xFFFFFFFF || !FindTargetByGdiNameAndId(devName, targetId, adapterId))
+        {
+            Logger::Get().Error("DisplayModule: 找不到显示器 ", displayId, " 的 CCD target");
+            return SetScaleResult::NotFound;
+        }
+
+        if (SetDpiScaling(adapterId, targetId, scale))
+        {
+            if (immediate) *immediate = true;
+            Logger::Get().Info("DisplayModule: 已设置缩放 ", displayId, " -> ", scale,
+                               "% (CCD API, 即时生效)");
+            return SetScaleResult::Ok;
+        }
     }
 
     Logger::Get().Error("DisplayModule: CCD API 设置缩放失败 ", displayId, " -> ", scale, "%");

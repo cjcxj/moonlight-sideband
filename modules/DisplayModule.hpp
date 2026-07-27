@@ -126,6 +126,13 @@ private:
     bool m_wakeRequested = false;
     mutable std::mutex m_mutex;
 
+    // 保护显示器枚举与模式变更之间的并发冲突：
+    // EnumerateDisplays (MonitorLoop) vs ChangeDisplaySettingsExW / SetDisplayConfig (OnCommand)
+    // 前者调用 CCD 查询读取显示配置，后者通过 CCD/GDI API 修改 ——
+    // 并发时 GetDisplayConfigBufferSizes/QueryDisplayConfig 可能拿到过期的大小
+    // 导致缓冲区溢出，破坏堆元数据。
+    mutable std::mutex m_displayMutex;
+
     // 上次已知的主显示器信息（用于变化检测）
     std::string m_lastPrimaryId;
     int m_lastPrimaryWidth = 0;
