@@ -688,8 +688,18 @@ void CursorModule::TextCursorMonitorLoop()
 
 bool CursorModule::GetCaretScreenPosition(int &outX, int &outY)
 {
+    // 必须取前台窗口所属线程：GetGUIThreadInfo(0) 拿的是"调用线程"的 GUI 状态，
+    // 而本函数跑在 m_textCursorThread 工作线程上，没有 GUI 消息队列，
+    // 永远拿不到 caret/focus。前台窗口的线程才有这些信息。
+    HWND hwndForeground = GetForegroundWindow();
+    if (!hwndForeground)
+        return false;
+    DWORD foregroundThreadId = GetWindowThreadProcessId(hwndForeground, nullptr);
+    if (foregroundThreadId == 0)
+        return false;
+
     GUITHREADINFO gti = {sizeof(GUITHREADINFO)};
-    if (GetGUIThreadInfo(0, &gti))
+    if (GetGUIThreadInfo(foregroundThreadId, &gti))
     {
         if (gti.hwndCaret && gti.rcCaret.left >= 0)
         {
