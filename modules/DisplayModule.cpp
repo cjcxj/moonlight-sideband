@@ -1489,7 +1489,7 @@ void DisplayModule::MonitorLoop()
         // 等待重启间隔，期间仍响应 Stop()
         {
             std::unique_lock<std::mutex> l(m_wakeMutex);
-            m_wakeCv.wait_for(l, kRestartDelay, [this] { return m_exit; });
+            m_wakeCv.wait_for(l, kRestartDelay, [this] { return m_exit.load(); });
             m_wakeRequested = false;
         }
     }
