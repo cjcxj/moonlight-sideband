@@ -26,6 +26,7 @@
 #include <set>
 #include <algorithm>
 #include <cstring>
+#include <memory>        // unique_ptr：CCD 查询用裸数组缓冲，防止驱动越界写破坏 vector
 #include <typeinfo>      // typeid：MonitorLoop 异常诊断输出异常类型名
 
 // 字符串/JSON 辅助已拆到 Win32Util.hpp / Json.hpp。
@@ -130,8 +131,6 @@ static bool QueryDisplayConfigData(UINT32 flags,
 
     constexpr UINT32 kMaxPaths = 1024;
     constexpr UINT32 kMaxModes = 4096;
-    constexpr UINT32 kPathSlack = 16;
-    constexpr UINT32 kModeSlack = 64;
     constexpr int kMaxRetries = 3;
 
     UINT32 numPaths = 0, numModes = 0;
@@ -154,30 +153,40 @@ static bool QueryDisplayConfigData(UINT32 flags,
         t_lastPathCount = numPaths;
         t_lastModeCount = numModes;
 
-        const UINT32 allocPaths = numPaths + kPathSlack;
-        const UINT32 allocModes = numModes + kModeSlack;
-        paths.resize(allocPaths);
-        modes.resize(allocModes);
+        // 固定按上限分配，不再按"报告值+余量"：切换过程中 CCD 计数会在
+        // GetDisplayConfigBufferSizes 与 QueryDisplayConfig 之间剧烈增长
+        //（本机 1 台真实显示器却有 16→32 条 CCD 路径），按报告值分配会被
+        // 驱动写穿、破坏堆 → 后续任意 vector 操作抛 "vector too long"。
+        // 固定 1024/4096 给足 32~64 倍余量，驱动物理上写不穿。
+        // 用裸数组而非 vector 接收：极端情况下越界写也只伤我们自己的缓冲区
+        // 尾部，不碰 vector 内部结构 / 相邻堆元数据，确认无误后再拷进 vector。
+        const UINT32 allocPaths = kMaxPaths;
+        const UINT32 allocModes = kMaxModes;
+        std::unique_ptr<DISPLAYCONFIG_PATH_INFO[]> pathBuf(new DISPLAYCONFIG_PATH_INFO[allocPaths]);
+        std::unique_ptr<DISPLAYCONFIG_MODE_INFO[]> modeBuf(new DISPLAYCONFIG_MODE_INFO[allocModes]);
 
         UINT32 retPaths = allocPaths, retModes = allocModes;
-        LONG r = QueryDisplayConfig(flags, &retPaths, paths.data(),
-                                    &retModes, modes.data(), nullptr);
+        LONG r = QueryDisplayConfig(flags, &retPaths, pathBuf.get(),
+                                    &retModes, modeBuf.get(), nullptr);
         if (r == ERROR_SUCCESS)
         {
-            // 驱动返回的计数超过已分配缓冲区（含余量）说明它无视缓冲大小，
-            // 内存已被越界写破坏，防御性拒绝，绝不能让 resize 再往大里走。
+            // 返回计数仍超上限：缓冲区可能已被写穿，防御性拒绝，
+            // 绝不把超大计数传进 vector 的 assign/resize。
             if (retPaths > allocPaths || retModes > allocModes)
+            {
+                Logger::Get().Error("DisplayModule: CCD 返回计数超上限 paths=", retPaths,
+                                    " modes=", retModes);
                 return false;
-            paths.resize(retPaths);
-            modes.resize(retModes);
+            }
+            paths.assign(pathBuf.get(), pathBuf.get() + retPaths);
+            modes.assign(modeBuf.get(), modeBuf.get() + retModes);
             return true;
         }
 
         if (r != ERROR_INSUFFICIENT_BUFFER)
             return false;
 
-        // 配置在两次查询之间增长：以 QueryDisplayConfig 自己返回的必要大小
-        // （retPaths/retModes）为准重新分配再试，避免再次拿到过期计数
+        // 配置增长：以 QueryDisplayConfig 返回的必要大小为准重试
         Logger::Get().Warning("DisplayModule: CCD 缓冲区不足 flags=", flags,
                               " 报告 paths=", numPaths, " modes=", numModes,
                               " 需 paths=", retPaths, " modes=", retModes, "，重试");
