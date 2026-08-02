@@ -678,7 +678,8 @@ std::vector<DisplayModule::DisplayInfo> DisplayModule::EnumerateDisplays() const
         adapter.cb = sizeof(adapter);
         for (DWORD i = 0; EnumDisplayDevicesW(nullptr, i, &adapter, 0); ++i)
         {
-            if (_wcsicmp(adapter.DeviceName, gdiName.c_str()) == 0)
+            if (BoundedWideEquals(adapter.DeviceName, _countof(adapter.DeviceName),
+                                  gdiName.c_str()))
             {
                 info.adapterName = WideToUtf8(adapter.DeviceString);
                 break;
