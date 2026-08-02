@@ -171,6 +171,7 @@ int main(int, char *[])
     Logger::Get().Init(lvl, cfg.logMaxBytes);
 
     Logger::Get().Info("======= moonlight-sideband 启动 =======");
+    Logger::Get().Info("构建版本: ", SIDEBAND_BUILD_COMMIT, " (", __DATE__, " ", __TIME__, ")");
     Logger::Get().Info("协议版本: 1, 端口: ", cfg.port,
                        ", 监听: ", (cfg.loopbackOnly ? "仅本机" : "全部网卡"));
     Logger::Get().Info("配置文件: ", Win32Util::WideToUtf8(Config::FilePath()));

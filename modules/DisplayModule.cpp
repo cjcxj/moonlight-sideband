@@ -176,12 +176,13 @@ static bool QueryDisplayConfigData(UINT32 flags,
         if (r != ERROR_INSUFFICIENT_BUFFER)
             return false;
 
-        // 配置在两次查询之间增长：重新取大小再试
+        // 配置在两次查询之间增长：以 QueryDisplayConfig 自己返回的必要大小
+        // （retPaths/retModes）为准重新分配再试，避免再次拿到过期计数
         Logger::Get().Warning("DisplayModule: CCD 缓冲区不足 flags=", flags,
                               " 报告 paths=", numPaths, " modes=", numModes,
-                              "，重试");
-        if (GetDisplayConfigBufferSizes(flags, &numPaths, &numModes) != ERROR_SUCCESS)
-            return false;
+                              " 需 paths=", retPaths, " modes=", retModes, "，重试");
+        numPaths = std::max(numPaths, retPaths);
+        numModes = std::max(numModes, retModes);
         if (!countsOk())
             return false;
     }
