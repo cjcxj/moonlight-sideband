@@ -744,8 +744,90 @@ static bool FindInactiveTargetIsInternal(const std::wstring &gdiName, uint32_t t
 // target）时，当前拓扑已是 EXTERNAL，再调 SDC_TOPOLOGY_EXTERNAL 是 no-op：
 // 返回成功但什么都没变。这里改为提供显式 path 数组：只包含目标 target 的
 // path，其余 path 一律不提供（即停用），让 Windows 重算模式。
+//
+// 优先从显示器数据库（QDC_DATABASE_CURRENT）恢复该 target 上次保存的拓扑与模式：
+// Windows 自带切换（Win+P）能保留分辨率/刷新率/缩放，正是因为切换时应用的是
+// 数据库里保存的配置，而不是让驱动重选默认模式；这里先尝试同样从数据库取回
+// path + mode 提交，失败再回退到"模式索引置无效、由系统自选"的旧逻辑。
 static bool ActivateTargetExclusive(const std::wstring &gdiName, uint32_t targetId)
 {
+    // 方法 A：从数据库恢复已保存配置（与 Win+P 行为一致）
+    {
+        std::vector<DISPLAYCONFIG_PATH_INFO> dbPaths;
+        std::vector<DISPLAYCONFIG_MODE_INFO> dbModes;
+        if (QueryDisplayConfigData(QDC_DATABASE_CURRENT, dbPaths, dbModes))
+        {
+            // 数据库 path 需同时满足：targetId 匹配 + 连接器可用 + source/target
+            // 都指向 dbModes 内的合法已保存模式（否则退回让系统自选）
+            auto usable = [&](const DISPLAYCONFIG_PATH_INFO &dbp) {
+                if (dbp.targetInfo.id != targetId)
+                    return false;
+                if (!dbp.targetInfo.targetAvailable)
+                    return false;
+                if (dbp.sourceInfo.modeInfoIdx == DISPLAYCONFIG_PATH_MODE_IDX_INVALID ||
+                    dbp.targetInfo.modeInfoIdx == DISPLAYCONFIG_PATH_MODE_IDX_INVALID)
+                    return false;
+                return dbp.sourceInfo.modeInfoIdx < dbModes.size() &&
+                       dbp.targetInfo.modeInfoIdx < dbModes.size();
+            };
+
+            int exactIdx = -1, looseIdx = -1;
+            for (int i = 0; i < (int)dbPaths.size(); ++i)
+            {
+                if (!usable(dbPaths[i]))
+                    continue;
+
+                if (looseIdx < 0)
+                    looseIdx = i;
+
+                DISPLAYCONFIG_SOURCE_DEVICE_NAME srcName = {};
+                srcName.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+                srcName.header.size = sizeof(srcName);
+                srcName.header.adapterId = dbPaths[i].sourceInfo.adapterId;
+                srcName.header.id = dbPaths[i].sourceInfo.id;
+                if (DisplayConfigGetDeviceInfo(&srcName.header) != ERROR_SUCCESS)
+                    continue;
+
+                if (_wcsicmp(srcName.viewGdiDeviceName, gdiName.c_str()) == 0)
+                {
+                    exactIdx = i;
+                    break;
+                }
+            }
+
+            int dbIdx = (exactIdx >= 0) ? exactIdx : looseIdx;
+            if (dbIdx >= 0)
+            {
+                DISPLAYCONFIG_PATH_INFO p = dbPaths[dbIdx];
+                p.flags = DISPLAYCONFIG_PATH_ACTIVE;
+                p.sourceInfo.statusFlags = 0;
+                p.targetInfo.statusFlags = 0;
+
+                // 只携带本 path 引用的 source/target 两个 mode 并重映射索引，
+                // 避免把数据库里其他显示器的 mode 一起提交（部分驱动会拒绝）
+                std::vector<DISPLAYCONFIG_MODE_INFO> modeSubset;
+                modeSubset.push_back(dbModes[p.sourceInfo.modeInfoIdx]);
+                p.sourceInfo.modeInfoIdx = 0;
+                modeSubset.push_back(dbModes[p.targetInfo.modeInfoIdx]);
+                p.targetInfo.modeInfoIdx = 1;
+
+                LONG r = SetDisplayConfig(1, &p, (UINT32)modeSubset.size(),
+                                          modeSubset.data(),
+                                          SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG |
+                                          SDC_ALLOW_CHANGES | SDC_SAVE_TO_DATABASE);
+                if (r == ERROR_SUCCESS)
+                {
+                    Logger::Get().Debug("DisplayModule: ActivateTargetExclusive 从数据库恢复配置 targetId=",
+                                        targetId, (exactIdx >= 0 ? " (精确匹配)" : " (宽松匹配)"));
+                    return true;
+                }
+                Logger::Get().Warning("DisplayModule: 从数据库恢复配置 SetDisplayConfig 失败 code=", r,
+                                      "，回退模式自选");
+            }
+        }
+    }
+
+    // 方法 B（回退）：QDC_ALL_PATHS 找可用 path，模式索引置无效让系统自选
     std::vector<DISPLAYCONFIG_PATH_INFO> paths;
     std::vector<DISPLAYCONFIG_MODE_INFO> modes;
     if (!QueryDisplayConfigData(QDC_ALL_PATHS, paths, modes))
