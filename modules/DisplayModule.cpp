@@ -26,6 +26,7 @@
 #include <set>
 #include <algorithm>
 #include <cstring>
+#include <cwchar>
 #include <memory>        // unique_ptr：CCD 查询用裸数组缓冲，防止驱动越界写破坏 vector
 #include <typeinfo>      // typeid：MonitorLoop 异常诊断输出异常类型名
 
@@ -46,6 +47,10 @@ using Win32Util::WideToUtf8;
 static thread_local uint32_t t_lastPathCount = 0;
 static thread_local uint32_t t_lastModeCount = 0;
 static thread_local size_t t_lastMonitorCount = 0;
+
+// 记录 MonitorLoop 当前执行到哪个阶段，异常时精确定位抛出点
+//（enumerate / hash / push / qdc_get_size / qdc_query / enum_monitors ...）。
+static thread_local const char *t_loopPhase = "unknown";
 
 // 提取异常类型名。MSVC 的 typeid 输出形如 "class std::length_error"，
 // 剥掉修饰前缀得到 "std::length_error"。
@@ -71,6 +76,7 @@ static void LogMonitorLoopException(const std::exception *e)
     Logger::Get().Error("monitor_count: ", t_lastMonitorCount);
     Logger::Get().Error("path_count: ", t_lastPathCount);
     Logger::Get().Error("mode_count: ", t_lastModeCount);
+    Logger::Get().Error("phase: ", t_loopPhase);
     Logger::Get().Error("thread: MonitorLoop");
     if (e)
         Logger::Get().Error("what: ", e->what());
@@ -100,6 +106,28 @@ static uint32_t ParseTargetId(const std::string &displayId)
         catch (...) { return 0xFFFFFFFF; }
     }
     return 0xFFFFFFFF;
+}
+
+// 驱动填写的 wchar 数组（viewGdiDeviceName / monitorFriendlyDeviceName 等）在
+// 切换瞬间的易变状态下可能没有空终止符。禁止裸拷贝 / 裸 _wcsicmp —— 它们会
+// 读穿数组边界，把栈上垃圾读成超长字符串，后续 string/vector 按这个长度
+// 操作就会抛 length_error 或访问违规。统一用有界版本。
+static size_t BoundedWideLen(const wchar_t *arr, size_t cap)
+{
+    size_t i = 0;
+    while (i < cap && arr[i]) ++i;
+    return i;
+}
+static std::wstring BoundedWideString(const wchar_t *arr, size_t cap)
+{
+    return std::wstring(arr, BoundedWideLen(arr, cap));
+}
+static bool BoundedWideEquals(const wchar_t *arr, size_t cap, const wchar_t *str)
+{
+    if (!arr || !str) return false;
+    const size_t n = BoundedWideLen(arr, cap);
+    if (n >= cap) return false;  // 数组内无空终止：视为不匹配，绝不读穿
+    return n == wcslen(str) && wcsncmp(arr, str, n) == 0;
 }
 
 // CCD 枚举辅助：按"GetDisplayConfigBufferSizes 取大小 → 分配 → 单次
@@ -134,6 +162,7 @@ static bool QueryDisplayConfigData(UINT32 flags,
     constexpr int kMaxRetries = 3;
 
     UINT32 numPaths = 0, numModes = 0;
+    t_loopPhase = "qdc_get_size";
     if (GetDisplayConfigBufferSizes(flags, &numPaths, &numModes) != ERROR_SUCCESS)
         return false;
 
@@ -166,8 +195,10 @@ static bool QueryDisplayConfigData(UINT32 flags,
         std::unique_ptr<DISPLAYCONFIG_MODE_INFO[]> modeBuf(new DISPLAYCONFIG_MODE_INFO[allocModes]);
 
         UINT32 retPaths = allocPaths, retModes = allocModes;
+        t_loopPhase = "qdc_query";
         LONG r = QueryDisplayConfig(flags, &retPaths, pathBuf.get(),
                                     &retModes, modeBuf.get(), nullptr);
+        t_loopPhase = "qdc_after_query";
         if (r == ERROR_SUCCESS)
         {
             // 返回计数仍超上限：缓冲区可能已被写穿，防御性拒绝，
@@ -298,7 +329,8 @@ static bool FindSourceByGdiNameAndId(const std::wstring &gdiName, uint32_t targe
         if (DisplayConfigGetDeviceInfo(&srcName.header) != ERROR_SUCCESS)
             continue;
 
-        if (_wcsicmp(srcName.viewGdiDeviceName, gdiName.c_str()) == 0)
+        if (BoundedWideEquals(srcName.viewGdiDeviceName, _countof(srcName.viewGdiDeviceName),
+                                    gdiName.c_str()))
         {
             outSourceAdapterId = path.sourceInfo.adapterId;
             outSourceId = path.sourceInfo.id;
@@ -529,6 +561,7 @@ std::vector<DisplayModule::DisplayInfo> DisplayModule::EnumerateDisplays() const
         std::set<std::wstring> activeMonitors;
         std::wstring primaryMonitor;
     } dmData;
+    t_loopPhase = "enum_monitors";
     EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR hMon, HDC, LPRECT, LPARAM dwData) -> BOOL {
         MONITORINFOEXW info = {};
         info.cbSize = sizeof(info);
@@ -559,6 +592,7 @@ std::vector<DisplayModule::DisplayInfo> DisplayModule::EnumerateDisplays() const
     {
         std::vector<DISPLAYCONFIG_PATH_INFO> activePaths;
         std::vector<DISPLAYCONFIG_MODE_INFO> activeModes;
+        t_loopPhase = "enum_ccd_active";
         if (QueryDisplayConfigData(QDC_ONLY_ACTIVE_PATHS, activePaths, activeModes))
         {
             for (const auto &ap : activePaths)
@@ -571,6 +605,7 @@ std::vector<DisplayModule::DisplayInfo> DisplayModule::EnumerateDisplays() const
     // 用 CCD API 获取所有显示路径（只返回实际存在的物理路径，不含虚拟设备）
     std::vector<DISPLAYCONFIG_PATH_INFO> paths;
     std::vector<DISPLAYCONFIG_MODE_INFO> modes;
+    t_loopPhase = "enum_ccd_all";
     if (!QueryDisplayConfigData(QDC_ALL_PATHS, paths, modes))
         return result;
 
@@ -583,6 +618,7 @@ std::vector<DisplayModule::DisplayInfo> DisplayModule::EnumerateDisplays() const
 
     // 遍历 CCD 路径，提取显示器信息
     std::set<std::wstring> seenDevices;  // EDID 去重
+    t_loopPhase = "enum_loop";
     for (const auto &path : paths)
     {
         // 获取 source GDI 设备名（如 "\\.\DISPLAY1"）
@@ -594,7 +630,8 @@ std::vector<DisplayModule::DisplayInfo> DisplayModule::EnumerateDisplays() const
         if (DisplayConfigGetDeviceInfo(&sourceName.header) != ERROR_SUCCESS)
             continue;
 
-        std::wstring gdiName = sourceName.viewGdiDeviceName;
+        std::wstring gdiName = BoundedWideString(sourceName.viewGdiDeviceName,
+                                                 _countof(sourceName.viewGdiDeviceName));
         if (gdiName.empty())
             continue;
 
@@ -614,7 +651,8 @@ std::vector<DisplayModule::DisplayInfo> DisplayModule::EnumerateDisplays() const
         std::wstring friendlyName;
         if (DisplayConfigGetDeviceInfo(&targetName.header) == ERROR_SUCCESS)
         {
-            friendlyName = targetName.monitorFriendlyDeviceName;
+            friendlyName = BoundedWideString(targetName.monitorFriendlyDeviceName,
+                                             _countof(targetName.monitorFriendlyDeviceName));
         }
 
         // 按 target 的 adapterId+id 去重（每个物理接口是唯一的）
@@ -764,7 +802,8 @@ static bool FindInactiveTargetIsInternal(const std::wstring &gdiName, uint32_t t
         if (DisplayConfigGetDeviceInfo(&srcName.header) != ERROR_SUCCESS)
             continue;
 
-        if (_wcsicmp(srcName.viewGdiDeviceName, gdiName.c_str()) != 0)
+        if (!BoundedWideEquals(srcName.viewGdiDeviceName, _countof(srcName.viewGdiDeviceName),
+                       gdiName.c_str()))
             continue;
 
         uint64_t aKey = makeAdapterKey(path.targetInfo.adapterId);
@@ -831,7 +870,8 @@ static bool ActivateTargetExclusive(const std::wstring &gdiName, uint32_t target
                 if (DisplayConfigGetDeviceInfo(&srcName.header) != ERROR_SUCCESS)
                     continue;
 
-                if (_wcsicmp(srcName.viewGdiDeviceName, gdiName.c_str()) == 0)
+                if (BoundedWideEquals(srcName.viewGdiDeviceName, _countof(srcName.viewGdiDeviceName),
+                                    gdiName.c_str()))
                 {
                     exactIdx = i;
                     break;
@@ -898,7 +938,8 @@ static bool ActivateTargetExclusive(const std::wstring &gdiName, uint32_t target
         if (DisplayConfigGetDeviceInfo(&srcName.header) != ERROR_SUCCESS)
             continue;
 
-        if (_wcsicmp(srcName.viewGdiDeviceName, gdiName.c_str()) == 0)
+        if (BoundedWideEquals(srcName.viewGdiDeviceName, _countof(srcName.viewGdiDeviceName),
+                                    gdiName.c_str()))
         {
             exactIdx = i;
             break;
@@ -1711,7 +1752,9 @@ void DisplayModule::MonitorLoop()
             // 不依赖变化检测，确保第一时间把最新状态推给客户端
             bool force = m_forcePush.exchange(false);
 
+            t_loopPhase = "enumerate";
             auto current = EnumerateDisplays();
+            t_loopPhase = "hash";
             uint64_t hash = HashDisplayState(current);
 
             // hash 比较：没有变化就不做任何更新（"不要每次都写"）
@@ -1721,8 +1764,13 @@ void DisplayModule::MonitorLoop()
                 last.displays = std::move(current);
 
                 if (force || m_server.HasClients())
+                {
+                    t_loopPhase = "push";
                     PushCurrentDisplayState(0);
+                }
             }
+
+            t_loopPhase = "idle";
 
             // 一整轮枚举 + 推送成功：恢复正常轮询节奏
             lastRoundFailed = false;
