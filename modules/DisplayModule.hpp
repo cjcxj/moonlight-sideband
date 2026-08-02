@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <map>
 #include <thread>
 #include <atomic>
 #include <mutex>
@@ -132,6 +133,26 @@ private:
     // 并发时 GetDisplayConfigBufferSizes/QueryDisplayConfig 可能拿到过期的大小
     // 导致缓冲区溢出，破坏堆元数据。
     mutable std::mutex m_displayMutex;
+
+    // 工具自管理的"每个显示器上次设置"缓存：用户通过本工具设置分辨率/缩放，
+    // 或切走时捕获当前生效设置；切回该显示器时自动恢复（切回前先把
+    // 当前活跃显示器的设置捕获进缓存）。
+    // 不依赖 Windows CCD 数据库（QDC_DATABASE_CURRENT 在本机不可靠：
+    // 1 台真实显示器却有 16~32 条 CCD 路径，数据库恢复静默失败）。
+    struct SavedSettings
+    {
+        bool hasMode = false;
+        int w = 0, h = 0, refresh = 0;
+        bool hasScale = false;
+        int scale = 100;
+    };
+    mutable std::mutex m_settingsMutex;
+    std::map<std::string, SavedSettings> m_savedSettings;  // key: displayId
+
+    // 把 displayId 当前生效的分辨率/缩放存入缓存（switch 前对活跃显示器调用）
+    void CaptureCurrentSettings(const std::string &displayId, const DisplayInfo &info);
+    // 切换激活并验证成功后，把缓存里该显示器的分辨率/缩放恢复回去
+    bool ApplySavedSettings(const std::string &displayId);
 
     // 监控线程"上次状态"缓存：hash 不变则跳过更新/推送
     struct DisplayState

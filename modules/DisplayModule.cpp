@@ -959,6 +959,77 @@ bool DisplayModule::VerifyTargetActive(uint32_t targetId, int attempts, int inte
     return false;
 }
 
+// 把 displayId 当前生效的分辨率/缩放存入缓存，供下次切回时恢复。
+// 用 EnumerateDisplays 已取到的 DisplayInfo 直接写入，无需额外 API 调用。
+void DisplayModule::CaptureCurrentSettings(const std::string &displayId, const DisplayInfo &info)
+{
+    SavedSettings s;
+    s.hasMode = (info.width > 0 && info.height > 0 && info.refreshRate > 0);
+    if (s.hasMode)
+    {
+        s.w = info.width;
+        s.h = info.height;
+        s.refresh = info.refreshRate;
+    }
+    s.hasScale = (info.scale >= 100);
+    s.scale = info.scale;
+
+    std::lock_guard<std::mutex> lk(m_settingsMutex);
+    m_savedSettings[displayId] = s;
+    Logger::Get().Debug("DisplayModule: 记录设置 ", displayId, " -> ",
+                        (s.hasMode ? std::to_string(s.w) + "x" + std::to_string(s.h) +
+                                        "@" + std::to_string(s.refresh)
+                                   : "无模式"),
+                        " 缩放=", (s.hasScale ? std::to_string(s.scale) : "无"));
+}
+
+// 切换激活并验证成功后，把缓存里该显示器的分辨率/缩放恢复回去。
+// 分辨率通过 SetDisplayMode（校验支持列表）恢复，缩放通过 SetDisplayScale。
+bool DisplayModule::ApplySavedSettings(const std::string &displayId)
+{
+    SavedSettings s;
+    {
+        std::lock_guard<std::mutex> lk(m_settingsMutex);
+        auto it = m_savedSettings.find(displayId);
+        if (it == m_savedSettings.end())
+            return false;
+        s = it->second;
+    }
+
+    bool applied = false;
+    if (s.hasMode)
+    {
+        SetModeResult r = SetDisplayMode(displayId, s.w, s.h, s.refresh);
+        if (r == SetModeResult::Ok)
+        {
+            Logger::Get().Info("DisplayModule: 恢复分辨率 ", displayId, " -> ",
+                               s.w, "x", s.h, "@", s.refresh);
+            applied = true;
+        }
+        else
+        {
+            Logger::Get().Warning("DisplayModule: 恢复分辨率失败 ", displayId,
+                                  " -> ", s.w, "x", s.h, "@", s.refresh,
+                                  " code=", (int)r);
+        }
+    }
+    if (s.hasScale)
+    {
+        SetScaleResult r = SetDisplayScale(displayId, s.scale);
+        if (r == SetScaleResult::Ok)
+        {
+            Logger::Get().Info("DisplayModule: 恢复缩放 ", displayId, " -> ", s.scale, "%");
+            applied = true;
+        }
+        else
+        {
+            Logger::Get().Warning("DisplayModule: 恢复缩放失败 ", displayId,
+                                  " -> ", s.scale, "% code=", (int)r);
+        }
+    }
+    return applied;
+}
+
 DisplayModule::SwitchResult DisplayModule::SwitchPrimaryDisplay(const std::string &displayId)
 {
     auto displays = EnumerateDisplays();
@@ -981,6 +1052,14 @@ DisplayModule::SwitchResult DisplayModule::SwitchPrimaryDisplay(const std::strin
     if (target->isActive && target->isPrimary)
         return SwitchResult::AlreadyPrimary;
 
+    // 切走前把当前活跃显示器的设置（分辨率/缩放）存入缓存，
+    // 下次切回时由 ApplySavedSettings 恢复（含 Windows 里手动改过的值）
+    for (const auto &d : displays)
+    {
+        if (d.isActive)
+            CaptureCurrentSettings(d.id, d);
+    }
+
     std::string gdiNameStr = ParseGdiName(displayId);
     uint32_t targetId = ParseTargetId(displayId);
     std::wstring targetDevName(gdiNameStr.begin(), gdiNameStr.end());
@@ -1002,6 +1081,8 @@ DisplayModule::SwitchResult DisplayModule::SwitchPrimaryDisplay(const std::strin
             // 不验证就会给客户端假的 ok:true
             if (VerifyTargetActive(targetId, 8, 250))
             {
+                // 恢复该显示器上次保存的分辨率/缩放（不依赖 Windows CCD 数据库）
+                ApplySavedSettings(displayId);
                 Logger::Get().Info("DisplayModule: 已切换到 ", displayId, " (CCD 供给配置, 已验证)");
                 return SwitchResult::Ok;
             }
@@ -1028,6 +1109,7 @@ DisplayModule::SwitchResult DisplayModule::SwitchPrimaryDisplay(const std::strin
         }
         if (result == ERROR_SUCCESS && VerifyTargetActive(targetId, 8, 250))
         {
+            ApplySavedSettings(displayId);
             Logger::Get().Info("DisplayModule: SetDisplayConfig 拓扑切换到",
                                 (isInternal ? "内部" : "外部"), "显示器 ", displayId, " (已验证)");
             return SwitchResult::Ok;
@@ -1121,6 +1203,8 @@ DisplayModule::SwitchResult DisplayModule::SwitchPrimaryDisplay(const std::strin
         Logger::Get().Error("DisplayModule: 切换流程走完但目标 target 未激活 ", displayId);
         return SwitchResult::ApiFailed;
     }
+
+    ApplySavedSettings(displayId);
 
     Logger::Get().Info("DisplayModule: 已切换到 ", displayId, " (其他显示器已禁用)");
 
@@ -1505,11 +1589,20 @@ void DisplayModule::OnCommand(SidebandSession &session,
             switch (r)
             {
             case SetModeResult::Ok:
+            {
+                // 记录到缓存：切回该显示器时自动恢复
+                std::lock_guard<std::mutex> lk(m_settingsMutex);
+                SavedSettings &s = m_savedSettings[displayId];
+                s.hasMode = true;
+                s.w = w;
+                s.h = h;
+                s.refresh = refresh;
                 respJson = "{\"ok\":true,\"display_id\":\"" + Json::Escape(displayId) +
                            "\",\"w\":" + std::to_string(w) +
                            ",\"h\":" + std::to_string(h) +
                            ",\"refresh\":" + std::to_string(refresh) + "}";
                 break;
+            }
             case SetModeResult::NotFound:
                 respJson = R"({"ok":false,"error":"not_found"})";
                 break;
@@ -1555,10 +1648,17 @@ void DisplayModule::OnCommand(SidebandSession &session,
             switch (r)
             {
             case SetScaleResult::Ok:
+            {
+                // 记录到缓存：切回该显示器时自动恢复
+                std::lock_guard<std::mutex> lk(m_settingsMutex);
+                SavedSettings &s = m_savedSettings[displayId];
+                s.hasScale = true;
+                s.scale = scale;
                 respJson = "{\"ok\":true,\"display_id\":\"" + Json::Escape(displayId) +
                            "\",\"scale\":" + std::to_string(scale) +
                            ",\"requires_sign_out\":" + (immediate ? "false" : "true") + "}";
                 break;
+            }
             case SetScaleResult::NotFound:
                 respJson = R"({"ok":false,"error":"not_found"})";
                 break;
