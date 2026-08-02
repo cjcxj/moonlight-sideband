@@ -229,9 +229,12 @@ struct DISPLAYCONFIG_SOURCE_DPI_SCALE_SET
     int32_t scaleRel;      // 相对于推荐值的偏移
 };
 
-// 通过 GDI 设备名 + targetId 查找 CCD target 的 adapterId
-static bool FindTargetByGdiNameAndId(const std::wstring &gdiName, uint32_t targetId,
-                                     LUID &outAdapterId)
+// 通过 GDI 设备名 + targetId 查找 CCD path，返回用于 DPI 查询/设置的 source adapterId + sourceId。
+// 私有 DISPLAYCONFIG_DEVICE_INFO_GET/SET_DPI_SCALE 接口的 header.id 填的是 source id
+//（参考 lihas/windows-DPI-scaling-sample），填 target id 会导致 SET 返回错误 —— 这是
+// 13fc091 把缩放从 sourceId 改成 targetId 后"CCD API 设置缩放失败"的回归根因。
+static bool FindSourceByGdiNameAndId(const std::wstring &gdiName, uint32_t targetId,
+                                     LUID &outSourceAdapterId, UINT32 &outSourceId)
 {
     std::vector<DISPLAYCONFIG_PATH_INFO> paths;
     std::vector<DISPLAYCONFIG_MODE_INFO> modes;
@@ -243,6 +246,7 @@ static bool FindTargetByGdiNameAndId(const std::wstring &gdiName, uint32_t targe
         if (path.targetInfo.id != targetId)
             continue;
 
+        // 先用 GET_SOURCE_NAME 验证 source id 有效（无效则跳过，避免把垃圾 id 传给 DPI 接口）
         DISPLAYCONFIG_SOURCE_DEVICE_NAME srcName = {};
         srcName.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
         srcName.header.size = sizeof(srcName);
@@ -253,7 +257,8 @@ static bool FindTargetByGdiNameAndId(const std::wstring &gdiName, uint32_t targe
 
         if (_wcsicmp(srcName.viewGdiDeviceName, gdiName.c_str()) == 0)
         {
-            outAdapterId = path.targetInfo.adapterId;
+            outSourceAdapterId = path.sourceInfo.adapterId;
+            outSourceId = path.sourceInfo.id;
             return true;
         }
     }
@@ -261,13 +266,13 @@ static bool FindTargetByGdiNameAndId(const std::wstring &gdiName, uint32_t targe
 }
 
 // 获取当前 DPI 缩放百分比
-static int GetDpiScalingPercent(LUID adapterId, UINT32 targetId)
+static int GetDpiScalingPercent(LUID adapterId, UINT32 sourceId)
 {
     DISPLAYCONFIG_SOURCE_DPI_SCALE_GET req = {};
     req.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_DPI_SCALE;
     req.header.size = sizeof(req);
     req.header.adapterId = adapterId;
-    req.header.id = targetId;
+    req.header.id = sourceId;
 
     if (DisplayConfigGetDeviceInfo(&req.header) != ERROR_SUCCESS)
         return 100;
@@ -285,19 +290,34 @@ static int GetDpiScalingPercent(LUID adapterId, UINT32 targetId)
 }
 
 // 设置 DPI 缩放（即时生效）
-static bool SetDpiScaling(LUID adapterId, UINT32 targetId, int dpiPercent)
+static bool SetDpiScaling(LUID adapterId, UINT32 sourceId, int dpiPercent)
 {
     // 获取当前 DPI 信息
     DISPLAYCONFIG_SOURCE_DPI_SCALE_GET req = {};
     req.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_DPI_SCALE;
     req.header.size = sizeof(req);
     req.header.adapterId = adapterId;
-    req.header.id = targetId;
+    req.header.id = sourceId;
 
-    if (DisplayConfigGetDeviceInfo(&req.header) != ERROR_SUCCESS)
+    LONG getRes = DisplayConfigGetDeviceInfo(&req.header);
+    if (getRes != ERROR_SUCCESS)
+    {
+        Logger::Get().Error("DisplayModule: 查询 DPI 缩放失败 code=", getRes);
         return false;
+    }
+
+    // 修正越界值后判断是否已在目标缩放：已到位则直接成功，
+    // 避免对部分驱动发出无变化的 SET 而被拒绝。
+    if (req.curScaleRel < req.minScaleRel) req.curScaleRel = req.minScaleRel;
+    if (req.curScaleRel > req.maxScaleRel) req.curScaleRel = req.maxScaleRel;
 
     int32_t minAbs = abs((int)req.minScaleRel);
+    size_t curIdx = (size_t)(minAbs + req.curScaleRel);
+    if (curIdx < sizeof(kDpiVals) / sizeof(kDpiVals[0]) &&
+        (int)kDpiVals[curIdx] == dpiPercent)
+    {
+        return true;
+    }
 
     // 查找目标百分比和推荐百分比在表中的索引
     int idxTarget = -1, idxRecommended = -1;
@@ -312,14 +332,31 @@ static bool SetDpiScaling(LUID adapterId, UINT32 targetId, int dpiPercent)
 
     int32_t scaleRel = idxTarget - idxRecommended;
 
+    // 目标值必须落在该显示器支持范围内，否则 SET 返回 ERROR_INVALID_PARAMETER
+    const size_t tableLen = sizeof(kDpiVals) / sizeof(kDpiVals[0]);
+    if (scaleRel < req.minScaleRel || scaleRel > req.maxScaleRel)
+    {
+        int minScale = 0, maxScale = 0;
+        size_t minIdx = (size_t)(minAbs + req.minScaleRel);
+        size_t maxIdx = (size_t)(minAbs + req.maxScaleRel);
+        if (minIdx < tableLen) minScale = (int)kDpiVals[minIdx];
+        if (maxIdx < tableLen) maxScale = (int)kDpiVals[maxIdx];
+        Logger::Get().Warning("DisplayModule: 目标缩放 ", dpiPercent,
+                              "% 超出支持范围 [", minScale, ", ", maxScale, "]");
+        return false;
+    }
+
     DISPLAYCONFIG_SOURCE_DPI_SCALE_SET setReq = {};
     setReq.header.type = DISPLAYCONFIG_DEVICE_INFO_SET_DPI_SCALE;
     setReq.header.size = sizeof(setReq);
     setReq.header.adapterId = adapterId;
-    setReq.header.id = targetId;
+    setReq.header.id = sourceId;
     setReq.scaleRel = scaleRel;
 
-    return DisplayConfigSetDeviceInfo(&setReq.header) == ERROR_SUCCESS;
+    LONG setRes = DisplayConfigSetDeviceInfo(&setReq.header);
+    if (setRes != ERROR_SUCCESS)
+        Logger::Get().Error("DisplayModule: SET_DPI_SCALE 失败 code=", setRes);
+    return setRes == ERROR_SUCCESS;
 }
 
 // ============================================================
@@ -605,8 +642,10 @@ std::vector<DisplayModule::DisplayInfo> DisplayModule::EnumerateDisplays() const
             info.bitsPerPel = (int)dm.dmBitsPerPel;
         }
 
-        // 用 CCD API 获取 DPI 缩放（对活跃和未启用的显示器都有效）
-        info.scale = GetDpiScalingPercent(path.targetInfo.adapterId, path.targetInfo.id);
+        // 用 CCD API 获取 DPI 缩放（对活跃和未启用的显示器都有效）。
+        // DPI 接口按 source id 寻址；上面的 GET_SOURCE_NAME 已用同一 source id 成功
+        // 取到名字，说明该 source 有效，这里再查缩放是安全的（避免把无效 id 传入）。
+        info.scale = GetDpiScalingPercent(path.sourceInfo.adapterId, path.sourceInfo.id);
 
         // 过滤掉未启用且没有真实友好名称的显示器（虚拟设备/无效路径）
         if (!info.isActive && (info.name.empty() || info.name == "Generic PnP Monitor"))
@@ -1137,22 +1176,24 @@ DisplayModule::SetScaleResult DisplayModule::SetDisplayScale(const std::string &
         }
     }
 
-    // 通过 GDI 设备名 + targetId 查找 CCD target
+    // 通过 GDI 设备名 + targetId 查找 CCD path 的 source（DPI 接口需要 source id）
     std::string gdiNameStr = ParseGdiName(displayId);
     uint32_t targetId = ParseTargetId(displayId);
     std::wstring devName(gdiNameStr.begin(), gdiNameStr.end());
-    LUID adapterId = {};
+    LUID sourceAdapterId = {};
+    UINT32 sourceId = 0;
 
     // 持锁防止与 EnumerateDisplays 并发导致 CCD 查询结果不一致
     {
         std::lock_guard<std::mutex> dl(m_displayMutex);
-        if (targetId == 0xFFFFFFFF || !FindTargetByGdiNameAndId(devName, targetId, adapterId))
+        if (targetId == 0xFFFFFFFF ||
+            !FindSourceByGdiNameAndId(devName, targetId, sourceAdapterId, sourceId))
         {
-            Logger::Get().Error("DisplayModule: 找不到显示器 ", displayId, " 的 CCD target");
+            Logger::Get().Error("DisplayModule: 找不到显示器 ", displayId, " 的 CCD source");
             return SetScaleResult::NotFound;
         }
 
-        if (SetDpiScaling(adapterId, targetId, scale))
+        if (SetDpiScaling(sourceAdapterId, sourceId, scale))
         {
             if (immediate) *immediate = true;
             Logger::Get().Info("DisplayModule: 已设置缩放 ", displayId, " -> ", scale,
