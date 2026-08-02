@@ -26,6 +26,7 @@
 #include <set>
 #include <algorithm>
 #include <cstring>
+#include <typeinfo>      // typeid：MonitorLoop 异常诊断输出异常类型名
 
 // 字符串/JSON 辅助已拆到 Win32Util.hpp / Json.hpp。
 // 这里做局部引入，避免大面积改动调用点。
@@ -33,6 +34,46 @@ using Win32Util::WideToUtf8;
 
 #pragma comment(lib, "shcore.lib")  // GetDpiForMonitor
 #pragma comment(lib, "user32.lib")
+
+// ============================================================
+//                 MonitorLoop 异常诊断状态（Phase 4）
+// ============================================================
+
+// 记录最近一次 CCD 枚举的计数。异常发生时由 MonitorLoop 读出来打日志，
+// 不用再靠猜 "vector too long" 到底发生在哪个环节。
+// thread_local：MonitorLoop 线程自己写自己读，无需跨线程同步。
+static thread_local uint32_t t_lastPathCount = 0;
+static thread_local uint32_t t_lastModeCount = 0;
+static thread_local size_t t_lastMonitorCount = 0;
+
+// 提取异常类型名。MSVC 的 typeid 输出形如 "class std::length_error"，
+// 剥掉修饰前缀得到 "std::length_error"。
+static std::string ExceptionTypeName(const std::exception &e)
+{
+    std::string n = typeid(e).name();
+    for (const char *prefix : { "class ", "struct ", "enum " })
+    {
+        if (n.rfind(prefix, 0) == 0)
+        {
+            n.erase(0, std::strlen(prefix));
+            break;
+        }
+    }
+    return n;
+}
+
+// 打印 MonitorLoop 异常诊断块。e 为 nullptr 表示未知异常。
+static void LogMonitorLoopException(const std::exception *e)
+{
+    Logger::Get().Error("DisplayModule MonitorLoop exception:");
+    Logger::Get().Error("exception: ", e ? ExceptionTypeName(*e) : "unknown");
+    Logger::Get().Error("monitor_count: ", t_lastMonitorCount);
+    Logger::Get().Error("path_count: ", t_lastPathCount);
+    Logger::Get().Error("mode_count: ", t_lastModeCount);
+    Logger::Get().Error("thread: MonitorLoop");
+    if (e)
+        Logger::Get().Error("what: ", e->what());
+}
 
 // ============================================================
 //                      辅助函数
@@ -76,6 +117,10 @@ static bool QueryDisplayConfigData(UINT32 flags,
     UINT32 numPaths = 0, numModes = 0;
     if (GetDisplayConfigBufferSizes(flags, &numPaths, &numModes) != ERROR_SUCCESS)
         return false;
+
+    // 记录原始计数，供 MonitorLoop 异常诊断（Phase 4）
+    t_lastPathCount = numPaths;
+    t_lastModeCount = numModes;
 
     // 防御性检查：避免异常大的缓冲区导致 "vector too long"
     if (numPaths > 256 || numModes > 1024)
@@ -405,6 +450,10 @@ std::vector<DisplayModule::DisplayInfo> DisplayModule::EnumerateDisplays() const
                        " 主显示器=", WideToUtf8(dmData.primaryMonitor));
     for (const auto &m : dmData.activeMonitors)
         Logger::Get().Debug("DisplayModule:   桌面: ", WideToUtf8(m));
+
+    // 记录桌面显示器数，供 MonitorLoop 异常诊断（Phase 4）。
+    // 在 CCD 查询之前就记：即使后面枚举抛异常，也能看到当时系统里有多少台显示器。
+    t_lastMonitorCount = dmData.activeMonitors.size();
 
     // 获取活跃路径的 target 集合（QDC_ONLY_ACTIVE_PATHS 只返回桌面中的路径）
     auto makeAdapterKey = [](const LUID &luid) -> uint64_t {
@@ -1362,49 +1411,85 @@ void DisplayModule::MonitorLoop()
 {
     Logger::Get().Debug("DisplayModule: 监控线程已启动");
 
-    // 上次已知的显示状态（含 hash）：hash 不变则跳过更新/推送
-    DisplayState last;
+    // 自愈阈值：连续异常超过该次数就重启监控循环（Phase 6）。
+    constexpr int kMaxConsecutiveErrors = 5;
+    // 重启前暂停片刻，等显示器驱动 / CCD 状态自行稳定，避免立刻重试又失败。
+    constexpr auto kRestartDelay = std::chrono::milliseconds(1000);
 
     while (!m_exit)
     {
-        try
+        // 每个"监控生命周期"的本地状态：hash 不变则跳过更新/推送。
+        // 连续异常达到阈值后整块重置 —— 相当于停止旧的监控、释放缓存、
+        // 以全新状态重新初始化（Phase 6）。
+        DisplayState last;
+        int consecutiveErrors = 0;
+
+        while (!m_exit)
         {
-            // 强制推送：客户端连接 / 切换 / 分辨率 / 缩放完成后置位，
-            // 不依赖变化检测，确保第一时间把最新状态推给客户端
-            bool force = m_forcePush.exchange(false);
-
-            auto current = EnumerateDisplays();
-            uint64_t hash = HashDisplayState(current);
-
-            // hash 比较：没有变化就不做任何更新（"不要每次都写"）
-            if (force || hash != last.hash)
+            try
             {
-                last.hash = hash;
-                last.displays = std::move(current);
+                // 强制推送：客户端连接 / 切换 / 分辨率 / 缩放完成后置位，
+                // 不依赖变化检测，确保第一时间把最新状态推给客户端
+                bool force = m_forcePush.exchange(false);
 
-                if (force || m_server.HasClients())
-                    PushCurrentDisplayState(0);
+                auto current = EnumerateDisplays();
+                uint64_t hash = HashDisplayState(current);
+
+                // hash 比较：没有变化就不做任何更新（"不要每次都写"）
+                if (force || hash != last.hash)
+                {
+                    last.hash = hash;
+                    last.displays = std::move(current);
+
+                    if (force || m_server.HasClients())
+                        PushCurrentDisplayState(0);
+                }
+
+                // 一整轮枚举 + 推送成功：清零连续异常计数（自愈判定基准）
+                consecutiveErrors = 0;
+            }
+            catch (const std::exception &e)
+            {
+                // 带完整上下文打日志，不再只留一句 "vector too long" 让人猜（Phase 4）。
+                // 一次异常绝不能污染整个模块状态：重置"上次状态"，
+                // 下一轮按"全新状态"重新检测，避免持续误报/漏报。
+                LogMonitorLoopException(&e);
+                last = DisplayState{};
+                if (++consecutiveErrors > kMaxConsecutiveErrors)
+                    break;  // 触发自愈重启
+            }
+            catch (...)
+            {
+                LogMonitorLoopException(nullptr);
+                last = DisplayState{};
+                if (++consecutiveErrors > kMaxConsecutiveErrors)
+                    break;  // 触发自愈重启
+            }
+
+            // 每 2 秒轮询一次；WM_DISPLAYCHANGE / 客户端连接 / 命令完成 / Stop 可提前唤醒。
+            // （wait_for 放在 try 之外：异常后照常休眠，不会忙循环。）
+            {
+                std::unique_lock<std::mutex> l(m_wakeMutex);
+                m_wakeCv.wait_for(l, std::chrono::seconds(2),
+                                  [this] { return m_wakeRequested || m_exit; });
+                m_wakeRequested = false;
             }
         }
-        catch (const std::exception &e)
-        {
-            // 一次异常绝不能污染整个模块状态：重置"上次状态"，
-            // 下一轮按"全新状态"重新检测，避免持续误报/漏报。
-            Logger::Get().Error("DisplayModule: MonitorLoop 异常: ", e.what());
-            last = DisplayState{};
-        }
-        catch (...)
-        {
-            Logger::Get().Error("DisplayModule: MonitorLoop 未知异常");
-            last = DisplayState{};
-        }
 
-        // 每 2 秒轮询一次；WM_DISPLAYCHANGE / 客户端连接 / 命令完成 / Stop 可提前唤醒。
-        // （wait_for 放在 try 之外：异常后照常休眠，不会忙循环。）
+        if (m_exit)
+            break;
+
+        Logger::Get().Error("DisplayModule: MonitorLoop 连续异常超过 ",
+                            kMaxConsecutiveErrors,
+                            " 次，重启监控（已释放缓存，重新初始化显示状态）");
+
+        // 重启后强制全量推送一次，让客户端拿到恢复后的状态
+        m_forcePush.store(true);
+
+        // 等待重启间隔，期间仍响应 Stop()
         {
             std::unique_lock<std::mutex> l(m_wakeMutex);
-            m_wakeCv.wait_for(l, std::chrono::seconds(2),
-                              [this] { return m_wakeRequested || m_exit; });
+            m_wakeCv.wait_for(l, kRestartDelay, [this] { return m_exit; });
             m_wakeRequested = false;
         }
     }
