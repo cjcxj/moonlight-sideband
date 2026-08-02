@@ -59,6 +59,42 @@ static uint32_t ParseTargetId(const std::string &displayId)
     return 0xFFFFFFFF;
 }
 
+// CCD 枚举辅助：严格按"GetDisplayConfigBufferSizes 取大小 → 精确分配 →
+// 单次 QueryDisplayConfig"的顺序查询（规范 2.1）。
+// 禁止 while 循环里 paths.resize()+重查（配置变化时反复翻倍），
+// 也禁止 static 持久化 vector（跨调用残留垃圾数据）（规范 2.2）。
+// 成功后按 API 实际返回的 count 裁剪，避免遍历到值初始化产生的零填充条目
+//（DISPLAYCONFIG target id 可能为 0，零填充条目会被误匹配）。
+static bool QueryDisplayConfigData(UINT32 flags,
+                                   std::vector<DISPLAYCONFIG_PATH_INFO> &paths,
+                                   std::vector<DISPLAYCONFIG_MODE_INFO> &modes)
+{
+    paths.clear();
+    modes.clear();
+
+    UINT32 numPaths = 0, numModes = 0;
+    if (GetDisplayConfigBufferSizes(flags, &numPaths, &numModes) != ERROR_SUCCESS)
+        return false;
+
+    // 防御性检查：避免异常大的缓冲区导致 "vector too long"
+    if (numPaths > 256 || numModes > 1024)
+    {
+        Logger::Get().Warning("DisplayModule: CCD 缓冲区异常大 paths=", numPaths, " modes=", numModes);
+        return false;
+    }
+
+    paths.resize(numPaths);
+    modes.resize(numModes);
+
+    if (QueryDisplayConfig(flags, &numPaths, paths.data(),
+                           &numModes, modes.data(), nullptr) != ERROR_SUCCESS)
+        return false;
+
+    paths.resize(numPaths);
+    modes.resize(numModes);
+    return true;
+}
+
 // ============================================================
 //                      CCD DPI 缩放（移植自 SetDPI）
 // ============================================================
@@ -90,18 +126,9 @@ struct DISPLAYCONFIG_SOURCE_DPI_SCALE_SET
 static bool FindTargetByGdiNameAndId(const std::wstring &gdiName, uint32_t targetId,
                                      LUID &outAdapterId)
 {
-    UINT32 numPaths = 0, numModes = 0;
-    if (GetDisplayConfigBufferSizes(QDC_ALL_PATHS, &numPaths, &numModes) != ERROR_SUCCESS)
-        return false;
-
-    if (numPaths > 256 || numModes > 1024)
-        return false;
-
-    std::vector<DISPLAYCONFIG_PATH_INFO> paths(numPaths);
-    std::vector<DISPLAYCONFIG_MODE_INFO> modes(numModes);
-
-    if (QueryDisplayConfig(QDC_ALL_PATHS, &numPaths, paths.data(),
-                           &numModes, modes.data(), nullptr) != ERROR_SUCCESS)
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths;
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes;
+    if (!QueryDisplayConfigData(QDC_ALL_PATHS, paths, modes))
         return false;
 
     for (const auto &path : paths)
@@ -339,40 +366,21 @@ std::vector<DisplayModule::DisplayInfo> DisplayModule::EnumerateDisplays() const
     };
     std::set<std::pair<uint64_t, uint32_t>> activeTargets;
     {
-        UINT32 numActivePaths = 0, numActiveModes = 0;
-        if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &numActivePaths, &numActiveModes) == ERROR_SUCCESS &&
-            numActivePaths <= 256 && numActiveModes <= 1024)
+        std::vector<DISPLAYCONFIG_PATH_INFO> activePaths;
+        std::vector<DISPLAYCONFIG_MODE_INFO> activeModes;
+        if (QueryDisplayConfigData(QDC_ONLY_ACTIVE_PATHS, activePaths, activeModes))
         {
-            std::vector<DISPLAYCONFIG_PATH_INFO> activePaths(numActivePaths);
-            std::vector<DISPLAYCONFIG_MODE_INFO> activeModes(numActiveModes);
-            if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &numActivePaths, activePaths.data(),
-                                   &numActiveModes, activeModes.data(), nullptr) == ERROR_SUCCESS)
+            for (const auto &ap : activePaths)
             {
-                for (const auto &ap : activePaths)
-                {
-                    activeTargets.insert({makeAdapterKey(ap.targetInfo.adapterId), ap.targetInfo.id});
-                }
+                activeTargets.insert({makeAdapterKey(ap.targetInfo.adapterId), ap.targetInfo.id});
             }
         }
     }
 
     // 用 CCD API 获取所有显示路径（只返回实际存在的物理路径，不含虚拟设备）
-    UINT32 numPaths = 0, numModes = 0;
-    if (GetDisplayConfigBufferSizes(QDC_ALL_PATHS, &numPaths, &numModes) != ERROR_SUCCESS)
-        return result;
-
-    // 防御性检查：避免异常大的缓冲区导致 "vector too long"
-    if (numPaths > 256 || numModes > 1024)
-    {
-        Logger::Get().Warning("DisplayModule: CCD 缓冲区异常大 paths=", numPaths, " modes=", numModes);
-        return result;
-    }
-
-    std::vector<DISPLAYCONFIG_PATH_INFO> paths(numPaths);
-    std::vector<DISPLAYCONFIG_MODE_INFO> modes(numModes);
-
-    if (QueryDisplayConfig(QDC_ALL_PATHS, &numPaths, paths.data(),
-                           &numModes, modes.data(), nullptr) != ERROR_SUCCESS)
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths;
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes;
+    if (!QueryDisplayConfigData(QDC_ALL_PATHS, paths, modes))
         return result;
 
     // 活跃路径排前面，确保去重时优先保留活跃路径
@@ -534,32 +542,19 @@ static bool FindInactiveTargetIsInternal(const std::wstring &gdiName, uint32_t t
 
     // 获取活跃 target 集合
     std::set<std::pair<uint64_t, uint32_t>> activeTargets;
-    UINT32 numAP = 0, numAM = 0;
-    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &numAP, &numAM) == ERROR_SUCCESS &&
-        numAP <= 256 && numAM <= 1024)
     {
-        std::vector<DISPLAYCONFIG_PATH_INFO> ap(numAP);
-        std::vector<DISPLAYCONFIG_MODE_INFO> am(numAM);
-        if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &numAP, ap.data(),
-                               &numAM, am.data(), nullptr) == ERROR_SUCCESS)
+        std::vector<DISPLAYCONFIG_PATH_INFO> ap;
+        std::vector<DISPLAYCONFIG_MODE_INFO> am;
+        if (QueryDisplayConfigData(QDC_ONLY_ACTIVE_PATHS, ap, am))
         {
             for (const auto &p : ap)
                 activeTargets.insert({makeAdapterKey(p.targetInfo.adapterId), p.targetInfo.id});
         }
     }
 
-    UINT32 numPaths = 0, numModes = 0;
-    if (GetDisplayConfigBufferSizes(QDC_ALL_PATHS, &numPaths, &numModes) != ERROR_SUCCESS)
-        return false;
-
-    if (numPaths > 256 || numModes > 1024)
-        return false;
-
-    std::vector<DISPLAYCONFIG_PATH_INFO> paths(numPaths);
-    std::vector<DISPLAYCONFIG_MODE_INFO> modes(numModes);
-
-    if (QueryDisplayConfig(QDC_ALL_PATHS, &numPaths, paths.data(),
-                           &numModes, modes.data(), nullptr) != ERROR_SUCCESS)
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths;
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes;
+    if (!QueryDisplayConfigData(QDC_ALL_PATHS, paths, modes))
         return false;
 
     for (const auto &path : paths)
@@ -601,20 +596,10 @@ static bool FindInactiveTargetIsInternal(const std::wstring &gdiName, uint32_t t
 // path，其余 path 一律不提供（即停用），让 Windows 重算模式。
 static bool ActivateTargetExclusive(const std::wstring &gdiName, uint32_t targetId)
 {
-    UINT32 numPaths = 0, numModes = 0;
-    if (GetDisplayConfigBufferSizes(QDC_ALL_PATHS, &numPaths, &numModes) != ERROR_SUCCESS)
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths;
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes;
+    if (!QueryDisplayConfigData(QDC_ALL_PATHS, paths, modes))
         return false;
-
-    if (numPaths > 256 || numModes > 1024)
-        return false;
-
-    std::vector<DISPLAYCONFIG_PATH_INFO> paths(numPaths);
-    std::vector<DISPLAYCONFIG_MODE_INFO> modes(numModes);
-
-    if (QueryDisplayConfig(QDC_ALL_PATHS, &numPaths, paths.data(),
-                           &numModes, modes.data(), nullptr) != ERROR_SUCCESS)
-        return false;
-    paths.resize(numPaths);
 
     // 找到目标 path：targetId 匹配 + source GDI 名匹配 + target 可用
     // （找不到 GDI 名匹配时，退而求其次接受仅 targetId 匹配的可用 path，
