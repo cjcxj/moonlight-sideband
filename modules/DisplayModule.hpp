@@ -200,6 +200,9 @@ private:
     // 监控主显示器变化的循环
     void MonitorLoop();
 
+    // 异常后重置显示器缓存，避免一次异常污染后续的变化检测
+    void ResetDisplayCache();
+
     // 唤醒监控线程（置 m_forcePush 并 notify）
     void RequestPush();
 

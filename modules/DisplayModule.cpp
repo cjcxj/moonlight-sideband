@@ -1333,6 +1333,17 @@ void DisplayModule::OnCommand(SidebandSession &session,
 //                      监控循环
 // ============================================================
 
+void DisplayModule::ResetDisplayCache()
+{
+    std::lock_guard<std::mutex> l(m_mutex);
+    m_lastHasPrimary = false;
+    m_lastPrimaryId.clear();
+    m_lastPrimaryWidth = 0;
+    m_lastPrimaryHeight = 0;
+    m_lastPrimaryRefresh = 0;
+    m_lastPrimaryScale = 100;
+}
+
 void DisplayModule::MonitorLoop()
 {
     Logger::Get().Debug("DisplayModule: 监控线程已启动");
@@ -1341,69 +1352,82 @@ void DisplayModule::MonitorLoop()
     {
         try
         {
-        // 处理客户端连接时的强制推送请求（不依赖 HasClients，确保首次推送）
-        if (m_forcePush.exchange(false))
-        {
-            PushCurrentDisplayState(0);
-            // 推送后更新缓存，避免下面又触发一次
-            DisplayInfo primary;
-            if (GetCurrentPrimary(primary))
+            // 处理客户端连接时的强制推送请求（不依赖 HasClients，确保首次推送）
+            if (m_forcePush.exchange(false))
             {
-                std::lock_guard<std::mutex> l(m_mutex);
-                m_lastHasPrimary = true;
-                m_lastPrimaryId = primary.id;
-                m_lastPrimaryWidth = primary.width;
-                m_lastPrimaryHeight = primary.height;
-                m_lastPrimaryRefresh = primary.refreshRate;
-                m_lastPrimaryScale = primary.scale;
-            }
-        }
-
-        if (m_server.HasClients())
-        {
-            DisplayInfo primary;
-            bool hasPrimary = GetCurrentPrimary(primary);
-
-            bool changed = false;
-            {
-                std::lock_guard<std::mutex> l(m_mutex);
-                if (hasPrimary != m_lastHasPrimary)
+                PushCurrentDisplayState(0);
+                // 推送后更新缓存，避免下面又触发一次
+                DisplayInfo primary;
+                if (GetCurrentPrimary(primary))
                 {
-                    changed = true;
+                    std::lock_guard<std::mutex> l(m_mutex);
+                    m_lastHasPrimary = true;
+                    m_lastPrimaryId = primary.id;
+                    m_lastPrimaryWidth = primary.width;
+                    m_lastPrimaryHeight = primary.height;
+                    m_lastPrimaryRefresh = primary.refreshRate;
+                    m_lastPrimaryScale = primary.scale;
                 }
-                else if (hasPrimary)
+            }
+
+            if (m_server.HasClients())
+            {
+                DisplayInfo primary;
+                bool hasPrimary = GetCurrentPrimary(primary);
+
+                bool changed = false;
                 {
-                    if (primary.id != m_lastPrimaryId ||
-                        primary.width != m_lastPrimaryWidth ||
-                        primary.height != m_lastPrimaryHeight ||
-                        primary.refreshRate != m_lastPrimaryRefresh ||
-                        primary.scale != m_lastPrimaryScale)
+                    std::lock_guard<std::mutex> l(m_mutex);
+                    if (hasPrimary != m_lastHasPrimary)
                     {
                         changed = true;
+                    }
+                    else if (hasPrimary)
+                    {
+                        if (primary.id != m_lastPrimaryId ||
+                            primary.width != m_lastPrimaryWidth ||
+                            primary.height != m_lastPrimaryHeight ||
+                            primary.refreshRate != m_lastPrimaryRefresh ||
+                            primary.scale != m_lastPrimaryScale)
+                        {
+                            changed = true;
+                        }
+                    }
+
+                    if (changed)
+                    {
+                        m_lastHasPrimary = hasPrimary;
+                        if (hasPrimary)
+                        {
+                            m_lastPrimaryId = primary.id;
+                            m_lastPrimaryWidth = primary.width;
+                            m_lastPrimaryHeight = primary.height;
+                            m_lastPrimaryRefresh = primary.refreshRate;
+                            m_lastPrimaryScale = primary.scale;
+                        }
                     }
                 }
 
                 if (changed)
                 {
-                    m_lastHasPrimary = hasPrimary;
-                    if (hasPrimary)
-                    {
-                        m_lastPrimaryId = primary.id;
-                        m_lastPrimaryWidth = primary.width;
-                        m_lastPrimaryHeight = primary.height;
-                        m_lastPrimaryRefresh = primary.refreshRate;
-                        m_lastPrimaryScale = primary.scale;
-                    }
+                    PushCurrentDisplayState(0);
                 }
             }
-
-            if (changed)
-            {
-                PushCurrentDisplayState(0);
-            }
+        }
+        catch (const std::exception &e)
+        {
+            // 一次异常绝不能污染整个模块状态：记日志并重置缓存，
+            // 下一轮按"全新状态"重新检测，避免持续误报/漏报。
+            Logger::Get().Error("DisplayModule: MonitorLoop 异常: ", e.what());
+            ResetDisplayCache();
+        }
+        catch (...)
+        {
+            Logger::Get().Error("DisplayModule: MonitorLoop 未知异常");
+            ResetDisplayCache();
         }
 
-        // 等待下一次唤醒。
+        // 等待下一次唤醒（放在 try 之外：异常后照常休眠，不会忙循环）。
         // 早期实现是每 2 秒无条件枚举一次所有显示器（单次约 50ms）来轮询变化，
         // 相当于常态占用约 2.5% 的一个核，纯属白烧。现在改为事件驱动：
         // 主窗口收到 WM_DISPLAYCHANGE、或客户端连接/切换完成时唤醒；
@@ -1413,15 +1437,6 @@ void DisplayModule::MonitorLoop()
             m_wakeCv.wait_for(l, std::chrono::seconds(10),
                               [this] { return m_wakeRequested || m_exit; });
             m_wakeRequested = false;
-        }
-        }
-        catch (const std::exception &e)
-        {
-            Logger::Get().Error("DisplayModule: MonitorLoop 异常: ", e.what());
-        }
-        catch (...)
-        {
-            Logger::Get().Error("DisplayModule: MonitorLoop 未知异常");
         }
     }
 
