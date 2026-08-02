@@ -6,7 +6,7 @@
  * - EnumDisplaySettingsExW 获取分辨率/刷新率
  * - CCD DisplayConfigGetDeviceInfo 获取/设置缩放（即时生效）
  * - SetDisplayConfig 供给配置精确切换到指定 target，并轮询验证确已生效
- * - 事件驱动地监控显示配置变化（WM_DISPLAYCHANGE 唤醒，10 秒兜底轮询）
+ * - 每 2 秒轮询 + hash 比较监控显示配置变化，仅在状态变化时更新缓存并推送
  */
 
 #include "DisplayModule.hpp"
@@ -21,6 +21,7 @@
 #include <sstream>
 #include <chrono>
 #include <cstdio>
+#include <cstdint>
 #include <map>
 #include <set>
 #include <algorithm>
@@ -93,6 +94,51 @@ static bool QueryDisplayConfigData(UINT32 flags,
     paths.resize(numPaths);
     modes.resize(numModes);
     return true;
+}
+
+// 计算显示器列表的 FNV-1a 内容 hash，供 MonitorLoop 做变化检测：
+// 只要任意显示器属性变化（插拔、几何、分辨率、刷新率、色深、缩放、
+// 主显示器切换），结果就不同，从而避免每轮轮询都无条件重写缓存。
+static uint64_t HashDisplayState(const std::vector<DisplayModule::DisplayInfo> &displays)
+{
+    // 先按唯一 id 排序：CCD 返回的路径顺序在两次调用间可能变化，
+    // 若直接按原始顺序参与 hash 会导致"状态没变但 hash 变了"的误报。
+    auto sorted = displays;
+    std::sort(sorted.begin(), sorted.end(),
+              [](const DisplayModule::DisplayInfo &a, const DisplayModule::DisplayInfo &b)
+              { return a.id < b.id; });
+
+    uint64_t h = 1469598103934665603ull;  // FNV-1a offset basis
+    const uint64_t kPrime = 1099511628211ull;
+
+    auto mix = [&h, kPrime](const void *data, size_t len)
+    {
+        const auto *p = static_cast<const unsigned char *>(data);
+        for (size_t i = 0; i < len; ++i)
+        {
+            h ^= p[i];
+            h *= kPrime;
+        }
+    };
+    auto mixInt = [&mix](const int &v) { mix(&v, sizeof(v)); };
+
+    for (const auto &d : sorted)
+    {
+        mix(d.id.data(), d.id.size());
+        mix(d.deviceId.data(), d.deviceId.size());
+        mix(d.name.data(), d.name.size());
+        mix(d.adapterName.data(), d.adapterName.size());
+        mixInt(d.x);
+        mixInt(d.y);
+        mixInt(d.width);
+        mixInt(d.height);
+        mixInt(d.refreshRate);
+        mixInt(d.bitsPerPel);
+        mixInt(d.scale);
+        unsigned char flags = (unsigned char)((d.isPrimary ? 1 : 0) | (d.isActive ? 2 : 0));
+        mix(&flags, 1);
+    }
+    return h;
 }
 
 // ============================================================
@@ -728,8 +774,6 @@ DisplayModule::SwitchResult DisplayModule::SwitchPrimaryDisplay(const std::strin
             if (VerifyTargetActive(targetId, 8, 250))
             {
                 Logger::Get().Info("DisplayModule: 已切换到 ", displayId, " (CCD 供给配置, 已验证)");
-                std::lock_guard<std::mutex> l(m_mutex);
-                m_lastPrimaryId.clear();
                 return SwitchResult::Ok;
             }
             Logger::Get().Warning("DisplayModule: CCD 供给配置提交成功但未生效，尝试回退方案");
@@ -757,8 +801,6 @@ DisplayModule::SwitchResult DisplayModule::SwitchPrimaryDisplay(const std::strin
         {
             Logger::Get().Info("DisplayModule: SetDisplayConfig 拓扑切换到",
                                 (isInternal ? "内部" : "外部"), "显示器 ", displayId, " (已验证)");
-            std::lock_guard<std::mutex> l(m_mutex);
-            m_lastPrimaryId.clear();
             return SwitchResult::Ok;
         }
 
@@ -853,8 +895,6 @@ DisplayModule::SwitchResult DisplayModule::SwitchPrimaryDisplay(const std::strin
 
     Logger::Get().Info("DisplayModule: 已切换到 ", displayId, " (其他显示器已禁用)");
 
-    std::lock_guard<std::mutex> l(m_mutex);
-    m_lastPrimaryId.clear();
     return SwitchResult::Ok;
 }
 
@@ -1318,108 +1358,52 @@ void DisplayModule::OnCommand(SidebandSession &session,
 //                      监控循环
 // ============================================================
 
-void DisplayModule::ResetDisplayCache()
-{
-    std::lock_guard<std::mutex> l(m_mutex);
-    m_lastHasPrimary = false;
-    m_lastPrimaryId.clear();
-    m_lastPrimaryWidth = 0;
-    m_lastPrimaryHeight = 0;
-    m_lastPrimaryRefresh = 0;
-    m_lastPrimaryScale = 100;
-}
-
 void DisplayModule::MonitorLoop()
 {
     Logger::Get().Debug("DisplayModule: 监控线程已启动");
+
+    // 上次已知的显示状态（含 hash）：hash 不变则跳过更新/推送
+    DisplayState last;
 
     while (!m_exit)
     {
         try
         {
-            // 处理客户端连接时的强制推送请求（不依赖 HasClients，确保首次推送）
-            if (m_forcePush.exchange(false))
+            // 强制推送：客户端连接 / 切换 / 分辨率 / 缩放完成后置位，
+            // 不依赖变化检测，确保第一时间把最新状态推给客户端
+            bool force = m_forcePush.exchange(false);
+
+            auto current = EnumerateDisplays();
+            uint64_t hash = HashDisplayState(current);
+
+            // hash 比较：没有变化就不做任何更新（"不要每次都写"）
+            if (force || hash != last.hash)
             {
-                PushCurrentDisplayState(0);
-                // 推送后更新缓存，避免下面又触发一次
-                DisplayInfo primary;
-                if (GetCurrentPrimary(primary))
-                {
-                    std::lock_guard<std::mutex> l(m_mutex);
-                    m_lastHasPrimary = true;
-                    m_lastPrimaryId = primary.id;
-                    m_lastPrimaryWidth = primary.width;
-                    m_lastPrimaryHeight = primary.height;
-                    m_lastPrimaryRefresh = primary.refreshRate;
-                    m_lastPrimaryScale = primary.scale;
-                }
-            }
+                last.hash = hash;
+                last.displays = std::move(current);
 
-            if (m_server.HasClients())
-            {
-                DisplayInfo primary;
-                bool hasPrimary = GetCurrentPrimary(primary);
-
-                bool changed = false;
-                {
-                    std::lock_guard<std::mutex> l(m_mutex);
-                    if (hasPrimary != m_lastHasPrimary)
-                    {
-                        changed = true;
-                    }
-                    else if (hasPrimary)
-                    {
-                        if (primary.id != m_lastPrimaryId ||
-                            primary.width != m_lastPrimaryWidth ||
-                            primary.height != m_lastPrimaryHeight ||
-                            primary.refreshRate != m_lastPrimaryRefresh ||
-                            primary.scale != m_lastPrimaryScale)
-                        {
-                            changed = true;
-                        }
-                    }
-
-                    if (changed)
-                    {
-                        m_lastHasPrimary = hasPrimary;
-                        if (hasPrimary)
-                        {
-                            m_lastPrimaryId = primary.id;
-                            m_lastPrimaryWidth = primary.width;
-                            m_lastPrimaryHeight = primary.height;
-                            m_lastPrimaryRefresh = primary.refreshRate;
-                            m_lastPrimaryScale = primary.scale;
-                        }
-                    }
-                }
-
-                if (changed)
-                {
+                if (force || m_server.HasClients())
                     PushCurrentDisplayState(0);
-                }
             }
         }
         catch (const std::exception &e)
         {
-            // 一次异常绝不能污染整个模块状态：记日志并重置缓存，
+            // 一次异常绝不能污染整个模块状态：重置"上次状态"，
             // 下一轮按"全新状态"重新检测，避免持续误报/漏报。
             Logger::Get().Error("DisplayModule: MonitorLoop 异常: ", e.what());
-            ResetDisplayCache();
+            last = DisplayState{};
         }
         catch (...)
         {
             Logger::Get().Error("DisplayModule: MonitorLoop 未知异常");
-            ResetDisplayCache();
+            last = DisplayState{};
         }
 
-        // 等待下一次唤醒（放在 try 之外：异常后照常休眠，不会忙循环）。
-        // 早期实现是每 2 秒无条件枚举一次所有显示器（单次约 50ms）来轮询变化，
-        // 相当于常态占用约 2.5% 的一个核，纯属白烧。现在改为事件驱动：
-        // 主窗口收到 WM_DISPLAYCHANGE、或客户端连接/切换完成时唤醒；
-        // 另留 10 秒兜底超时，覆盖不发广播的变更（例如仅 DPI 缩放改变）。
+        // 每 2 秒轮询一次；WM_DISPLAYCHANGE / 客户端连接 / 命令完成 / Stop 可提前唤醒。
+        // （wait_for 放在 try 之外：异常后照常休眠，不会忙循环。）
         {
             std::unique_lock<std::mutex> l(m_wakeMutex);
-            m_wakeCv.wait_for(l, std::chrono::seconds(10),
+            m_wakeCv.wait_for(l, std::chrono::seconds(2),
                               [this] { return m_wakeRequested || m_exit; });
             m_wakeRequested = false;
         }

@@ -114,7 +114,8 @@ payload 为 `{"ok":false,"error":"unauthorized","cmd":<原指令>}` 的响应（
 - `EnumDisplaySettingsExW` 获取分辨率、刷新率、色深
 - CCD `DisplayConfigGetDeviceInfo` 获取/设置缩放，即时生效（移植自 SetDPI）
 - `SetDisplayConfig` + 供给配置精确切换到指定 target，切换后轮询验证确已生效
-- 显示配置变化由 `WM_DISPLAYCHANGE` 事件驱动推送（另有 10 秒兜底）
+- 每 2 秒轮询一次显示状态并做整体 hash 比较，仅在变化时推送
+  （`WM_DISPLAYCHANGE` / 客户端连接 / 切换完成可提前唤醒）
 - JSON 响应包含：`id/name/adapter/x/y/w/h/refresh/bpp/scale/is_primary/is_active`
 
 **已知限制**：

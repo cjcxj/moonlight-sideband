@@ -9,7 +9,7 @@
  *    模块的 Stop()、钩子卸载、Shutdown() 一律不执行。
  *    现在托盘右键就能优雅退出，注销时也会收到 WM_ENDSESSION。
  * 2. 拿到一个顶层窗口句柄后即可接收 WM_DISPLAYCHANGE 广播，
- *    DisplayModule 不必再每 2 秒枚举一次显示器（每次约 50ms）。
+ *    DisplayModule 每 2 秒轮询的监控循环能被该事件提前唤醒（更快响应）。
  *
  * 注意：这里必须是普通顶层窗口而不是 message-only 窗口（HWND_MESSAGE），
  * 因为 message-only 窗口收不到 WM_DISPLAYCHANGE 这类广播消息。窗口创建后

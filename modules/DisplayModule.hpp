@@ -5,6 +5,7 @@
 #include "SidebandServer.hpp"
 
 #include <windows.h>
+#include <cstdint>
 #include <string>
 #include <vector>
 #include <thread>
@@ -117,14 +118,13 @@ private:
     std::atomic<bool> m_forcePush{false};  // 客户端连接/切换完成时置位，由 MonitorLoop 异步推送
 
     // 显示器监控线程。
-    // 早期实现是每 2 秒无条件枚举一次所有显示器（单次约 50ms）来发现变化；
-    // 现在改为等待条件变量：由 WM_DISPLAYCHANGE 或 m_forcePush 唤醒，
-    // 另有一个 10 秒的兜底超时以防漏掉某些不发广播的变更（如仅缩放改变）。
+    // 每 2 秒轮询一次显示器状态（WM_DISPLAYCHANGE / 客户端连接 / 命令完成可提前唤醒），
+    // 并对枚举结果做整体 hash 比较：只有状态确实变化时才更新缓存并推送，
+    // 避免每轮无条件重写。
     std::thread m_monitorThread;
     std::mutex m_wakeMutex;
     std::condition_variable m_wakeCv;
     bool m_wakeRequested = false;
-    mutable std::mutex m_mutex;
 
     // 保护显示器枚举与模式变更之间的并发冲突：
     // EnumerateDisplays (MonitorLoop) vs ChangeDisplaySettingsExW / SetDisplayConfig (OnCommand)
@@ -133,13 +133,12 @@ private:
     // 导致缓冲区溢出，破坏堆元数据。
     mutable std::mutex m_displayMutex;
 
-    // 上次已知的主显示器信息（用于变化检测）
-    std::string m_lastPrimaryId;
-    int m_lastPrimaryWidth = 0;
-    int m_lastPrimaryHeight = 0;
-    int m_lastPrimaryRefresh = 0;
-    int m_lastPrimaryScale = 100;
-    bool m_lastHasPrimary = false;
+    // 监控线程"上次状态"缓存：hash 不变则跳过更新/推送
+    struct DisplayState
+    {
+        std::vector<DisplayInfo> displays;
+        uint64_t hash = 0;
+    };
 
     // === 内部实现 ===
 
@@ -197,11 +196,8 @@ private:
     // 把 DisplayMode 列表序列化为 JSON
     std::string ModesToJson(const std::string &displayId, const std::vector<DisplayMode> &modes) const;
 
-    // 监控主显示器变化的循环
+    // 监控显示器状态变化的循环
     void MonitorLoop();
-
-    // 异常后重置显示器缓存，避免一次异常污染后续的变化检测
-    void ResetDisplayCache();
 
     // 唤醒监控线程（置 m_forcePush 并 notify）
     void RequestPush();

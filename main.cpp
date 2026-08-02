@@ -20,7 +20,7 @@
  *   主线程        —— Win32 消息循环（托盘菜单 + WM_DISPLAYCHANGE）
  *   服务器线程    —— SidebandServer::Run()，WSAPoll 收发
  *   CursorModule  —— 工作线程 / 文本光标线程 / 钩子消息循环线程
- *   DisplayModule —— 监控线程（事件驱动）
+ *   DisplayModule —— 监控线程（每 2 秒轮询 + hash 比较，事件可提前唤醒）
  */
 
 // NOMINMAX / WIN32_LEAN_AND_MEAN / _WIN32_WINNT 等
