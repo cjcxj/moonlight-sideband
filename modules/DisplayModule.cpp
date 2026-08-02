@@ -101,14 +101,26 @@ static uint32_t ParseTargetId(const std::string &displayId)
     return 0xFFFFFFFF;
 }
 
-// CCD 枚举辅助：严格按"GetDisplayConfigBufferSizes 取大小 → 精确分配 →
-// 单次 QueryDisplayConfig"的顺序查询（规范 2.1）。
-// 禁止 while 循环里 paths.resize()+重查（配置变化时反复翻倍），
-// 也禁止 static 持久化 vector（跨调用残留垃圾数据）（规范 2.2）。
+// CCD 枚举辅助：按"GetDisplayConfigBufferSizes 取大小 → 分配 → 单次
+// QueryDisplayConfig"的顺序查询（规范 2.1），并处理配置变化的 TOCTOU。
+// 禁止 static 持久化 vector（跨调用残留垃圾数据）（规范 2.2）。
 // 成功后按 API 实际返回的 count 裁剪，避免遍历到值初始化产生的零填充条目
 //（DISPLAYCONFIG target id 可能为 0，零填充条目会被误匹配）。
+//
 // 防御上限：paths<=1024 / modes<=4096，配合 <=0 检查在 vector 创建前挡掉
 // "vector too long"（length_error 只能来自 resize/assign 收到超大计数）。
+//
+// 关键修复（P4）：CCD 存在经典 TOCTOU —— GetDisplayConfigBufferSizes 报 N 后，
+// 到真正 QueryDisplayConfig 之间显示配置可能变化，实际路径/模式数超过 N。
+// 老代码直接失败返回（枚举结果为空），更糟的是部分驱动会无视缓冲大小把多于
+// N 的项写进去，破坏 vector 底层堆 → 后续任意 vector 操作抛 "vector too long"
+//（length_error）或访问违规（0xC0000005）崩溃 —— 正是本系统（1 台真实显示器
+// 却有 16 条 CCD 路径）启动枚举必崩的根因。
+// 这里双重防御：
+//   1) 分配时多留余量（paths+16 / modes+64），把轻微"超过报告值"的写入兜进
+//      缓冲区，不至于越界破坏堆；
+//   2) 收到 ERROR_INSUFFICIENT_BUFFER 后重新取大小再查（最多 3 次），
+//      配置真正大幅变化时也能拿到正确结果，而不是放弃。
 static bool QueryDisplayConfigData(UINT32 flags,
                                    std::vector<DISPLAYCONFIG_PATH_INFO> &paths,
                                    std::vector<DISPLAYCONFIG_MODE_INFO> &modes)
@@ -116,45 +128,66 @@ static bool QueryDisplayConfigData(UINT32 flags,
     paths.clear();
     modes.clear();
 
+    constexpr UINT32 kMaxPaths = 1024;
+    constexpr UINT32 kMaxModes = 4096;
+    constexpr UINT32 kPathSlack = 16;
+    constexpr UINT32 kModeSlack = 64;
+    constexpr int kMaxRetries = 3;
+
     UINT32 numPaths = 0, numModes = 0;
     if (GetDisplayConfigBufferSizes(flags, &numPaths, &numModes) != ERROR_SUCCESS)
         return false;
 
-    // 记录原始计数，供 MonitorLoop 异常诊断（Phase 4）
-    t_lastPathCount = numPaths;
-    t_lastModeCount = numModes;
-
-    // 防御性检查：拒绝异常大/异常小的计数，避免 "vector too long"
-    // （length_error 的唯一来源就是 resize/assign 收到远超 max_size 的计数，
-    //   这里在 vector 创建前就把它们挡掉）
-    if (numPaths <= 0 || numPaths > 1024)
+    auto countsOk = [&]() {
+        return numPaths > 0 && numPaths <= kMaxPaths &&
+               numModes > 0 && numModes <= kMaxModes;
+    };
+    if (!countsOk())
     {
-        Logger::Get().Error("DisplayModule: 无效 pathCount=", numPaths);
-        return false;
-    }
-    if (numModes <= 0 || numModes > 4096)
-    {
-        Logger::Get().Error("DisplayModule: 无效 modeCount=", numModes);
+        Logger::Get().Error("DisplayModule: 无效 CCD 计数 paths=", numPaths, " modes=", numModes);
         return false;
     }
 
-    const UINT32 allocPaths = numPaths;
-    const UINT32 allocModes = numModes;
-    paths.resize(allocPaths);
-    modes.resize(allocModes);
+    for (int attempt = 0; attempt < kMaxRetries; ++attempt)
+    {
+        // 记录本次报告计数，供 MonitorLoop 异常诊断（Phase 4）
+        t_lastPathCount = numPaths;
+        t_lastModeCount = numModes;
 
-    if (QueryDisplayConfig(flags, &numPaths, paths.data(),
-                           &numModes, modes.data(), nullptr) != ERROR_SUCCESS)
-        return false;
+        const UINT32 allocPaths = numPaths + kPathSlack;
+        const UINT32 allocModes = numModes + kModeSlack;
+        paths.resize(allocPaths);
+        modes.resize(allocModes);
 
-    // 防御：驱动返回的计数超过已分配缓冲区则按失败处理（正常 API 不会这样，
-    // 真发生说明驱动/内存已异常，绝不能让 resize 再往大里走）
-    if (numPaths > allocPaths || numModes > allocModes)
-        return false;
+        UINT32 retPaths = allocPaths, retModes = allocModes;
+        LONG r = QueryDisplayConfig(flags, &retPaths, paths.data(),
+                                    &retModes, modes.data(), nullptr);
+        if (r == ERROR_SUCCESS)
+        {
+            // 驱动返回的计数超过已分配缓冲区（含余量）说明它无视缓冲大小，
+            // 内存已被越界写破坏，防御性拒绝，绝不能让 resize 再往大里走。
+            if (retPaths > allocPaths || retModes > allocModes)
+                return false;
+            paths.resize(retPaths);
+            modes.resize(retModes);
+            return true;
+        }
 
-    paths.resize(numPaths);
-    modes.resize(numModes);
-    return true;
+        if (r != ERROR_INSUFFICIENT_BUFFER)
+            return false;
+
+        // 配置在两次查询之间增长：重新取大小再试
+        Logger::Get().Warning("DisplayModule: CCD 缓冲区不足 flags=", flags,
+                              " 报告 paths=", numPaths, " modes=", numModes,
+                              "，重试");
+        if (GetDisplayConfigBufferSizes(flags, &numPaths, &numModes) != ERROR_SUCCESS)
+            return false;
+        if (!countsOk())
+            return false;
+    }
+
+    Logger::Get().Warning("DisplayModule: CCD 查询重试耗尽，放弃 flags=", flags);
+    return false;
 }
 
 // 计算显示器列表的 FNV-1a 内容 hash，供 MonitorLoop 做变化检测：
