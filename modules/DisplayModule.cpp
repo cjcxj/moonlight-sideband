@@ -818,9 +818,6 @@ std::vector<DisplayModule::DisplayInfo> DisplayModule::EnumerateDisplays() const
                                                          _countof(monitor.DeviceString)));
         }
 
-        if (info.name.empty())
-            info.name = "Display " + std::to_string(result.size() + 1);
-
         // 获取分辨率/刷新率。
         // DEVMODEW 也套写穿防护：dmSize/dmDriverExtra=0 时合规驱动只写 sizeof(dm)
         // 字节，但无视契约的驱动多写扩展字节会踩坏相邻栈对象（Phase 5）。
@@ -854,12 +851,19 @@ std::vector<DisplayModule::DisplayInfo> DisplayModule::EnumerateDisplays() const
         // 取到名字，说明该 source 有效，这里再查缩放是安全的（避免把无效 id 传入）。
         info.scale = GetDpiScalingPercent(path.sourceInfo.adapterId, path.sourceInfo.id);
 
-        // 过滤掉未启用且没有真实友好名称的显示器（虚拟设备/无效路径）
+        // 过滤掉未启用且没有真实友好名称的显示器（虚拟设备/无效路径）。
+        // 必须在兜底命名之前判断：名字为空说明该端口没有真实显示器
+        // （未连接 / 无 EDID / 虚拟输出），否则每个空端口都会以 "Display N"
+        // 的名义漏进列表，导致客户端看到一大堆"未启用"的假屏幕。
         if (!info.isActive && (info.name.empty() || info.name == "Generic PnP Monitor"))
         {
             Logger::Get().Debug("DisplayModule: 跳过虚拟设备 ", info.id, " name=", info.name);
             continue;
         }
+
+        // 兜底命名：能走到这里的一般都有真实名字；仅极少数情况下仍为空。
+        if (info.name.empty())
+            info.name = "Display " + std::to_string(result.size() + 1);
 
         Logger::Get().Debug("DisplayModule: 枚举 ", info.id, " active=", info.isActive,
                            " primary=", info.isPrimary,
