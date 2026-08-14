@@ -65,7 +65,12 @@ if(MSVC)
     # "æ‰"å¼€æ—¥å¿—"。窄字符串之所以看起来没事，是因为源代码页与执行代码页相同、
     # 字节原样透传，只有宽字面量需要真实转码才暴露出来。
     # /utf-8 等价于 /source-charset:utf-8 /execution-charset:utf-8。
-    target_compile_options(moonlight_sideband PRIVATE /W4 /utf-8)
+    #
+    # /EHa：显示驱动（虚拟显示器）可能在 CCD 查询时写穿我们传入的栈缓冲区，
+    # 引发访问违规（0xC0000005）。/EHa 让 catch(...) 也能接住 SEH 异常，
+    # MonitorLoop / 服务器主循环 / 各工作线程的 catch(...) 就能把这类驱动
+    # 异常降级为"记录日志 + 本轮重试"，而不是整个进程崩溃。
+    target_compile_options(moonlight_sideband PRIVATE /W4 /utf-8 /EHa)
 endif()
 
 # Windows 子系统 (无控制台黑框)。

@@ -17,6 +17,9 @@ constexpr int kMaxAuthFailures = 5;
 
 // 主循环等待事件的超时（毫秒）。也决定了 Tick 的抖动上限。
 constexpr int kPollTimeoutMs = 15;
+
+// 模块 Tick 间隔（~30Hz）
+constexpr auto kTickInterval = std::chrono::milliseconds(33);
 } // namespace
 
 SidebandServer::SidebandServer()
@@ -314,6 +317,33 @@ void SidebandServer::DispatchCommand(SidebandSession &session,
 {
     using namespace SidebandProtocol;
 
+    // 单条指令的处理必须异常隔离：模块的 OnCommand 会做 CCD 枚举/切换，
+    // 遇到驱动返回的坏数据可能抛 length_error/访问违规（/EHa 下 catch(...)
+    // 也能接住）。不在这里兜住，异常会一路冒到主循环杀掉整个服务器线程；
+    // 且 ProcessRxBuffer 只有在本函数正常返回后才消费该包，抛出会留下
+    // 坏包反复触发同一错误。
+    try
+    {
+        DispatchCommandInner(session, cmd_id, req_id, payload, payload_len);
+    }
+    catch (const std::exception &e)
+    {
+        Logger::Get().Error("SidebandServer: 指令处理异常 cmd=", cmd_id,
+                            " req=", req_id, " err=", e.what());
+    }
+    catch (...)
+    {
+        Logger::Get().Error("SidebandServer: 指令处理未知异常 cmd=", cmd_id,
+                            " req=", req_id);
+    }
+}
+
+void SidebandServer::DispatchCommandInner(SidebandSession &session,
+                                          uint32_t cmd_id, uint32_t req_id,
+                                          const uint8_t *payload, uint32_t payload_len)
+{
+    using namespace SidebandProtocol;
+
     Logger::Get().Debug("SidebandServer: 收到指令 cmd=", cmd_id, " req=", req_id,
                         " len=", payload_len);
 
@@ -481,12 +511,40 @@ void SidebandServer::Run()
     Logger::Get().Debug("SidebandServer: 主循环开始");
 
     auto lastTick = std::chrono::steady_clock::now();
-    constexpr auto kTickInterval = std::chrono::milliseconds(33); // ~30Hz
 
     std::vector<WSAPOLLFD> fds;
     std::vector<SessionPtr> polled;
 
     while (m_running)
+    {
+        // 单轮主循环异常隔离：任何一轮遇到坏数据（驱动/网络）都不允许
+        // 杀掉整个服务器线程 —— 记录后继续下一轮。配合 /EHa，catch(...)
+        // 也能接住访问违规（0xC0000005）。
+        try
+        {
+            if (!RunRound(fds, polled, lastTick))
+                break;
+        }
+        catch (const std::exception &e)
+        {
+            Logger::Get().Error("SidebandServer: 主循环本轮异常: ", e.what());
+            Sleep(10);
+        }
+        catch (...)
+        {
+            Logger::Get().Error("SidebandServer: 主循环本轮未知异常");
+            Sleep(10);
+        }
+    }
+
+    Logger::Get().Debug("SidebandServer: 主循环退出");
+}
+
+// 一轮 WSAPoll + 收发 + 摘除 + Tick。返回 false 表示应退出主循环。
+bool SidebandServer::RunRound(std::vector<WSAPOLLFD> &fds,
+                              std::vector<SessionPtr> &polled,
+                              std::chrono::steady_clock::time_point &lastTick)
+{
     {
         // 组装本轮要等待的 socket 集合：[0] 是监听 socket，其后是各客户端
         fds.clear();
@@ -556,18 +614,17 @@ void SidebandServer::Run()
                 }
             }
         }
-
-        // 摘除断开的会话（可能由本轮 recv 判定，也可能由广播线程判定）
-        ReapDisconnected();
-
-        // 周期性 Tick
-        auto now = std::chrono::steady_clock::now();
-        if (now - lastTick >= kTickInterval)
-        {
-            TickModules();
-            lastTick = now;
-        }
     }
 
-    Logger::Get().Debug("SidebandServer: 主循环退出");
+    // 摘除断开的会话（可能由本轮 recv 判定，也可能由广播线程判定）
+    ReapDisconnected();
+
+    // 周期性 Tick
+    auto now = std::chrono::steady_clock::now();
+    if (now - lastTick >= kTickInterval)
+    {
+        TickModules();
+        lastTick = now;
+    }
+    return true;
 }

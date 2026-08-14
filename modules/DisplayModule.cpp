@@ -52,6 +52,12 @@ static thread_local size_t t_lastMonitorCount = 0;
 //（enumerate / hash / push / qdc_get_size / qdc_query / enum_monitors ...）。
 static thread_local const char *t_loopPhase = "unknown";
 
+// 记录 enum_loop 当前正在处理的 CCD path 下标与 targetId（Phase 5 诊断）。
+// 若 length_error / 访问违规仍复现，日志能直接指出是哪一条 path 触发，
+// 不用再全文件猜。
+static thread_local uint32_t t_loopPathIndex = 0xFFFFFFFF;
+static thread_local uint32_t t_loopTargetId = 0xFFFFFFFF;
+
 // 提取异常类型名。MSVC 的 typeid 输出形如 "class std::length_error"，
 // 剥掉修饰前缀得到 "std::length_error"。
 static std::string ExceptionTypeName(const std::exception &e)
@@ -78,6 +84,11 @@ static void LogMonitorLoopException(const std::exception *e)
     Logger::Get().Error("mode_count: ", t_lastModeCount);
     Logger::Get().Error("phase: ", t_loopPhase);
     Logger::Get().Error("thread: MonitorLoop");
+    if (t_loopPathIndex != 0xFFFFFFFF)
+    {
+        Logger::Get().Error("path_index: ", t_loopPathIndex,
+                            " target_id: 0x", std::hex, t_loopTargetId, std::dec);
+    }
     if (e)
         Logger::Get().Error("what: ", e->what());
 }
@@ -130,6 +141,74 @@ static bool BoundedWideEquals(const wchar_t *arr, size_t cap, const wchar_t *str
     return n == wcslen(str) && wcsncmp(arr, str, n) == 0;
 }
 
+// ============================================================
+//            驱动写穿防护（Phase 5，根因修复）
+// ============================================================
+//
+// 本机（1 台真实显示器 + 虚拟显示驱动）的 CCD 查询在客户端连接/流启动期间
+// 会把比固定数组更长的 wchar 串写进 viewGdiDeviceName[32] /
+// monitorFriendlyDeviceName[64]，越界写落在**相邻栈对象**上 —— 把 enum_loop
+// 里 result / info 等 vector/string 的内联元数据踩坏，随后任意 vector 操作
+//（push_back）看到垃圾 size/capacity → _Xlen() 抛 std::length_error
+//（what() == "vector too long"），或直接写/读到野地址 → 0xC0000005 崩溃。
+// 这正是日志里"每次客户端连接后 MonitorLoop 每轮必抛 length_error、偶发
+// 访问违规"的根因；之前的修复只挡了"读"（BoundedWideString），没挡"写"。
+//
+// 防御：给驱动输出结构体挂一段冗余 wchar 区。驱动的越界写先落入冗余区
+//（不再碰相邻栈对象），调用后检查冗余区是否被踩即可检测写穿。
+// header.size 仍填 sizeof(T)（驱动承诺只写这么多），冗余区不属于告诉驱动的
+// 大小 —— 合规驱动不会碰它，只有无视大小的驱动才会写进来。
+template <typename T, size_t SlackWChars>
+struct DriverOutputGuard
+{
+    T value{};                   // 传给驱动的结构体（header.size = sizeof(T)）
+    wchar_t slack[SlackWChars]{};  // 吸收驱动的越界写；调用后检查（NSDMI 清零）
+
+    bool Overrun() const
+    {
+        for (size_t i = 0; i < SlackWChars; ++i)
+            if (slack[i] != 0)
+                return true;
+        return false;
+    }
+};
+
+// 查询 GET_SOURCE_NAME（带写穿防护）。path 决定 adapterId/sourceId。
+static bool QuerySourceNameGuarded(const DISPLAYCONFIG_PATH_INFO &path,
+                                   DriverOutputGuard<DISPLAYCONFIG_SOURCE_DEVICE_NAME, 64> &out)
+{
+    out.value = {};
+    out.value.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+    out.value.header.size = sizeof(out.value);
+    out.value.header.adapterId = path.sourceInfo.adapterId;
+    out.value.header.id = path.sourceInfo.id;
+    LONG r = DisplayConfigGetDeviceInfo(&out.value.header);
+    if (r == ERROR_SUCCESS && out.Overrun())
+    {
+        Logger::Get().Warning("DisplayModule: GET_SOURCE_NAME 驱动写穿检测 targetId=",
+                              path.targetInfo.id);
+    }
+    return r == ERROR_SUCCESS;
+}
+
+// 查询 GET_TARGET_NAME（带写穿防护）。
+static bool QueryTargetNameGuarded(const DISPLAYCONFIG_PATH_INFO &path,
+                                   DriverOutputGuard<DISPLAYCONFIG_TARGET_DEVICE_NAME, 128> &out)
+{
+    out.value = {};
+    out.value.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+    out.value.header.size = sizeof(out.value);
+    out.value.header.adapterId = path.targetInfo.adapterId;
+    out.value.header.id = path.targetInfo.id;
+    LONG r = DisplayConfigGetDeviceInfo(&out.value.header);
+    if (r == ERROR_SUCCESS && out.Overrun())
+    {
+        Logger::Get().Warning("DisplayModule: GET_TARGET_NAME 驱动写穿检测 targetId=",
+                              path.targetInfo.id);
+    }
+    return r == ERROR_SUCCESS;
+}
+
 // CCD 枚举辅助：按"GetDisplayConfigBufferSizes 取大小 → 分配 → 单次
 // QueryDisplayConfig"的顺序查询（规范 2.1），并处理配置变化的 TOCTOU。
 // 禁止 static 持久化 vector（跨调用残留垃圾数据）（规范 2.2）。
@@ -159,6 +238,8 @@ static bool QueryDisplayConfigData(UINT32 flags,
 
     constexpr UINT32 kMaxPaths = 1024;
     constexpr UINT32 kMaxModes = 4096;
+    constexpr UINT32 kPathSlack = 128;   // 冗余区：吸收驱动"略超报告值"的越界写
+    constexpr UINT32 kModeSlack = 512;
     constexpr int kMaxRetries = 3;
 
     UINT32 numPaths = 0, numModes = 0;
@@ -182,17 +263,18 @@ static bool QueryDisplayConfigData(UINT32 flags,
         t_lastPathCount = numPaths;
         t_lastModeCount = numModes;
 
-        // 固定按上限分配，不再按"报告值+余量"：切换过程中 CCD 计数会在
+        // 固定按上限+冗余分配，不再按"报告值+余量"：切换过程中 CCD 计数会在
         // GetDisplayConfigBufferSizes 与 QueryDisplayConfig 之间剧烈增长
         //（本机 1 台真实显示器却有 16→32 条 CCD 路径），按报告值分配会被
         // 驱动写穿、破坏堆 → 后续任意 vector 操作抛 "vector too long"。
-        // 固定 1024/4096 给足 32~64 倍余量，驱动物理上写不穿。
+        // 固定 1024+128/4096+512 给足余量，驱动物理上写不穿。
         // 用裸数组而非 vector 接收：极端情况下越界写也只伤我们自己的缓冲区
         // 尾部，不碰 vector 内部结构 / 相邻堆元数据，确认无误后再拷进 vector。
-        const UINT32 allocPaths = kMaxPaths;
-        const UINT32 allocModes = kMaxModes;
-        std::unique_ptr<DISPLAYCONFIG_PATH_INFO[]> pathBuf(new DISPLAYCONFIG_PATH_INFO[allocPaths]);
-        std::unique_ptr<DISPLAYCONFIG_MODE_INFO[]> modeBuf(new DISPLAYCONFIG_MODE_INFO[allocModes]);
+        const UINT32 allocPaths = kMaxPaths + kPathSlack;
+        const UINT32 allocModes = kMaxModes + kModeSlack;
+        // 带括号的 new：值初始化（清零），尾部踩踏检测依赖"未写区域全零"。
+        std::unique_ptr<DISPLAYCONFIG_PATH_INFO[]> pathBuf(new DISPLAYCONFIG_PATH_INFO[allocPaths]());
+        std::unique_ptr<DISPLAYCONFIG_MODE_INFO[]> modeBuf(new DISPLAYCONFIG_MODE_INFO[allocModes]());
 
         UINT32 retPaths = allocPaths, retModes = allocModes;
         t_loopPhase = "qdc_query";
@@ -209,6 +291,39 @@ static bool QueryDisplayConfigData(UINT32 flags,
                                     " modes=", retModes);
                 return false;
             }
+
+            // 尾部踩踏检测：若驱动把多于 retPaths/retModes 的项写进了冗余区，
+            // 说明它无视缓冲大小 —— 本轮的 assign 仍然安全（只取 retPaths），
+            // 但记一条日志便于判断是否该提高上限。
+            {
+                bool tailClobbered = false;
+                for (UINT32 i = retPaths; i < allocPaths; ++i)
+                {
+                    if (pathBuf[i].targetInfo.id != 0 || pathBuf[i].sourceInfo.id != 0)
+                    {
+                        tailClobbered = true;
+                        break;
+                    }
+                }
+                if (!tailClobbered)
+                {
+                    for (UINT32 i = retModes; i < allocModes; ++i)
+                    {
+                        // 值初始化后 infoType == 0；驱动写过则为 1/2/0xFFFFFFFF
+                        if (modeBuf[i].infoType != 0)
+                        {
+                            tailClobbered = true;
+                            break;
+                        }
+                    }
+                }
+                if (tailClobbered)
+                {
+                    Logger::Get().Warning("DisplayModule: CCD 驱动写穿冗余区 flags=", flags,
+                                          " retPaths=", retPaths, " retModes=", retModes);
+                }
+            }
+
             paths.assign(pathBuf.get(), pathBuf.get() + retPaths);
             modes.assign(modeBuf.get(), modeBuf.get() + retModes);
             return true;
@@ -321,15 +436,11 @@ static bool FindSourceByGdiNameAndId(const std::wstring &gdiName, uint32_t targe
             continue;
 
         // 先用 GET_SOURCE_NAME 验证 source id 有效（无效则跳过，避免把垃圾 id 传给 DPI 接口）
-        DISPLAYCONFIG_SOURCE_DEVICE_NAME srcName = {};
-        srcName.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
-        srcName.header.size = sizeof(srcName);
-        srcName.header.adapterId = path.sourceInfo.adapterId;
-        srcName.header.id = path.sourceInfo.id;
-        if (DisplayConfigGetDeviceInfo(&srcName.header) != ERROR_SUCCESS)
+        DriverOutputGuard<DISPLAYCONFIG_SOURCE_DEVICE_NAME, 64> srcName;
+        if (!QuerySourceNameGuarded(path, srcName))
             continue;
 
-        if (BoundedWideEquals(srcName.viewGdiDeviceName, _countof(srcName.viewGdiDeviceName),
+        if (BoundedWideEquals(srcName.value.viewGdiDeviceName, _countof(srcName.value.viewGdiDeviceName),
                                     gdiName.c_str()))
         {
             outSourceAdapterId = path.sourceInfo.adapterId;
@@ -343,21 +454,25 @@ static bool FindSourceByGdiNameAndId(const std::wstring &gdiName, uint32_t targe
 // 获取当前 DPI 缩放百分比
 static int GetDpiScalingPercent(LUID adapterId, UINT32 sourceId)
 {
-    DISPLAYCONFIG_SOURCE_DPI_SCALE_GET req = {};
-    req.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_DPI_SCALE;
-    req.header.size = sizeof(req);
-    req.header.adapterId = adapterId;
-    req.header.id = sourceId;
+    // 私有 DPI 接口同样套写穿防护：未公开结构，驱动可能按自身期望的版本
+    // 多写字节，踩坏相邻栈对象（Phase 5）。
+    DriverOutputGuard<DISPLAYCONFIG_SOURCE_DPI_SCALE_GET, 32> req;
+    req.value.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_DPI_SCALE;
+    req.value.header.size = sizeof(req.value);
+    req.value.header.adapterId = adapterId;
+    req.value.header.id = sourceId;
 
-    if (DisplayConfigGetDeviceInfo(&req.header) != ERROR_SUCCESS)
+    if (DisplayConfigGetDeviceInfo(&req.value.header) != ERROR_SUCCESS)
         return 100;
+    if (req.Overrun())
+        Logger::Get().Warning("DisplayModule: GET_DPI_SCALE 驱动写穿检测 sourceId=", sourceId);
 
     // 修正越界值
-    if (req.curScaleRel < req.minScaleRel) req.curScaleRel = req.minScaleRel;
-    if (req.curScaleRel > req.maxScaleRel) req.curScaleRel = req.maxScaleRel;
+    if (req.value.curScaleRel < req.value.minScaleRel) req.value.curScaleRel = req.value.minScaleRel;
+    if (req.value.curScaleRel > req.value.maxScaleRel) req.value.curScaleRel = req.value.maxScaleRel;
 
-    int32_t minAbs = abs((int)req.minScaleRel);
-    size_t idx = (size_t)(minAbs + req.curScaleRel);
+    int32_t minAbs = abs((int)req.value.minScaleRel);
+    size_t idx = (size_t)(minAbs + req.value.curScaleRel);
     if (idx < sizeof(kDpiVals) / sizeof(kDpiVals[0]))
         return (int)kDpiVals[idx];
 
@@ -368,13 +483,13 @@ static int GetDpiScalingPercent(LUID adapterId, UINT32 sourceId)
 static bool SetDpiScaling(LUID adapterId, UINT32 sourceId, int dpiPercent)
 {
     // 获取当前 DPI 信息
-    DISPLAYCONFIG_SOURCE_DPI_SCALE_GET req = {};
-    req.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_DPI_SCALE;
-    req.header.size = sizeof(req);
-    req.header.adapterId = adapterId;
-    req.header.id = sourceId;
+    DriverOutputGuard<DISPLAYCONFIG_SOURCE_DPI_SCALE_GET, 32> req;
+    req.value.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_DPI_SCALE;
+    req.value.header.size = sizeof(req.value);
+    req.value.header.adapterId = adapterId;
+    req.value.header.id = sourceId;
 
-    LONG getRes = DisplayConfigGetDeviceInfo(&req.header);
+    LONG getRes = DisplayConfigGetDeviceInfo(&req.value.header);
     if (getRes != ERROR_SUCCESS)
     {
         Logger::Get().Error("DisplayModule: 查询 DPI 缩放失败 code=", getRes);
@@ -383,11 +498,11 @@ static bool SetDpiScaling(LUID adapterId, UINT32 sourceId, int dpiPercent)
 
     // 修正越界值后判断是否已在目标缩放：已到位则直接成功，
     // 避免对部分驱动发出无变化的 SET 而被拒绝。
-    if (req.curScaleRel < req.minScaleRel) req.curScaleRel = req.minScaleRel;
-    if (req.curScaleRel > req.maxScaleRel) req.curScaleRel = req.maxScaleRel;
+    if (req.value.curScaleRel < req.value.minScaleRel) req.value.curScaleRel = req.value.minScaleRel;
+    if (req.value.curScaleRel > req.value.maxScaleRel) req.value.curScaleRel = req.value.maxScaleRel;
 
-    int32_t minAbs = abs((int)req.minScaleRel);
-    size_t curIdx = (size_t)(minAbs + req.curScaleRel);
+    int32_t minAbs = abs((int)req.value.minScaleRel);
+    size_t curIdx = (size_t)(minAbs + req.value.curScaleRel);
     if (curIdx < sizeof(kDpiVals) / sizeof(kDpiVals[0]) &&
         (int)kDpiVals[curIdx] == dpiPercent)
     {
@@ -409,11 +524,11 @@ static bool SetDpiScaling(LUID adapterId, UINT32 sourceId, int dpiPercent)
 
     // 目标值必须落在该显示器支持范围内，否则 SET 返回 ERROR_INVALID_PARAMETER
     const size_t tableLen = sizeof(kDpiVals) / sizeof(kDpiVals[0]);
-    if (scaleRel < req.minScaleRel || scaleRel > req.maxScaleRel)
+    if (scaleRel < req.value.minScaleRel || scaleRel > req.value.maxScaleRel)
     {
         int minScale = 0, maxScale = 0;
-        size_t minIdx = (size_t)(minAbs + req.minScaleRel);
-        size_t maxIdx = (size_t)(minAbs + req.maxScaleRel);
+        size_t minIdx = (size_t)(minAbs + req.value.minScaleRel);
+        size_t maxIdx = (size_t)(minAbs + req.value.maxScaleRel);
         if (minIdx < tableLen) minScale = (int)kDpiVals[minIdx];
         if (maxIdx < tableLen) maxScale = (int)kDpiVals[maxIdx];
         Logger::Get().Warning("DisplayModule: 目标缩放 ", dpiPercent,
@@ -568,9 +683,11 @@ std::vector<DisplayModule::DisplayInfo> DisplayModule::EnumerateDisplays() const
         if (GetMonitorInfoW(hMon, &info))
         {
             auto *data = reinterpret_cast<DesktopMonitorsData*>(dwData);
-            data->activeMonitors.insert(info.szDevice);
+            // szDevice 也是驱动填充的固定数组，防御性走有界拷贝（Phase 5）
+            std::wstring devName = BoundedWideString(info.szDevice, _countof(info.szDevice));
+            data->activeMonitors.insert(devName);
             if (info.dwFlags & MONITORINFOF_PRIMARY)
-                data->primaryMonitor = info.szDevice;
+                data->primaryMonitor = devName;
         }
         return TRUE;
     }, reinterpret_cast<LPARAM>(&dmData));
@@ -619,19 +736,23 @@ std::vector<DisplayModule::DisplayInfo> DisplayModule::EnumerateDisplays() const
     // 遍历 CCD 路径，提取显示器信息
     std::set<std::wstring> seenDevices;  // EDID 去重
     t_loopPhase = "enum_loop";
+    uint32_t loopIdx = 0;
     for (const auto &path : paths)
     {
+        // Phase 5 诊断：记录当前 path，异常时能直接指出是哪条路径触发
+        t_loopPathIndex = loopIdx++;
+        t_loopTargetId = path.targetInfo.id;
+
         // 获取 source GDI 设备名（如 "\\.\DISPLAY1"）
-        DISPLAYCONFIG_SOURCE_DEVICE_NAME sourceName = {};
-        sourceName.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
-        sourceName.header.size = sizeof(sourceName);
-        sourceName.header.adapterId = path.sourceInfo.adapterId;
-        sourceName.header.id = path.sourceInfo.id;
-        if (DisplayConfigGetDeviceInfo(&sourceName.header) != ERROR_SUCCESS)
+        // 带写穿防护：虚拟显示驱动可能把超长/非空终止串写进 viewGdiDeviceName[32]，
+        // 越界写会踩坏相邻栈对象（result/info 的 vector/string 内联元数据）→
+        // 后续 push_back 抛 "vector too long"（Phase 5 根因修复）。
+        DriverOutputGuard<DISPLAYCONFIG_SOURCE_DEVICE_NAME, 64> sourceName;
+        if (!QuerySourceNameGuarded(path, sourceName))
             continue;
 
-        std::wstring gdiName = BoundedWideString(sourceName.viewGdiDeviceName,
-                                                 _countof(sourceName.viewGdiDeviceName));
+        std::wstring gdiName = BoundedWideString(sourceName.value.viewGdiDeviceName,
+                                                 _countof(sourceName.value.viewGdiDeviceName));
         if (gdiName.empty())
             continue;
 
@@ -642,17 +763,13 @@ std::vector<DisplayModule::DisplayInfo> DisplayModule::EnumerateDisplays() const
             continue;
         }
 
-        // 获取 target 友好名称和 EDID 信息
-        DISPLAYCONFIG_TARGET_DEVICE_NAME targetName = {};
-        targetName.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
-        targetName.header.size = sizeof(targetName);
-        targetName.header.adapterId = path.targetInfo.adapterId;
-        targetName.header.id = path.targetInfo.id;
+        // 获取 target 友好名称和 EDID 信息（同样带写穿防护）
+        DriverOutputGuard<DISPLAYCONFIG_TARGET_DEVICE_NAME, 128> targetName;
         std::wstring friendlyName;
-        if (DisplayConfigGetDeviceInfo(&targetName.header) == ERROR_SUCCESS)
+        if (QueryTargetNameGuarded(path, targetName))
         {
-            friendlyName = BoundedWideString(targetName.monitorFriendlyDeviceName,
-                                             _countof(targetName.monitorFriendlyDeviceName));
+            friendlyName = BoundedWideString(targetName.value.monitorFriendlyDeviceName,
+                                             _countof(targetName.value.monitorFriendlyDeviceName));
         }
 
         // 按 target 的 adapterId+id 去重（每个物理接口是唯一的）
@@ -673,7 +790,10 @@ std::vector<DisplayModule::DisplayInfo> DisplayModule::EnumerateDisplays() const
         // isActive 基于 QDC_ONLY_ACTIVE_PATHS（该 target 是否在桌面中）
         info.isActive = activeTargets.count({adapterKey, path.targetInfo.id}) > 0;
 
-        // 用 EnumDisplayDevicesW 获取适配器名称和监视器 DeviceID
+        // 用 EnumDisplayDevicesW 获取适配器名称和监视器 DeviceID。
+        // DeviceString/DeviceID 也是驱动填的 WCHAR[128]，同样可能没有空终止符：
+        // 直接 WideToUtf8() 会用 wcslen 读穿数组边界（读野地址 → 0xC0000005），
+        // 统一走有界版本（Phase 5）。
         DISPLAY_DEVICEW adapter = {};
         adapter.cb = sizeof(adapter);
         for (DWORD i = 0; EnumDisplayDevicesW(nullptr, i, &adapter, 0); ++i)
@@ -681,7 +801,8 @@ std::vector<DisplayModule::DisplayInfo> DisplayModule::EnumerateDisplays() const
             if (BoundedWideEquals(adapter.DeviceName, _countof(adapter.DeviceName),
                                   gdiName.c_str()))
             {
-                info.adapterName = WideToUtf8(adapter.DeviceString);
+                info.adapterName = WideToUtf8(BoundedWideString(adapter.DeviceString,
+                                                                _countof(adapter.DeviceString)));
                 break;
             }
         }
@@ -690,38 +811,42 @@ std::vector<DisplayModule::DisplayInfo> DisplayModule::EnumerateDisplays() const
         monitor.cb = sizeof(monitor);
         if (EnumDisplayDevicesW(gdiName.c_str(), 0, &monitor, 0))
         {
-            info.deviceId = WideToUtf8(monitor.DeviceID);
+            info.deviceId = WideToUtf8(BoundedWideString(monitor.DeviceID,
+                                                         _countof(monitor.DeviceID)));
             if (info.name.empty())
-                info.name = WideToUtf8(monitor.DeviceString);
+                info.name = WideToUtf8(BoundedWideString(monitor.DeviceString,
+                                                         _countof(monitor.DeviceString)));
         }
 
         if (info.name.empty())
             info.name = "Display " + std::to_string(result.size() + 1);
 
-        // 获取分辨率/刷新率
-        DEVMODEW dm = {};
-        dm.dmSize = sizeof(dm);
-        dm.dmDriverExtra = 0;
-        if (EnumDisplaySettingsExW(gdiName.c_str(), ENUM_CURRENT_SETTINGS, &dm, 0))
+        // 获取分辨率/刷新率。
+        // DEVMODEW 也套写穿防护：dmSize/dmDriverExtra=0 时合规驱动只写 sizeof(dm)
+        // 字节，但无视契约的驱动多写扩展字节会踩坏相邻栈对象（Phase 5）。
+        DriverOutputGuard<DEVMODEW, 32> dm;
+        dm.value.dmSize = sizeof(dm.value);
+        dm.value.dmDriverExtra = 0;
+        if (EnumDisplaySettingsExW(gdiName.c_str(), ENUM_CURRENT_SETTINGS, &dm.value, 0))
         {
-            info.x = dm.dmPosition.x;
-            info.y = dm.dmPosition.y;
-            info.width = (int)dm.dmPelsWidth;
-            info.height = (int)dm.dmPelsHeight;
-            info.refreshRate = (int)dm.dmDisplayFrequency;
-            info.bitsPerPel = (int)dm.dmBitsPerPel;
+            info.x = dm.value.dmPosition.x;
+            info.y = dm.value.dmPosition.y;
+            info.width = (int)dm.value.dmPelsWidth;
+            info.height = (int)dm.value.dmPelsHeight;
+            info.refreshRate = (int)dm.value.dmDisplayFrequency;
+            info.bitsPerPel = (int)dm.value.dmBitsPerPel;
             // isPrimary 基于 MONITORINFOF_PRIMARY 标志（镜像模式下多个显示器位置都是 (0,0)）
             if (info.isActive)
                 info.isPrimary = (dmData.primaryMonitor == gdiName);
         }
-        else if (EnumDisplaySettingsExW(gdiName.c_str(), ENUM_REGISTRY_SETTINGS, &dm, 0))
+        else if (EnumDisplaySettingsExW(gdiName.c_str(), ENUM_REGISTRY_SETTINGS, &dm.value, 0))
         {
-            info.x = dm.dmPosition.x;
-            info.y = dm.dmPosition.y;
-            info.width = (int)dm.dmPelsWidth;
-            info.height = (int)dm.dmPelsHeight;
-            info.refreshRate = (int)dm.dmDisplayFrequency;
-            info.bitsPerPel = (int)dm.dmBitsPerPel;
+            info.x = dm.value.dmPosition.x;
+            info.y = dm.value.dmPosition.y;
+            info.width = (int)dm.value.dmPelsWidth;
+            info.height = (int)dm.value.dmPelsHeight;
+            info.refreshRate = (int)dm.value.dmDisplayFrequency;
+            info.bitsPerPel = (int)dm.value.dmBitsPerPel;
         }
 
         // 用 CCD API 获取 DPI 缩放（对活跃和未启用的显示器都有效）。
@@ -795,15 +920,11 @@ static bool FindInactiveTargetIsInternal(const std::wstring &gdiName, uint32_t t
         if (path.targetInfo.id != targetId)
             continue;
 
-        DISPLAYCONFIG_SOURCE_DEVICE_NAME srcName = {};
-        srcName.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
-        srcName.header.size = sizeof(srcName);
-        srcName.header.adapterId = path.sourceInfo.adapterId;
-        srcName.header.id = path.sourceInfo.id;
-        if (DisplayConfigGetDeviceInfo(&srcName.header) != ERROR_SUCCESS)
+        DriverOutputGuard<DISPLAYCONFIG_SOURCE_DEVICE_NAME, 64> srcName;
+        if (!QuerySourceNameGuarded(path, srcName))
             continue;
 
-        if (!BoundedWideEquals(srcName.viewGdiDeviceName, _countof(srcName.viewGdiDeviceName),
+        if (!BoundedWideEquals(srcName.value.viewGdiDeviceName, _countof(srcName.value.viewGdiDeviceName),
                        gdiName.c_str()))
             continue;
 
@@ -863,15 +984,11 @@ static bool ActivateTargetExclusive(const std::wstring &gdiName, uint32_t target
                 if (looseIdx < 0)
                     looseIdx = i;
 
-                DISPLAYCONFIG_SOURCE_DEVICE_NAME srcName = {};
-                srcName.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
-                srcName.header.size = sizeof(srcName);
-                srcName.header.adapterId = dbPaths[i].sourceInfo.adapterId;
-                srcName.header.id = dbPaths[i].sourceInfo.id;
-                if (DisplayConfigGetDeviceInfo(&srcName.header) != ERROR_SUCCESS)
+                DriverOutputGuard<DISPLAYCONFIG_SOURCE_DEVICE_NAME, 64> srcName;
+                if (!QuerySourceNameGuarded(dbPaths[i], srcName))
                     continue;
 
-                if (BoundedWideEquals(srcName.viewGdiDeviceName, _countof(srcName.viewGdiDeviceName),
+                if (BoundedWideEquals(srcName.value.viewGdiDeviceName, _countof(srcName.value.viewGdiDeviceName),
                                     gdiName.c_str()))
                 {
                     exactIdx = i;
@@ -931,15 +1048,11 @@ static bool ActivateTargetExclusive(const std::wstring &gdiName, uint32_t target
         if (looseIdx < 0)
             looseIdx = i;
 
-        DISPLAYCONFIG_SOURCE_DEVICE_NAME srcName = {};
-        srcName.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
-        srcName.header.size = sizeof(srcName);
-        srcName.header.adapterId = paths[i].sourceInfo.adapterId;
-        srcName.header.id = paths[i].sourceInfo.id;
-        if (DisplayConfigGetDeviceInfo(&srcName.header) != ERROR_SUCCESS)
+        DriverOutputGuard<DISPLAYCONFIG_SOURCE_DEVICE_NAME, 64> srcName;
+        if (!QuerySourceNameGuarded(paths[i], srcName))
             continue;
 
-        if (BoundedWideEquals(srcName.viewGdiDeviceName, _countof(srcName.viewGdiDeviceName),
+        if (BoundedWideEquals(srcName.value.viewGdiDeviceName, _countof(srcName.value.viewGdiDeviceName),
                                     gdiName.c_str()))
         {
             exactIdx = i;

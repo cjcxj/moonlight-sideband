@@ -10,6 +10,7 @@
 #include <atomic>
 #include <functional>
 #include <map>
+#include <chrono>
 
 #include "ISidebandModule.hpp"
 #include "SidebandSession.hpp"
@@ -119,10 +120,23 @@ private:
     // 接受所有待处理的新连接
     void AcceptNewClients();
 
-    // 客户端指令入口：先处理通用指令，再鉴权，最后路由到唯一的处理模块
+    // 主循环单轮：WSAPoll 收发 + 摘除断开会话 + 周期 Tick。
+    // 被 Run() 的 try/catch 包裹，一轮坏数据不允许杀掉服务器线程。
+    // 返回 false 表示应退出主循环。
+    bool RunRound(std::vector<WSAPOLLFD> &fds,
+                  std::vector<SessionPtr> &polled,
+                  std::chrono::steady_clock::time_point &lastTick);
+
+    // 客户端指令入口：先处理通用指令，再鉴权，最后路由到唯一的处理模块。
+    // 外层包 try/catch 做指令级异常隔离（坏数据/驱动异常不杀服务器线程）。
     void DispatchCommand(SidebandSession &session,
                          uint32_t cmd_id, uint32_t req_id,
                          const uint8_t *payload, uint32_t payload_len);
+
+    // 指令实际处理逻辑（被 DispatchCommand 的 try/catch 包裹）
+    void DispatchCommandInner(SidebandSession &session,
+                              uint32_t cmd_id, uint32_t req_id,
+                              const uint8_t *payload, uint32_t payload_len);
 
     // 处理 AUTH_REQ
     void HandleAuth(SidebandSession &session, uint32_t req_id,
