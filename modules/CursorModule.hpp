@@ -36,8 +36,12 @@ public:
     CursorEngine(SidebandServer &net);
     ~CursorEngine();
 
-    void ResetState();
     void CaptureAndSend();
+
+    // 显示配置变化（WM_DISPLAYCHANGE / 切换显示器）后的软重置：
+    // 作废所有依赖旧显示器/旧 DPI 的缓存。只在捕获线程（WorkerLoop）调用 ——
+    // 这些成员没有同步保护，跨线程直接调会与正在进行的捕获竞争。
+    void ResetAfterDisplayChange();
 
 private:
     ULONG_PTR m_token;
@@ -48,6 +52,10 @@ private:
     // 状态缓存
     HCURSOR mLastCursor = NULL;
     int mLastTierSize = -1;
+    // 光标大小设置缓存（注册表 CursorBaseSize，GetTargetSize 内部 2s 轮询）。
+    // -1 = 未初始化。变化时强制重捕：Windows 原位重建共享光标的位图内容，
+    // 句柄值不变，仅靠句柄比较检测不到尺寸变更。
+    int mLastTargetSize = -1;
     std::chrono::steady_clock::time_point mLastProcessTime;
 
     // DPI 缓存
@@ -104,6 +112,7 @@ public:
 
     void OnClientConnected(SidebandSession &session) override;
     void OnClientDisconnected(SidebandSession &session) override;
+    void OnDisplayChanged() override;
 
     // 生命周期（现在是 ISidebandModule 接口的一部分，由 SidebandServer 统一调用）
     bool Start() override;
@@ -129,6 +138,9 @@ private:
     std::condition_variable m_cvCursorChanged;
     std::mutex m_mutexCursor;
     bool m_cursorChanged = false;
+    // 显示配置变化标志：OnClientConnected / OnDisplayChanged 只置标志，
+    // 由 WorkerLoop 在捕获线程消费并执行软重置（避免跨线程直接操作 engine）。
+    bool m_displayResetPending = false;
 
     // 文本光标状态
     std::atomic<int> m_lastSentState{-2};

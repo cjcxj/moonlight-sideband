@@ -119,7 +119,9 @@ void CursorEngine::FreeResources()
 int CursorEngine::GetTargetSize()
 {
     static int s_size = 32;
-    static auto s_lastCheck = std::chrono::steady_clock::now();
+    // epoch 初始化：首次调用立即读注册表拿真实值，而不是先返回默认 32、
+    // 2s 后才刷新（否则启动时会触发一次虚假的"32 -> 实际值"重置）
+    static auto s_lastCheck = std::chrono::steady_clock::time_point{};
     auto now = std::chrono::steady_clock::now();
     if (std::chrono::duration_cast<std::chrono::seconds>(now - s_lastCheck).count() > 2)
     {
@@ -208,9 +210,17 @@ CursorEngine::~CursorEngine()
     Gdiplus::GdiplusShutdown(m_token);
 }
 
-void CursorEngine::ResetState()
+void CursorEngine::ResetAfterDisplayChange()
 {
+    // 显示拓扑变化后，旧的 HMONITOR 句柄可能已失效，旧显示器的 DPI/档位缓存
+    // 全部不可信。这里只作废缓存，真正的重新自适应由下一帧 CaptureAndSend 完成：
+    // mLastMonitor=NULL 强制重查 DPI；mLastCursor=NULL 强制重发一帧当前光标。
+    // 注意必须在捕获线程（WorkerLoop）调用。
     mLastCursor = NULL;
+    mLastMonitor = NULL;
+    m_isDpiChanging = false;
+    mLastDpiCheckTime = std::chrono::steady_clock::time_point{};
+    Logger::Get().Info("CursorEngine: 光标捕获状态已重置（新客户端/显示配置变化）");
 }
 
 void CursorEngine::CaptureAndSend()
@@ -235,6 +245,22 @@ void CursorEngine::CaptureAndSend()
     UINT currentDpi = GetCursorMonitorDPI();
     int expectedTierSize = GetExpectedSystemCursorSize(32, currentDpi);
 
+    // 光标大小设置（注册表 CursorBaseSize）变化检测。
+    // Windows 改指针大小滑块时是原位重建共享光标（IDC_ARROW 等）的位图内容：
+    // HCURSOR 句柄值不变，仅靠下面的句柄比较永远检测不到 → 发出去的光标
+    // 尺寸不跟随系统设置变化（问题 2 根因）。每 2 秒轮询一次注册表，
+    // 变化时作废句柄缓存强制重捕，新尺寸的位图随下一帧发出。
+    int targetSize = GetTargetSize();
+    if (mLastTargetSize == -1)
+        mLastTargetSize = targetSize;
+    else if (targetSize != mLastTargetSize)
+    {
+        Logger::Get().Info("CursorEngine: 光标大小设置变更 ", mLastTargetSize, " -> ",
+                           targetSize, "，强制重捕");
+        mLastTargetSize = targetSize;
+        mLastCursor = NULL;
+    }
+
     if (mLastTierSize == -1)
         mLastTierSize = expectedTierSize;
 
@@ -245,13 +271,20 @@ void CursorEngine::CaptureAndSend()
             m_isDpiChanging = true;
             m_dpiChangeStartTime = now;
         }
-        else
+        else if (std::chrono::duration_cast<std::chrono::milliseconds>(now - m_dpiChangeStartTime).count() > 500)
         {
-            if (std::chrono::duration_cast<std::chrono::milliseconds>(now - m_dpiChangeStartTime).count() > 500)
-            {
-                // DPI 变化重启逻辑交给上层处理；这里仅跳过本帧
-                Logger::Get().Debug("CursorEngine: 检测到 DPI 变化，跳过本帧");
-            }
+            // 档位差异稳定超过 500ms：DPI 真的变了（典型场景就是切换显示器，
+            // 两个屏幕缩放比例不同）。原版 windows-cursor-streamer 在这里
+            // RestartApplication() 整进程重启来刷新资源；本进程是常驻服务，
+            // 重启会断掉所有客户端连接，改为进程内软重置：接受新档位并作废
+            // 旧光标缓存，下一帧按新档位正常捕获。
+            // 不更新 mLastTierSize 的话这个分支每帧都 return，捕获会永久停止
+            //（这正是"切换屏幕后捕获不到光标"的根因）。
+            Logger::Get().Info("CursorEngine: 光标档位变更 ", mLastTierSize, " -> ",
+                               expectedTierSize, "，重置捕获状态");
+            mLastTierSize = expectedTierSize;
+            m_isDpiChanging = false;
+            mLastCursor = NULL;
         }
         return;
     }
@@ -591,14 +624,12 @@ void CursorModule::HookLoop()
 
 void CursorModule::OnClientConnected(SidebandSession &)
 {
-    // 新客户端连入，强制刷新光标状态
-    if (m_engine)
-    {
-        m_engine->ResetState();
-        Logger::Get().Debug("CursorModule: 新客户端连接，强制刷新光标状态");
-    }
+    // 新客户端连入，强制刷新光标状态。
+    // 只置标志：软重置统一由 WorkerLoop 在捕获线程执行，
+    // 避免在网络线程直接调 m_engine->ResetAfterDisplayChange() 造成跨线程写。
     {
         std::lock_guard<std::mutex> l(m_mutexCursor);
+        m_displayResetPending = true;
         m_cursorChanged = true;
     }
     m_cvCursorChanged.notify_one();
@@ -607,6 +638,18 @@ void CursorModule::OnClientConnected(SidebandSession &)
 void CursorModule::OnClientDisconnected(SidebandSession &)
 {
     // 单客户端断开不影响其他客户端；不需要特殊处理
+}
+
+void CursorModule::OnDisplayChanged()
+{
+    // WM_DISPLAYCHANGE（UI 线程）→ 只置标志唤醒 WorkerLoop，
+    // 软重置在捕获线程执行（CursorEngine 的状态成员无同步保护）。
+    {
+        std::lock_guard<std::mutex> l(m_mutexCursor);
+        m_displayResetPending = true;
+        m_cursorChanged = true;
+    }
+    m_cvCursorChanged.notify_one();
 }
 
 void CursorModule::WorkerLoop()
@@ -621,7 +664,15 @@ void CursorModule::WorkerLoop()
                                            [this] { return m_cursorChanged || m_exit; });
                 if (m_exit)
                     break;
+                // 显示拓扑变化 / 新客户端连入 → 先做软重置，再照常捕获
+                bool reset = m_displayResetPending;
+                m_displayResetPending = false;
                 m_cursorChanged = false;
+                l.unlock();
+                if (reset && m_engine)
+                {
+                    m_engine->ResetAfterDisplayChange();
+                }
             }
             if (m_engine)
                 m_engine->CaptureAndSend();
