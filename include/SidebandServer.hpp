@@ -80,7 +80,7 @@ public:
     // 语义见 SidebandProtocol.hpp 的 BuildTextCursorPacket。
     void BroadcastTextCursorState(int32_t yPercentage,
                                   int32_t caretHeight = 0,
-                                  int32_t sourceTag = CARET_SOURCE_NONE);
+                                  int32_t sourceTag = SidebandProtocol::CARET_SOURCE_NONE);
 
     // 向所有客户端广播控制指令
     void BroadcastCommand(uint32_t cmd_id, uint32_t req_id,
