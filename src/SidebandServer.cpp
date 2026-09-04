@@ -223,7 +223,9 @@ void SidebandServer::BroadcastCursor(uint32_t hash, int32_t hotX, int32_t hotY,
     // 这里不在持锁状态下回调模块，避免潜在的自锁
 }
 
-void SidebandServer::BroadcastTextCursorState(int32_t yPercentage)
+void SidebandServer::BroadcastTextCursorState(int32_t yPercentage,
+                                              int32_t caretHeight,
+                                              int32_t sourceTag)
 {
     std::vector<SessionPtr> snapshot;
     {
@@ -234,7 +236,7 @@ void SidebandServer::BroadcastTextCursorState(int32_t yPercentage)
     for (auto &client : snapshot)
     {
         if (client->IsConnected())
-            client->SendTextCursorState(yPercentage);
+            client->SendTextCursorState(yPercentage, caretHeight, sourceTag);
     }
 }
 

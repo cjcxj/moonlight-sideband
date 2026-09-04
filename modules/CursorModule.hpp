@@ -143,6 +143,10 @@ private:
     bool m_displayResetPending = false;
 
     // 文本光标状态
+    // m_lastSentState 的取值含义：
+    //   -2 = 尚未发送过任何状态（初始值）
+    //   -1 = 最近一次上报"无插入符"（不活跃）
+    //   0..10000 = 最近一次上报的 Y 百分比（YPercent 所指为插入符底边）
     std::atomic<int> m_lastSentState{-2};
     std::atomic<bool> m_textCursorActive{false};
 
@@ -163,7 +167,20 @@ private:
     void TextCursorMonitorLoop();
     void HookLoop();   // 钩子线程：安装钩子 + 消息循环
     void UpdateTextCursorState(bool forceUpdate = false);
-    bool GetCaretScreenPosition(int &outX, int &outY);
+
+    // 取系统插入符的屏幕位置。
+    // 返回值：true = 拿到有效插入符；false = 当前无插入符可报。
+    // outX/outY: 插入符底边中点的屏幕物理坐标（基准是 bottom ——
+    //            下游"别让软键盘挡住输入行"要避开的是行底，而非行顶）。
+    // outHeight: 插入符高度（像素，0 = 未知）。
+    // outSource: 来源标记，SidebandProtocol::CARET_SOURCE_*。
+    //
+    // 阶段一仅实现 Win32 系统插入符（GUITHREADINFO）。Chromium/Electron、
+    // UWP/WinUI、Qt、Flutter、Java 等自绘 caret 的框架 hwndCaret 为 NULL，
+    // 此处返回 false —— 比返回一个冒充的位置更诚实。后续阶段在此追加
+    // WinEvent OBJID_CARET / MSAA / UIA 路径（对应 CARET_SOURCE_* 扩充值）。
+    bool GetCaretScreenPosition(int &outX, int &outY,
+                                int &outHeight, int &outSource);
 
     // 供钩子回调调用：只置标志 + 唤醒，必须立即返回
     void PokeTextCursor(bool force);

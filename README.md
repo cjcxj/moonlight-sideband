@@ -65,8 +65,16 @@ Hash != 0xFFFFFFFF
 
 ### 文本光标状态包（向后兼容，CmdID=2 老格式）
 ```
-[BodyLen=20(4)] [0xFFFFFFFF(4)] [CmdID=2(4)] [YPercent(4)] [0(4)] [0(4)]
+[BodyLen=20(4)] [0xFFFFFFFF(4)] [CmdID=2(4)] [YPercent(4)] [Height(4)] [Source(4)]
 ```
+- `YPercent`：插入符**底边**在所在显示器内的纵向百分比（0–10000，-1=无插入符）。
+  以底边为基准：下游"别让软键盘挡住当前输入行"要避开的是行底。
+- `Height`：插入符高度（像素，0=未知）。老客户端按 BodyLen 只解析到 YPercent，
+  尾部字段被忽略，不受影响。
+- `Source`：来源标记，`0`=无、`1`=Win32 系统插入符（GUITHREADINFO）、
+  `2`=MSAA/WinEvent（预留）、`3`=UI Automation（预留）。
+- 注意：自绘插入符的应用（Chromium/Electron、UWP/WinUI、Qt、Flutter、Java）
+  目前上报"无插入符"（-1），不会拿鼠标位置冒充。
 
 ### 新控制指令包（双向）
 ```

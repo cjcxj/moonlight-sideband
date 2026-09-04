@@ -75,8 +75,12 @@ public:
                          int32_t frames, int32_t delay,
                          const std::vector<uint8_t> &pngData);
 
-    // 向所有客户端广播文本光标状态
-    void BroadcastTextCursorState(int32_t yPercentage);
+    // 向所有客户端广播文本光标状态。
+    // caretHeight/sourceTag 填入老格式包尾的保留字段（老客户端忽略），
+    // 语义见 SidebandProtocol.hpp 的 BuildTextCursorPacket。
+    void BroadcastTextCursorState(int32_t yPercentage,
+                                  int32_t caretHeight = 0,
+                                  int32_t sourceTag = CARET_SOURCE_NONE);
 
     // 向所有客户端广播控制指令
     void BroadcastCommand(uint32_t cmd_id, uint32_t req_id,

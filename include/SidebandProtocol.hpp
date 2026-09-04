@@ -73,7 +73,15 @@ namespace Cmd {
 constexpr uint32_t CURSOR_HEADER_SIZE = 20;  // [Hash][HotX][HotY][Frames][Delay]
 
 // 文本光标状态包（老格式，固定 24 字节）
-constexpr uint32_t TEXT_CURSOR_PACKET_SIZE = 24;  // [BodyLen=20][Hash][CmdID=2][YPercent][0][0]
+constexpr uint32_t TEXT_CURSOR_PACKET_SIZE = 24;  // [BodyLen=20][Hash][CmdID=2][YPercent][Height][Source]
+
+// 文本光标来源标记（BuildTextCursorPacket 的 sourceTag 参数 / 包尾保留字段 2）
+// 阶段一：只有 0（无插入符）与 1（Win32 系统插入符）两种取值。
+// 预留 2 = WinEvent OBJID_CARET / MSAA，3 = UI Automation，供后续阶段扩充。
+constexpr int32_t CARET_SOURCE_NONE   = 0;
+constexpr int32_t CARET_SOURCE_WIN32  = 1;
+constexpr int32_t CARET_SOURCE_MSAA   = 2;  // 预留：WinEvent OBJID_CARET + accLocation
+constexpr int32_t CARET_SOURCE_UIA    = 3;  // 预留：TextPattern2::GetCaretRange
 
 // 新控制指令包头大小（BodyLen 之后）
 constexpr uint32_t COMMAND_HEADER_SIZE = 16;  // [Hash][CmdID][ReqID][PayloadLen]
@@ -114,20 +122,29 @@ inline std::vector<uint8_t> BuildCachedCursorPacket(uint32_t hash, int32_t hotX,
 }
 
 // 构造文本光标状态包（老格式, CmdID=2）
-inline std::vector<uint8_t> BuildTextCursorPacket(int32_t yPercentage)
+//
+// 老格式包末尾有两个历史保留字段（两个 [0]）。老客户端按 BodyLen=20
+// 只解析到 YPercent，尾部字段被忽略；新客户端可继续读取：
+//   - reserved1: 插入符高度（像素）。取 rcCaret.bottom - rcCaret.top。
+//     语义是"输入行底边（YPercent 所指位置）再往上多少像素是行顶"，
+//     下游"别让软键盘挡住当前输入行"应以底边 Y 为基准、避开高度。
+//     0 = 未知（含状态为"无插入符"的包）。
+//   - reserved2: 来源标记，见 CARET_SOURCE_*。
+inline std::vector<uint8_t> BuildTextCursorPacket(int32_t yPercentage,
+                                                  int32_t caretHeight = 0,
+                                                  int32_t sourceTag = 0)
 {
     uint32_t bodyLen = CURSOR_HEADER_SIZE;
     uint32_t magicHash = MAGIC_HASH;
     int32_t cmdId = 2;
-    int32_t zero = 0;
     std::vector<uint8_t> packet(4 + bodyLen);
     uint8_t *p = packet.data();
-    memcpy(p, &bodyLen, 4);   p += 4;
-    memcpy(p, &magicHash, 4); p += 4;
-    memcpy(p, &cmdId, 4);     p += 4;
+    memcpy(p, &bodyLen, 4);     p += 4;
+    memcpy(p, &magicHash, 4);  p += 4;
+    memcpy(p, &cmdId, 4);      p += 4;
     memcpy(p, &yPercentage, 4); p += 4;
-    memcpy(p, &zero, 4);      p += 4;
-    memcpy(p, &zero, 4);      p += 4;
+    memcpy(p, &caretHeight, 4); p += 4;
+    memcpy(p, &sourceTag, 4);   p += 4;
     return packet;
 }
 

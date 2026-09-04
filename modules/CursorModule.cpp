@@ -737,8 +737,21 @@ void CursorModule::TextCursorMonitorLoop()
     }
 }
 
-bool CursorModule::GetCaretScreenPosition(int &outX, int &outY)
+// 判定插入符是否真的在闪。GUI_CARETBLINKING 未置位时 hwndCaret 可能
+// 仍是一个残留的已注册插入符 —— 典型场景：应用失焦/失活后没调
+// DestroyCaret，GetGUIThreadInfo 照样报出 rcCaret，但插入符实际不可见。
+// 直接上报会持续报告一个并不存在的光标位置，所以这里过滤掉。
+static bool IsCaretActuallyBlinking(const GUITHREADINFO &gti)
 {
+    return (gti.flags & GUI_CARETBLINKING) != 0;
+}
+
+bool CursorModule::GetCaretScreenPosition(int &outX, int &outY,
+                                          int &outHeight, int &outSource)
+{
+    outHeight = 0;
+    outSource = SidebandProtocol::CARET_SOURCE_NONE;
+
     // 必须取前台窗口所属线程：GetGUIThreadInfo(0) 拿的是"调用线程"的 GUI 状态，
     // 而本函数跑在 m_textCursorThread 工作线程上，没有 GUI 消息队列，
     // 永远拿不到 caret/focus。前台窗口的线程才有这些信息。
@@ -750,48 +763,58 @@ bool CursorModule::GetCaretScreenPosition(int &outX, int &outY)
         return false;
 
     GUITHREADINFO gti = {sizeof(GUITHREADINFO)};
-    if (GetGUIThreadInfo(foregroundThreadId, &gti))
-    {
-        if (gti.hwndCaret && gti.rcCaret.left >= 0)
-        {
-            POINT caretPos = {gti.rcCaret.left, gti.rcCaret.top};
-            if (ClientToScreen(gti.hwndCaret, &caretPos))
-            {
-                outX = caretPos.x;
-                outY = caretPos.y;
-                return true;
-            }
-        }
-        if (gti.hwndFocus)
-        {
-            RECT focusRect;
-            if (GetWindowRect(gti.hwndFocus, &focusRect))
-            {
-                POINT mousePos;
-                if (GetCursorPos(&mousePos))
-                {
-                    if (PtInRect(&focusRect, mousePos))
-                    {
-                        outX = mousePos.x;
-                        outY = mousePos.y;
-                        return true;
-                    }
-                }
-            }
-        }
-    }
-    return false;
+    if (!GetGUIThreadInfo(foregroundThreadId, &gti))
+        return false;
+
+    // 只认真正的 Win32 系统插入符。
+    //
+    // 历史教训：旧版这里还有一条"焦点窗口内有鼠标 → 返回鼠标位置"的兜底，
+    // 注释写着"适用于自绘光标的应用，如 Chrome/Electron"。但它与输入框毫无
+    // 关系：打字时鼠标通常停在别处，发出去的 Y 是错的；没在输入时（鼠标
+    // 恰好停在焦点窗口内）还会源源不断地伪造"文本光标"状态，并经由
+    // m_textCursorActive 让键盘钩子持续自我续命。自绘 caret 的应用
+    //（Chromium/Electron、UWP/WinUI、Qt、Flutter、Java）hwndCaret 为
+    // NULL，正确行为是"无数据"，由后续阶段的 WinEvent/MSAA/UIA 路径覆盖。
+    if (!gti.hwndCaret)
+        return false;
+
+    // 插入符必须在闪（见 IsCaretActuallyBlinking 的注释）。
+    if (!IsCaretActuallyBlinking(gti))
+        return false;
+
+    // 高度优先取 bottom - top；注册了零高/畸形矩形的个别应用给 0（未知）。
+    // 注意不做 "left >= 0" 检查：插入符横向滚出客户区（left 为负）时
+    // Y 仍然是有效的输入行位置，按"无插入符"处理反而丢掉了真实状态。
+    int height = gti.rcCaret.bottom - gti.rcCaret.top;
+    if (height < 0)
+        height = 0;
+
+    // 基准取底边（bottom）：下游"别让软键盘挡住当前输入行"要避开的是
+    // 行底而非行顶。X 取插入符中线，仅供需要水平位置的调用方使用。
+    POINT caretPos = {gti.rcCaret.left + (gti.rcCaret.right - gti.rcCaret.left) / 2,
+                      gti.rcCaret.bottom};
+    if (!ClientToScreen(gti.hwndCaret, &caretPos))
+        return false;
+
+    outX = caretPos.x;
+    outY = caretPos.y;
+    outHeight = height;
+    outSource = SidebandProtocol::CARET_SOURCE_WIN32;
+    return true;
 }
 
 void CursorModule::UpdateTextCursorState(bool forceUpdate)
 {
+    // 本函数只跑在 m_textCursorThread（见 TextCursorMonitorLoop），
+    // static 缓存无跨线程竞争。
     static int lastCaretX = -1;
     static int lastCaretY = -1;
 
     int currentState = -1;
     int caretX = 0, caretY = 0;
+    int caretHeight = 0, caretSource = SidebandProtocol::CARET_SOURCE_NONE;
 
-    if (GetCaretScreenPosition(caretX, caretY))
+    if (GetCaretScreenPosition(caretX, caretY, caretHeight, caretSource))
     {
         if (!forceUpdate && caretX == lastCaretX && caretY == lastCaretY)
             return;
@@ -807,6 +830,13 @@ void CursorModule::UpdateTextCursorState(bool forceUpdate)
             int relativeY = caretY - mi.rcMonitor.top;
             currentState = (int)((relativeY * 10000.0f) / monitorHeight);
             currentState = std::clamp(currentState, 0, 10000);
+        }
+        else
+        {
+            // 拿不到显示器信息时本包只能按"无插入符"发送，
+            // 不允许出现"-1 却带着高度/来源"的自相矛盾包。
+            caretHeight = 0;
+            caretSource = SidebandProtocol::CARET_SOURCE_NONE;
         }
         m_textCursorActive = true;
     }
@@ -834,7 +864,7 @@ void CursorModule::UpdateTextCursorState(bool forceUpdate)
         else
             Logger::Get().Debug("[文本光标] Y 轴位置:", currentState / 100.0f, "%");
 
-        m_server.BroadcastTextCursorState(currentState);
+        m_server.BroadcastTextCursorState(currentState, caretHeight, caretSource);
         m_lastSentState.store(currentState);
     }
 }

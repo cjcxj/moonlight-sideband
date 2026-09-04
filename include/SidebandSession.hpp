@@ -57,7 +57,10 @@ public:
                     const std::vector<uint8_t> &pngData);
 
     // 发送文本光标状态（兼容老协议, CmdID=2）
-    bool SendTextCursorState(int32_t yPercentage);
+    // caretHeight/sourceTag 填入老格式包尾保留字段（老客户端忽略）
+    bool SendTextCursorState(int32_t yPercentage,
+                             int32_t caretHeight = 0,
+                             int32_t sourceTag = CARET_SOURCE_NONE);
 
     // 发送控制指令（新协议）
     bool SendCommand(uint32_t cmd_id, uint32_t req_id,

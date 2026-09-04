@@ -209,6 +209,15 @@ static void TestProtocolPackets()
     CHECK_EQ_INT(ReadU32(txt, 4), MAGIC_HASH);
     CHECK_EQ_INT(ReadU32(txt, 8), 2);
     CHECK_EQ_INT(ReadU32(txt, 12), 5000);
+    // 包尾两个保留字段：老语义保持 0/0（默认参数），不破坏老客户端
+    CHECK_EQ_INT(ReadU32(txt, 16), 0);
+    CHECK_EQ_INT(ReadU32(txt, 20), 0);
+
+    // 新语义：保留字段填插入符高度 + 来源标记，包长与老格式一致
+    auto txt2 = BuildTextCursorPacket(1234, 22, CARET_SOURCE_WIN32);
+    CHECK_EQ_INT(txt2.size(), TEXT_CURSOR_PACKET_SIZE);
+    CHECK_EQ_INT(ReadU32(txt2, 16), 22);
+    CHECK_EQ_INT(ReadU32(txt2, 20), CARET_SOURCE_WIN32);
 }
 
 static void TestAuthPayloadRoundTrip()

@@ -169,12 +169,14 @@ bool SidebandSession::SendCursor(uint32_t hash, int32_t hotX, int32_t hotY,
     return true;
 }
 
-bool SidebandSession::SendTextCursorState(int32_t yPercentage)
+bool SidebandSession::SendTextCursorState(int32_t yPercentage,
+                                         int32_t caretHeight,
+                                         int32_t sourceTag)
 {
     if (!IsConnected())
         return false;
 
-    auto packet = SidebandProtocol::BuildTextCursorPacket(yPercentage);
+    auto packet = SidebandProtocol::BuildTextCursorPacket(yPercentage, caretHeight, sourceTag);
     bool delivered = false;
     return SendOrQueue(packet, /*droppable=*/true, delivered);
 }
