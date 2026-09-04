@@ -16,9 +16,10 @@
 #include <windows.h>
 #include <shellscalingapi.h>
 #include <gdiplus.h>
-// UIA客户端接口。放在 windows.h 之后（先 winsock2 顺序由 SidebandSession.hpp
-// 的包含顺序保证 —— 本文件经由 CursorModule.hpp 间接包含 winsock2.h）。
-#include <uiautomation.h>
+// UIA 客户端规范头（uiautomation.h 在部分 SDK/包含顺序下解析不完整，
+// CI 实测缺 ITextPattern/GetPattern/CLSID_CUIAutomation）。
+// 放在 windows.h 之后（先 winsock2 顺序由 CursorModule.hpp 间接保证）。
+#include <UIAutomationClient.h>
 #include <ole2.h>
 #include <oleauto.h>   // SafeArrayAccessData / SafeArrayGetElement
 
@@ -33,9 +34,35 @@
 #pragma comment(lib, "shcore.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "advapi32.lib")
-// UIA（IUIAutomation 来自 uiautomationclient.lib；uiautomation.h 里自带
-// #pragma comment(lib, ...) 的 MSVC 用户不存在此问题，这里显式补上保险）
+// UIA 接口定义的导入库（UIAutomationClient.h 自带 pragma 时此行为冗余保险）
 #pragma comment(lib, "uiautomationcore.lib")
+
+namespace {
+// GetPattern 出参是 IUnknown**，取到后再按需 QueryInterface。
+// 直接拿 IUnknown 判空 + 转 TextPattern 接口，消除双重判错分支。
+bool QueryPattern2(IUIAutomationElement *el, ITextPattern2 **out)
+{
+    *out = nullptr;
+    IUnknown *pUnk = nullptr;
+    HRESULT hr = el->GetPattern(UIA_TextPattern2Id, &pUnk);
+    if (FAILED(hr) || !pUnk)
+        return false;
+    hr = pUnk->QueryInterface(IID_PPV_ARGS(out));
+    pUnk->Release();
+    return SUCCEEDED(hr) && *out;
+}
+bool QueryPattern(IUIAutomationElement *el, ITextPattern **out)
+{
+    *out = nullptr;
+    IUnknown *pUnk = nullptr;
+    HRESULT hr = el->GetPattern(UIA_TextPatternId, &pUnk);
+    if (FAILED(hr) || !pUnk)
+        return false;
+    hr = pUnk->QueryInterface(IID_PPV_ARGS(out));
+    pUnk->Release();
+    return SUCCEEDED(hr) && *out;
+}
+} // namespace
 
 // 全局单例（钩子回调转发用）
 CursorModule *CursorModule::s_instance = nullptr;
@@ -896,9 +923,9 @@ bool CursorModule::GetCaretViaUIA(int &outX, int &outY, int &outHeight)
 
     // 2. TextPattern2::GetCaretRange —— Chromium、Firefox、WinUI、记事本
     //    等现代文本栈都实现。取不到再退化到 selection（第 3 步）。
-    //    GetPattern 对不支持的 pattern 可能返回 S_OK 但指针为空，两种都要防。
+    //    GetPattern 出参是 IUnknown**，先 QueryInterface 转具体接口。
     ITextPattern2 *pPattern2 = nullptr;
-    if (SUCCEEDED(pFocus->GetPattern(UIA_TextPattern2, &pPattern2)) && pPattern2)
+    if (QueryPattern2(pFocus, &pPattern2))
     {
         // 场景：SelectAll 后 caret 在文末 —— 确保取的是 caret 而非 selection 头。
         BOOL isActive = FALSE;
@@ -928,7 +955,7 @@ bool CursorModule::GetCaretViaUIA(int &outX, int &outY, int &outHeight)
     if (!ok)
     {
         ITextPattern *pPattern = nullptr;
-        if (SUCCEEDED(pFocus->GetPattern(UIA_TextPattern, &pPattern)) && pPattern)
+        if (QueryPattern(pFocus, &pPattern))
         {
             VARIANT vtType;
             VariantInit(&vtType);

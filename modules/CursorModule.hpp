@@ -22,6 +22,13 @@ typedef BOOL(WINAPI *GETCURSORFRAMEINFO)(HCURSOR, DWORD, DWORD, DWORD *, DWORD *
 
 class SidebandServer;
 
+// UIA 客户端主接口（定义在 <UIAutomationClient.h>，仅 CursorModule.cpp 引入）。
+// 此处放在全局作用域做前向声明 —— 不能放进类里：类内声明会创建一个同名
+// 嵌套类型（CursorModule::IUIAutomation）遮蔽全局版本，导致 .cpp 里所有
+// UIA 调用全部解析到空类型（C2027/C2556/C2787 连锁报错的根因）。
+// MIDL_INTERFACE 展开为 struct，前向声明也用 struct 才能与完整定义合并。
+struct IUIAutomation;
+
 /**
  * CursorEngine - 光标捕获与编码
  *
@@ -166,8 +173,7 @@ private:
     // 全部只在 m_textCursorThread 上创建/使用/释放 —— UIA 是跨进程 COM 调用，
     // 目标应用挂死时调用会同步阻塞（UIA 无逐调用超时），所以只允许待在
     // 这个专用线程上，钩子回调与其他工作线程绝不触碰。
-    // 前向声明：uiautomation.h 里 MIDL_INTERFACE 生成的是 struct。
-    struct IUIAutomation;
+    // IUIAutomation 是全局前向声明（文件顶部），完整定义只在 .cpp 里可见。
     IUIAutomation *m_pUia = nullptr;
     bool m_uiaBroken = false;          // COM/UIA 初始化已知失败（如组件缺失）
     bool m_uiaComInited = false;       // 本线程 CoInitializeEx 成功过，Stop 时需配对释放
