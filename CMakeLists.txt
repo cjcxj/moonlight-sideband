@@ -51,6 +51,7 @@ target_link_libraries(moonlight_sideband PRIVATE
     advapi32    # Registry
     shell32     # 托盘图标 / CommandLineToArgvW
     bcrypt      # BCryptGenRandom (令牌生成)
+    uiautomationcore  # UIA（阶段二：自绘 caret 应用兜底取插入符位置）
 )
 
 # 嵌入 Manifest (DPI Awareness)

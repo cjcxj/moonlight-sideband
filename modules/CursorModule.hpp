@@ -162,25 +162,44 @@ private:
     bool m_textCursorPoke = false;       // 有输入事件，需要刷新
     bool m_textCursorPokeForce = false;  // 需要强制刷新（鼠标左键抬起）
 
+    // === UI Automation（阶段二：自绘 caret 应用兜底） ===
+    // 全部只在 m_textCursorThread 上创建/使用/释放 —— UIA 是跨进程 COM 调用，
+    // 目标应用挂死时调用会同步阻塞（UIA 无逐调用超时），所以只允许待在
+    // 这个专用线程上，钩子回调与其他工作线程绝不触碰。
+    // 前向声明：uiautomation.h 里 MIDL_INTERFACE 生成的是 struct。
+    struct IUIAutomation;
+    IUIAutomation *m_pUia = nullptr;
+    bool m_uiaBroken = false;          // COM/UIA 初始化已知失败（如组件缺失）
+    bool m_uiaComInited = false;       // 本线程 CoInitializeEx 成功过，Stop 时需配对释放
+    std::chrono::steady_clock::time_point m_uiaNextRetry{};  // 失败后的重试时间点
+
     // 工作循环
     void WorkerLoop();
     void TextCursorMonitorLoop();
     void HookLoop();   // 钩子线程：安装钩子 + 消息循环
     void UpdateTextCursorState(bool forceUpdate = false);
 
-    // 取系统插入符的屏幕位置。
-    // 返回值：true = 拿到有效插入符；false = 当前无插入符可报。
+    // 取系统插入符（Win32 caret，GUITHREADINFO 路径）。
+    // 返回值：true = 拿到有效插入符；false = 本路径不可用（不代表无插入符，
+    // 调用方需继续尝试 UIA 路径）。
     // outX/outY: 插入符底边中点的屏幕物理坐标（基准是 bottom ——
     //            下游"别让软键盘挡住输入行"要避开的是行底，而非行顶）。
     // outHeight: 插入符高度（像素，0 = 未知）。
-    // outSource: 来源标记，SidebandProtocol::CARET_SOURCE_*。
-    //
-    // 阶段一仅实现 Win32 系统插入符（GUITHREADINFO）。Chromium/Electron、
-    // UWP/WinUI、Qt、Flutter、Java 等自绘 caret 的框架 hwndCaret 为 NULL，
-    // 此处返回 false —— 比返回一个冒充的位置更诚实。后续阶段在此追加
-    // WinEvent OBJID_CARET / MSAA / UIA 路径（对应 CARET_SOURCE_* 扩充值）。
-    bool GetCaretScreenPosition(int &outX, int &outY,
-                                int &outHeight, int &outSource);
+    bool GetCaretViaWin32(int &outX, int &outY, int &outHeight);
+
+    // UIA 兜底：给自绘 caret 的应用（Chromium/Electron、UWP/WinUI、Qt、
+    // Flutter、Java……）取插入符位置。
+    // 返回 true = 拿到；false = UIA 不可用/目标不支持/无聚焦文本区域。
+    // 只允许在 m_textCursorThread 上调用（跨进程 COM，可能阻塞）。
+    // 坐标语义与 GetCaretViaWin32 一致：底边中点 + 高度。
+    // UIA 路径同时对 PMv2 进程自动换算 DPI 虚拟化坐标，目标进程
+    // DPI-unaware 也不会带缩放偏移。
+    bool GetCaretViaUIA(int &outX, int &outY, int &outHeight);
+
+    // UIA 惰性初始化 + 失败退避（60s 才重试一次），返回可用的
+    // IUIAutomation*（不可用时 nullptr）。只允许在 m_textCursorThread
+    // 上调用（CoInitializeEx 线程亲和）。
+    IUIAutomation *EnsureUia();
 
     // 供钩子回调调用：只置标志 + 唤醒，必须立即返回
     void PokeTextCursor(bool force);

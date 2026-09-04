@@ -72,9 +72,10 @@ Hash != 0xFFFFFFFF
 - `Height`：插入符高度（像素，0=未知）。老客户端按 BodyLen 只解析到 YPercent，
   尾部字段被忽略，不受影响。
 - `Source`：来源标记，`0`=无、`1`=Win32 系统插入符（GUITHREADINFO）、
-  `2`=MSAA/WinEvent（预留）、`3`=UI Automation（预留）。
-- 注意：自绘插入符的应用（Chromium/Electron、UWP/WinUI、Qt、Flutter、Java）
-  目前上报"无插入符"（-1），不会拿鼠标位置冒充。
+  `2`=MSAA/WinEvent（预留）、`3`=UI Automation（TextPattern2::GetCaretRange，
+  覆盖 Chromium/Electron、Firefox、WinUI 等自绘插入符应用）。
+- 注意：自绘插入符的应用通过 UIA 路径上报；两级取词均失败时才报
+  "无插入符"（-1），不会拿鼠标位置冒充。
 
 ### 新控制指令包（双向）
 ```

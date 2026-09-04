@@ -16,10 +16,16 @@
 #include <windows.h>
 #include <shellscalingapi.h>
 #include <gdiplus.h>
+// UIA客户端接口。放在 windows.h 之后（先 winsock2 顺序由 SidebandSession.hpp
+// 的包含顺序保证 —— 本文件经由 CursorModule.hpp 间接包含 winsock2.h）。
+#include <uiautomation.h>
+#include <ole2.h>
+#include <oleauto.h>   // SafeArrayAccessData / SafeArrayGetElement
 
 #include <algorithm>
 #include <cstring>
 #include <cmath>
+#include <cstdio>
 
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "user32.lib")
@@ -27,6 +33,9 @@
 #pragma comment(lib, "shcore.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "advapi32.lib")
+// UIA（IUIAutomation 来自 uiautomationclient.lib；uiautomation.h 里自带
+// #pragma comment(lib, ...) 的 MSVC 用户不存在此问题，这里显式补上保险）
+#pragma comment(lib, "uiautomationcore.lib")
 
 // 全局单例（钩子回调转发用）
 CursorModule *CursorModule::s_instance = nullptr;
@@ -735,6 +744,20 @@ void CursorModule::TextCursorMonitorLoop()
             Logger::Get().Error("CursorModule: TextCursorMonitorLoop 未知异常");
         }
     }
+
+    // UIA/COM 清理必须在本线程做（m_pUia 是跨进程 COM 接口指针，
+    // 线程亲和；CoUninitialize 同理）。跑在循环之后的这里正是
+    // m_textCursorThread 自己的退出路径。
+    if (m_pUia)
+    {
+        m_pUia->Release();
+        m_pUia = nullptr;
+    }
+    if (m_uiaComInited)
+    {
+        CoUninitialize();
+        m_uiaComInited = false;
+    }
 }
 
 // 判定插入符是否真的在闪。GUI_CARETBLINKING 未置位时 hwndCaret 可能
@@ -746,12 +769,218 @@ static bool IsCaretActuallyBlinking(const GUITHREADINFO &gti)
     return (gti.flags & GUI_CARETBLINKING) != 0;
 }
 
-bool CursorModule::GetCaretScreenPosition(int &outX, int &outY,
-                                          int &outHeight, int &outSource)
-{
-    outHeight = 0;
-    outSource = SidebandProtocol::CARET_SOURCE_NONE;
+// ============================================================
+//   UI Automation 路径（阶段二：自绘 caret 应用兜底）
+// ============================================================
 
+// 确保 UIA 可用（惰性初始化，只在 m_textCursorThread 上调用）。
+// 返回可用的 IUIAutomation*；不可用时返回 nullptr。
+// 失败分两种：
+//  - CoCreateInstance/Initialize 失败：置 m_uiaBroken，之后每 60s 才重试一次，
+//    避免每次取词都在注定失败的 COM 初始化上空转。
+//  - 只是本次调用失败：不动 m_uiaBroken，下一轮照常再试。
+IUIAutomation *CursorModule::EnsureUia()
+{
+    if (m_pUia)
+        return m_pUia;
+    if (m_uiaBroken)
+    {
+        if (std::chrono::steady_clock::now() < m_uiaNextRetry)
+            return nullptr;
+        m_uiaBroken = false;  // 重试窗口到了，重新走完整初始化
+    }
+
+    // CoInitialize: UIA 内部自己持有 MTA，普通线程需要先初始化 COM。
+    // STA 也可用（UIA 会内部转 MTA），MTA 减少一次隐式封送。
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE)
+        { m_uiaBroken = true; m_uiaNextRetry = std::chrono::steady_clock::now() + std::chrono::seconds(60); return nullptr; }
+    // 只有本线程自己 init 成功（S_OK）才需要配对 CoUninitialize；
+    // RPC_E_CHANGED_MODE 表示线程已有别的模式，释放责任不归我们。
+    if (hr == S_OK)
+        m_uiaComInited = true;
+
+    hr = CoCreateInstance(CLSID_CUIAutomation, nullptr, CLSCTX_INPROC_SERVER,
+                          IID_PPV_ARGS(&m_pUia));
+    if (FAILED(hr) || !m_pUia)
+    {
+        char hrBuf[32];
+        std::snprintf(hrBuf, sizeof(hrBuf), "0x%08lX", (unsigned long)hr);
+        Logger::Get().Warning("CursorModule: UIA 初始化失败 hr=", hrBuf);
+        m_pUia = nullptr;
+        m_uiaBroken = true;
+        m_uiaNextRetry = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+        return nullptr;
+    }
+
+    Logger::Get().Info("CursorModule: UIA 初始化成功（自绘插入符应用开始支持）");
+    return m_pUia;
+}
+
+// 从 TextRange 的边界矩形数组里取"最后一行"的底边中点。
+// 返回 false = 矩形数组为空/格式异常。
+// GetBoundingRectangles 返回 VT_R8 SAFEARRAY，每矩形 4 个 double：
+// [left, top, width, height]（注意是宽高不是 right/bottom）。
+static bool RectsToCaretBottom(SAFEARRAY *psa, int &outX, int &outY, int &outHeight)
+{
+    if (!psa || SafeArrayGetDim(psa) != 1)  // GetDim 返回维度数（非 HRESULT）
+        return false;
+
+    LONG lb = 0, ub = 0;
+    SafeArrayGetLBound(psa, 1, &lb);
+    SafeArrayGetUBound(psa, 1, &ub);
+    LONG count = ub - lb + 1;
+    if (count < 4 || (count % 4) != 0)
+        return false;
+    LONG rects = count / 4;
+
+    // 一次性锁定直取数据指针，避免逐元素 SafeArrayGetElement 的反复加锁。
+    // 返回的指针指向 LBound 元素，元素连续存放，第 r 个矩形就是 data + r*4。
+    double *data = nullptr;
+    if (FAILED(SafeArrayAccessData(psa, (void HUGEP **)&data)) || !data)
+        return false;
+
+    double bestTop = 0.0, bestBottom = 0.0, bestLeft = 0.0, bestRight = 0.0;
+    bool got = false;
+    for (LONG r = 0; r < rects; r++)
+    {
+        const double *v = data + r * 4;
+        double left = v[0], top = v[1], width = v[2], height = v[3];
+        // 只要求行高非零：GetCaretRange 返回的是退化（空）选区，在不少实现
+        //（含 Chromium）里就是零宽 + 行高的矩形，零宽是正常形态不能跳过。
+        // 零宽时 left==right，中线自然退化为 left，正是插入点。
+        if (height <= 0.0)
+            continue;
+        double bottom = top + height;
+        // 取"最后一行"（caret 所在行）：行基线在下的就是当前输入行
+        if (!got || bottom > bestBottom)
+        {
+            got = true;
+            bestTop = top;
+            bestBottom = bottom;
+            bestLeft = left;
+            bestRight = left + width;
+        }
+    }
+    SafeArrayUnaccessData(psa);
+    if (!got)
+        return false;
+
+    int x = (int)std::llround((bestLeft + bestRight) / 2.0);
+    int y = (int)std::llround(bestBottom);
+    int h = (int)std::llround(bestBottom - bestTop);
+    if (h < 0)
+        h = 0;
+    outX = x;
+    outY = y;
+    outHeight = h;
+    return true;
+}
+
+bool CursorModule::GetCaretViaUIA(int &outX, int &outY, int &outHeight)
+{
+    outX = outY = outHeight = 0;
+
+    IUIAutomation *uia = EnsureUia();
+    if (!uia)
+        return false;
+
+    // 1. 聚焦元素。FocusChanged 可能后到，捕获点位置为准 —— GetFocusedElement
+    //    直查实时状态，比事件缓存可靠。
+    IUIAutomationElement *pFocus = nullptr;
+    if (FAILED(uia->GetFocusedElement(&pFocus)) || !pFocus)
+        return false;
+
+    bool ok = false;
+    int x = 0, y = 0, h = 0;
+
+    // 2. TextPattern2::GetCaretRange —— Chromium、Firefox、WinUI、记事本
+    //    等现代文本栈都实现。取不到再退化到 selection（第 3 步）。
+    //    GetPattern 对不支持的 pattern 可能返回 S_OK 但指针为空，两种都要防。
+    ITextPattern2 *pPattern2 = nullptr;
+    if (SUCCEEDED(pFocus->GetPattern(UIA_TextPattern2, &pPattern2)) && pPattern2)
+    {
+        // 场景：SelectAll 后 caret 在文末 —— 确保取的是 caret 而非 selection 头。
+        BOOL isActive = FALSE;
+        IUIAutomationTextRange *pRange = nullptr;
+        if (SUCCEEDED(pPattern2->GetCaretRange(&isActive, &pRange)) && pRange)
+        {
+            SAFEARRAY *psa = nullptr;
+            if (SUCCEEDED(pRange->GetBoundingRectangles(&psa)))
+            {
+                if (RectsToCaretBottom(psa, x, y, h))
+                    ok = true;
+                if (psa)
+                    SafeArrayDestroy(psa);
+            }
+            pRange->Release();
+        }
+        pPattern2->Release();
+    }
+
+    // 3. 退化路径：无 TextPattern2 时取选区矩形。GetSelection 返回的是
+    //    IUIAutomationTextRangeArray 的 SAFEARRAY（不是单个 range）。
+    //    【闸门】只接受控件类型为 Edit 的焦点元素：浏览器里点击页面文本
+    //    会留下 DOM 选区，Document 控件的 TextPattern 会把它报成 selection
+    //    —— 那不是 caret，照单全收就等于从 UIA 后门放回了假数据
+    //    （阶段一刚清理掉的那种）。退化场景（无 TextPattern2 的文本栈，
+    //    如部分 Qt 版本）真正的输入框控件类型就是 Edit。
+    if (!ok)
+    {
+        ITextPattern *pPattern = nullptr;
+        if (SUCCEEDED(pFocus->GetPattern(UIA_TextPattern, &pPattern)) && pPattern)
+        {
+            VARIANT vtType;
+            VariantInit(&vtType);
+            bool isEdit = false;
+            if (SUCCEEDED(pFocus->GetCurrentPropertyValue(UIA_ControlTypePropertyId, &vtType)) &&
+                vtType.vt == VT_I4 && vtType.lVal == UIA_EditControlTypeId)
+                isEdit = true;
+            VariantClear(&vtType);
+
+            if (isEdit)
+            {
+                SAFEARRAY *psaRanges = nullptr;
+                if (SUCCEEDED(pPattern->GetSelection(&psaRanges)) && psaRanges)
+                {
+                    LONG lb = 0, ub = 0;
+                    SafeArrayGetLBound(psaRanges, 1, &lb);
+                    SafeArrayGetUBound(psaRanges, 1, &ub);
+                    for (LONG i = lb; i <= ub && !ok; i++)
+                    {
+                        IUIAutomationTextRange *pRange = nullptr;
+                        if (FAILED(SafeArrayGetElement(psaRanges, &i, &pRange)) || !pRange)
+                            continue;
+                        SAFEARRAY *psa = nullptr;
+                        if (SUCCEEDED(pRange->GetBoundingRectangles(&psa)))
+                        {
+                            if (RectsToCaretBottom(psa, x, y, h))
+                                ok = true;
+                            if (psa)
+                                SafeArrayDestroy(psa);
+                        }
+                        pRange->Release();
+                    }
+                    SafeArrayDestroy(psaRanges);
+                }
+            }
+            pPattern->Release();
+        }
+    }
+
+    pFocus->Release();
+
+    if (!ok)
+        return false;
+
+    outX = x;
+    outY = y;
+    outHeight = h;
+    return true;
+}
+
+bool CursorModule::GetCaretViaWin32(int &outX, int &outY, int &outHeight)
+{
     // 必须取前台窗口所属线程：GetGUIThreadInfo(0) 拿的是"调用线程"的 GUI 状态，
     // 而本函数跑在 m_textCursorThread 工作线程上，没有 GUI 消息队列，
     // 永远拿不到 caret/focus。前台窗口的线程才有这些信息。
@@ -774,7 +1003,7 @@ bool CursorModule::GetCaretScreenPosition(int &outX, int &outY,
     // 恰好停在焦点窗口内）还会源源不断地伪造"文本光标"状态，并经由
     // m_textCursorActive 让键盘钩子持续自我续命。自绘 caret 的应用
     //（Chromium/Electron、UWP/WinUI、Qt、Flutter、Java）hwndCaret 为
-    // NULL，正确行为是"无数据"，由后续阶段的 WinEvent/MSAA/UIA 路径覆盖。
+    // NULL —— 正确行为是落到 UIA 路径（GetCaretViaUIA）。
     if (!gti.hwndCaret)
         return false;
 
@@ -799,7 +1028,6 @@ bool CursorModule::GetCaretScreenPosition(int &outX, int &outY,
     outX = caretPos.x;
     outY = caretPos.y;
     outHeight = height;
-    outSource = SidebandProtocol::CARET_SOURCE_WIN32;
     return true;
 }
 
@@ -812,9 +1040,22 @@ void CursorModule::UpdateTextCursorState(bool forceUpdate)
 
     int currentState = -1;
     int caretX = 0, caretY = 0;
-    int caretHeight = 0, caretSource = SidebandProtocol::CARET_SOURCE_NONE;
+    int caretHeight = 0;
+    int caretSource = SidebandProtocol::CARET_SOURCE_NONE;
 
-    if (GetCaretScreenPosition(caretX, caretY, caretHeight, caretSource))
+    // 两级取词：Win32 系统 caret 优先（零成本、零风险），失败再走 UIA
+    //（跨进程 COM，可能阻塞，但能覆盖自绘 caret 的现代应用栈）。
+    if (GetCaretViaWin32(caretX, caretY, caretHeight))
+    {
+        caretSource = SidebandProtocol::CARET_SOURCE_WIN32;
+    }
+    else if (GetCaretViaUIA(caretX, caretY, caretHeight))
+    {
+        caretSource = SidebandProtocol::CARET_SOURCE_UIA;
+    }
+
+    bool haveCaret = (caretSource != SidebandProtocol::CARET_SOURCE_NONE);
+    if (haveCaret)
     {
         if (!forceUpdate && caretX == lastCaretX && caretY == lastCaretY)
             return;
@@ -837,6 +1078,7 @@ void CursorModule::UpdateTextCursorState(bool forceUpdate)
             // 不允许出现"-1 却带着高度/来源"的自相矛盾包。
             caretHeight = 0;
             caretSource = SidebandProtocol::CARET_SOURCE_NONE;
+            currentState = -1;
         }
         m_textCursorActive = true;
     }
