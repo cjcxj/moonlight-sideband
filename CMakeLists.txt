@@ -115,24 +115,6 @@ set_target_properties(moonlight_sideband PROPERTIES
 # ============================================================
 option(SIDEBAND_BUILD_TESTS "Build unit tests for platform-independent logic" OFF)
 
-# ============================================================
-#  文本插入符探针（可选测试客户端）
-#
-#  连上服务端后解析并打印每个文本光标包的 Y%/高度/来源/包间隔，
-#  用于真机验证 caret 追踪（Win32 + UIA 两级路径）。
-#    cmake -S . -B build -DSIDEBAND_BUILD_CARET_PROBE=ON
-#    cmake --build build --config Release --target caret_probe
-# ============================================================
-option(SIDEBAND_BUILD_CARET_PROBE "Build the caret text-cursor probe test client" OFF)
-
-if(SIDEBAND_BUILD_CARET_PROBE)
-    add_executable(caret_probe tools/caret_probe.cpp)
-    target_link_libraries(caret_probe PRIVATE ws2_32)
-    if(MSVC)
-        target_compile_options(caret_probe PRIVATE /utf-8 /W4)
-    endif()
-endif()
-
 if(SIDEBAND_BUILD_TESTS)
     enable_testing()
     add_executable(sideband_tests tests/test_units.cpp)
