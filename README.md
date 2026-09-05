@@ -115,7 +115,38 @@ payload 为 `{"ok":false,"error":"unauthorized","cmd":<原指令>}` 的响应（
 - 服务端/客户端双层缓存
 - 文本插入符追踪（低级钩子只置标志，实际取词在工作线程做，
   避免超时被 Windows 摘掉钩子）
+- 两级取词：Win32 系统 caret（GUITHREADINFO）优先，UIA
+  `TextPattern2::GetCaretRange` 兜底（覆盖 Chromium/Electron、Firefox、
+  WinUI 等自绘插入符应用），见下方"文本插入符测试"
 - 与原协议 100% 兼容
+
+#### 文本插入符测试
+
+探针（连接后实时打印每个文本光标包的 Y%/高度/来源/间隔）：
+
+```
+cmake -S . -B build -DSIDEBAND_BUILD_CARET_PROBE=ON
+cmake --build build --config Release --target caret_probe
+build\Release\caret_probe.exe [host] [port]      # 默认 127.0.0.1 5005
+```
+
+注意：服务端只在其**有 TCP 客户端连接时**才做插入符轮询/上报——
+探针本身就是那个客户端。退出按 `q`+回车。
+
+验证场景（前台应用 + 探针输出）：
+
+| 场景 | 预期 |
+|---|---|
+| 记事本 / cmd 打字 | `来源=Win32`，Y% 跟随输入行**底边** |
+| Chrome 地址栏 / 网页输入框打字 | `来源=UIA`，Y% 跟随输入行 |
+| VSCode / Electron 应用编辑器打字 | `来源=UIA` |
+| 浏览器正文点击（不输入） | 不报 caret（Edit 闸门挡掉 DOM 选区） |
+| 切到桌面 / 无输入框窗口 | `退出输入状态` |
+| 记事本里横向滚动让 caret 滚出左缘 | Y% 持续上报（不再断流） |
+| 多显示器（可选） | Y% 相对 caret 所在显示器计算 |
+
+判读要点：`进入输入状态`→`更新`只应发生在真的打字时；
+来源字段（`Win32`/`UIA`）可用于统计两级路径的实际覆盖。
 
 ### DisplayModule ✅
 - CCD `QueryDisplayConfig` 枚举，支持同一 GDI source 下挂多个 target
