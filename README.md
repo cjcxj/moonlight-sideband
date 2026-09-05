@@ -115,6 +115,14 @@ payload 为 `{"ok":false,"error":"unauthorized","cmd":<原指令>}` 的响应（
 - 服务端/客户端双层缓存
 - 文本插入符追踪（低级钩子只置标志，实际取词在工作线程做，
   避免超时被 Windows 摘掉钩子）
+- 两级插入符取词：Win32 `GUITHREADINFO` 系统插入符优先（要求
+  `GUI_CARETBLINKING`），UIA `TextPattern2::GetCaretRange` 兜底
+  （覆盖 Chromium/Electron、Firefox、WinUI 等自绘插入符应用）；
+  底边基准 + 携带高度与来源标记（协议尾保留字段，老客户端不受影响）
+- UIA 退化区间处理：零宽选区先 `ExpandToEnclosingUnit` 归一化再取
+  矩形（Windows Terminal #14664 等实现返回空矩形数组），行尾向前
+  借 1 字符；GetSelection 路径用 Edit 控件闸门 + WT 窗口类单点放行
+  挡浏览器 DOM 选区假数据
 - 与原协议 100% 兼容
 
 ### DisplayModule ✅
