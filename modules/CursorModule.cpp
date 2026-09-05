@@ -16,9 +16,12 @@
 #include <windows.h>
 #include <shellscalingapi.h>
 #include <gdiplus.h>
-// UIA 客户端规范头（uiautomation.h 在部分 SDK/包含顺序下解析不完整，
-// CI 实测缺 ITextPattern/GetPattern/CLSID_CUIAutomation）。
-// 放在 windows.h 之后（先 winsock2 顺序由 CursorModule.hpp 间接保证）。
+// UIA 客户端规范头。命名规则备忘（前一轮踩过的坑，别再犯）：
+// 客户端接口全部带 IUIAutomation 前缀 —— IUIAutomationTextPattern(2)、
+// IUIAutomationTextRange(Array)、IUIAutomationElement；
+// ITextPattern(2) 是提供方（UIAutomationCore provider 侧）的名字，
+// 客户端头里不存在。元素上取模式的方法是 GetCurrentPattern
+//（IUnknown** 出参），GetPattern 是 WinRT provider 侧的名字。
 #include <UIAutomationClient.h>
 #include <ole2.h>
 #include <oleauto.h>   // SafeArrayAccessData / SafeArrayGetElement
@@ -38,24 +41,24 @@
 #pragma comment(lib, "uiautomationcore.lib")
 
 namespace {
-// GetPattern 出参是 IUnknown**，取到后再按需 QueryInterface。
-// 直接拿 IUnknown 判空 + 转 TextPattern 接口，消除双重判错分支。
-bool QueryPattern2(IUIAutomationElement *el, ITextPattern2 **out)
+// GetCurrentPattern 出参是 IUnknown**，取到后再按需 QueryInterface。
+// 封装判空 + 转具体客户端接口，消除散落各处的双重判错分支。
+bool QueryTextPattern2(IUIAutomationElement *el, IUIAutomationTextPattern2 **out)
 {
     *out = nullptr;
     IUnknown *pUnk = nullptr;
-    HRESULT hr = el->GetPattern(UIA_TextPattern2Id, &pUnk);
+    HRESULT hr = el->GetCurrentPattern(UIA_TextPattern2Id, &pUnk);
     if (FAILED(hr) || !pUnk)
         return false;
     hr = pUnk->QueryInterface(IID_PPV_ARGS(out));
     pUnk->Release();
     return SUCCEEDED(hr) && *out;
 }
-bool QueryPattern(IUIAutomationElement *el, ITextPattern **out)
+bool QueryTextPattern(IUIAutomationElement *el, IUIAutomationTextPattern **out)
 {
     *out = nullptr;
     IUnknown *pUnk = nullptr;
-    HRESULT hr = el->GetPattern(UIA_TextPatternId, &pUnk);
+    HRESULT hr = el->GetCurrentPattern(UIA_TextPatternId, &pUnk);
     if (FAILED(hr) || !pUnk)
         return false;
     hr = pUnk->QueryInterface(IID_PPV_ARGS(out));
@@ -923,9 +926,8 @@ bool CursorModule::GetCaretViaUIA(int &outX, int &outY, int &outHeight)
 
     // 2. TextPattern2::GetCaretRange —— Chromium、Firefox、WinUI、记事本
     //    等现代文本栈都实现。取不到再退化到 selection（第 3 步）。
-    //    GetPattern 出参是 IUnknown**，先 QueryInterface 转具体接口。
-    ITextPattern2 *pPattern2 = nullptr;
-    if (QueryPattern2(pFocus, &pPattern2))
+    IUIAutomationTextPattern2 *pPattern2 = nullptr;
+    if (QueryTextPattern2(pFocus, &pPattern2))
     {
         // 场景：SelectAll 后 caret 在文末 —— 确保取的是 caret 而非 selection 头。
         BOOL isActive = FALSE;
@@ -945,8 +947,9 @@ bool CursorModule::GetCaretViaUIA(int &outX, int &outY, int &outHeight)
         pPattern2->Release();
     }
 
-    // 3. 退化路径：无 TextPattern2 时取选区矩形。GetSelection 返回的是
-    //    IUIAutomationTextRangeArray 的 SAFEARRAY（不是单个 range）。
+    // 3. 退化路径：无 TextPattern2 时取选区矩形。客户端 GetSelection 返回
+    //    IUIAutomationTextRangeArray（Length + GetElement 的 COM 集合，
+    //    不是 SAFEARRAY）。
     //    【闸门】只接受控件类型为 Edit 的焦点元素：浏览器里点击页面文本
     //    会留下 DOM 选区，Document 控件的 TextPattern 会把它报成 selection
     //    —— 那不是 caret，照单全收就等于从 UIA 后门放回了假数据
@@ -954,8 +957,8 @@ bool CursorModule::GetCaretViaUIA(int &outX, int &outY, int &outHeight)
     //    如部分 Qt 版本）真正的输入框控件类型就是 Edit。
     if (!ok)
     {
-        ITextPattern *pPattern = nullptr;
-        if (QueryPattern(pFocus, &pPattern))
+        IUIAutomationTextPattern *pPattern = nullptr;
+        if (QueryTextPattern(pFocus, &pPattern))
         {
             VARIANT vtType;
             VariantInit(&vtType);
@@ -967,16 +970,14 @@ bool CursorModule::GetCaretViaUIA(int &outX, int &outY, int &outHeight)
 
             if (isEdit)
             {
-                SAFEARRAY *psaRanges = nullptr;
-                if (SUCCEEDED(pPattern->GetSelection(&psaRanges)) && psaRanges)
+                IUIAutomationTextRangeArray *pRanges = nullptr;
+                if (SUCCEEDED(pPattern->GetSelection(&pRanges)) && pRanges)
                 {
-                    LONG lb = 0, ub = 0;
-                    SafeArrayGetLBound(psaRanges, 1, &lb);
-                    SafeArrayGetUBound(psaRanges, 1, &ub);
-                    for (LONG i = lb; i <= ub && !ok; i++)
+                    int n = pRanges->Length;
+                    for (int i = 0; i < n && !ok; i++)
                     {
                         IUIAutomationTextRange *pRange = nullptr;
-                        if (FAILED(SafeArrayGetElement(psaRanges, &i, &pRange)) || !pRange)
+                        if (FAILED(pRanges->GetElement(i, &pRange)) || !pRange)
                             continue;
                         SAFEARRAY *psa = nullptr;
                         if (SUCCEEDED(pRange->GetBoundingRectangles(&psa)))
@@ -988,7 +989,7 @@ bool CursorModule::GetCaretViaUIA(int &outX, int &outY, int &outHeight)
                         }
                         pRange->Release();
                     }
-                    SafeArrayDestroy(psaRanges);
+                    pRanges->Release();
                 }
             }
             pPattern->Release();
