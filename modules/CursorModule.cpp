@@ -30,6 +30,7 @@
 #include <cstring>
 #include <cmath>
 #include <cstdio>
+#include <cwchar>
 #include <set>
 #include <string>
 
@@ -909,6 +910,79 @@ static bool RectsToCaretBottom(SAFEARRAY *psa, int &outX, int &outY, int &outHei
     return true;
 }
 
+// 从文本区间取插入符底边（三级尝试），坐标语义与 RectsToCaretBottom 一致。
+//
+// 1) 直接 GetBoundingRectangles：非退化选区（用户真的选中了文字），
+//    以及 Chromium 等直接给"零宽+行高"矩形的实现，走这里。
+// 2) 退化区间陷阱：打字位（未选中文本）是零宽区间，Windows Terminal、
+//    JetBrains 系等实现对其直接返回**空矩形数组**（microsoft/terminal
+//    #14664），必须先 Clone 再 ExpandToEnclosingUnit(TextUnit_Character)
+//    归一化为一个字符，才有矩形可取。
+// 3) 行尾兜底：prompt 末尾 / 空缓冲时 Expand 无字符可展，把 Start 端点
+//    向前借 1 个字符，取那一行的矩形（X 不上报，借字符右缘无妨）。
+static bool RangeToCaretBottom(IUIAutomationTextRange *pRange, int &outX, int &outY, int &outHeight)
+{
+    if (!pRange)
+        return false;
+
+    // 1. 直接取
+    SAFEARRAY *psa = nullptr;
+    if (SUCCEEDED(pRange->GetBoundingRectangles(&psa)))
+    {
+        bool ok = RectsToCaretBottom(psa, outX, outY, outHeight);
+        if (psa)
+            SafeArrayDestroy(psa);
+        if (ok)
+            return true;
+    }
+
+    // 2. 退化区间：Expand 归一化后再取
+    IUIAutomationTextRange *pExpanded = nullptr;
+    if (SUCCEEDED(pRange->Clone(&pExpanded)) && pExpanded)
+    {
+        pExpanded->ExpandToEnclosingUnit(TextUnit_Character);
+        psa = nullptr;
+        if (SUCCEEDED(pExpanded->GetBoundingRectangles(&psa)))
+        {
+            bool ok = RectsToCaretBottom(psa, outX, outY, outHeight);
+            if (psa)
+                SafeArrayDestroy(psa);
+            if (ok)
+            {
+                pExpanded->Release();
+                return true;
+            }
+        }
+
+        // 3. 行尾：向后无字符，向前借 1 个字符
+        IUIAutomationTextRange *pBack = nullptr;
+        if (SUCCEEDED(pRange->Clone(&pBack)) && pBack)
+        {
+            int moved = 0;
+            if (SUCCEEDED(pBack->MoveEndpointByUnit(TextPatternRangeEndpoint_Start,
+                                                    TextUnit_Character, -1, &moved)) && moved != 0)
+            {
+                psa = nullptr;
+                if (SUCCEEDED(pBack->GetBoundingRectangles(&psa)))
+                {
+                    bool ok = RectsToCaretBottom(psa, outX, outY, outHeight);
+                    if (psa)
+                        SafeArrayDestroy(psa);
+                    if (ok)
+                    {
+                        pBack->Release();
+                        pExpanded->Release();
+                        return true;
+                    }
+                }
+            }
+            pBack->Release();
+        }
+        pExpanded->Release();
+    }
+    return false;
+}
+
 bool CursorModule::GetCaretViaUIA(int &outX, int &outY, int &outHeight)
 {
     outX = outY = outHeight = 0;
@@ -936,14 +1010,10 @@ bool CursorModule::GetCaretViaUIA(int &outX, int &outY, int &outHeight)
         IUIAutomationTextRange *pRange = nullptr;
         if (SUCCEEDED(pPattern2->GetCaretRange(&isActive, &pRange)) && pRange)
         {
-            SAFEARRAY *psa = nullptr;
-            if (SUCCEEDED(pRange->GetBoundingRectangles(&psa)))
-            {
-                if (RectsToCaretBottom(psa, x, y, h))
-                    ok = true;
-                if (psa)
-                    SafeArrayDestroy(psa);
-            }
+            // RangeToCaretBottom 内含退化区间 Expand + 行尾借字符三级尝试，
+            // 覆盖直接取矩形为空的实现（Windows Terminal 等）。
+            if (RangeToCaretBottom(pRange, x, y, h))
+                ok = true;
             pRange->Release();
         }
         pPattern2->Release();
@@ -952,11 +1022,14 @@ bool CursorModule::GetCaretViaUIA(int &outX, int &outY, int &outHeight)
     // 3. 退化路径：无 TextPattern2 时取选区矩形。客户端 GetSelection 返回
     //    IUIAutomationTextRangeArray（Length + GetElement 的 COM 集合，
     //    不是 SAFEARRAY）。
-    //    【闸门】只接受控件类型为 Edit 的焦点元素：浏览器里点击页面文本
-    //    会留下 DOM 选区，Document 控件的 TextPattern 会把它报成 selection
-    //    —— 那不是 caret，照单全收就等于从 UIA 后门放回了假数据
-    //    （阶段一刚清理掉的那种）。退化场景（无 TextPattern2 的文本栈，
-    //    如部分 Qt 版本）真正的输入框控件类型就是 Edit。
+    //    【闸门】只接受 Edit 控件，或前台窗口是 Windows Terminal 的
+    //    Document 控件：浏览器里点击页面文本会留下 DOM 选区，Document
+    //    控件的 TextPattern 会把它报成 selection —— 那不是 caret，
+    //    照单全收就等于从 UIA 后门放回假数据（阶段一刚清理掉的那种）。
+    //    例外原因：WT 无 TextPattern2、退化选区返回空矩形（#14664），
+    //    只有 GetSelection+Expand 这一条路能取到（RangeToCaretBottom
+    //    第 2 级）；其 TermControl 恰为 Document 控件。名单只收
+    //    CASCADIA_HOSTING_WINDOW_CLASS 一个类，别的窗口该挡照挡。
     if (!ok)
     {
         IUIAutomationTextPattern *pPattern = nullptr;
@@ -969,6 +1042,16 @@ bool CursorModule::GetCaretViaUIA(int &outX, int &outY, int &outHeight)
                 vtType.vt == VT_I4 && vtType.lVal == UIA_EditControlTypeId)
                 isEdit = true;
             VariantClear(&vtType);
+
+            if (!isEdit)
+            {
+                // 前台窗口类名单点放行：Windows Terminal（CASCADIA_HOSTING_WINDOW_CLASS）
+                HWND fg = GetForegroundWindow();
+                wchar_t cls[64] = L"";
+                if (fg && GetClassNameW(fg, cls, 64) &&
+                    wcscmp(cls, L"CASCADIA_HOSTING_WINDOW_CLASS") == 0)
+                    isEdit = true;
+            }
 
             if (isEdit)
             {
@@ -985,14 +1068,9 @@ bool CursorModule::GetCaretViaUIA(int &outX, int &outY, int &outHeight)
                             IUIAutomationTextRange *pRange = nullptr;
                             if (FAILED(pRanges->GetElement(i, &pRange)) || !pRange)
                                 continue;
-                            SAFEARRAY *psa = nullptr;
-                            if (SUCCEEDED(pRange->GetBoundingRectangles(&psa)))
-                            {
-                                if (RectsToCaretBottom(psa, x, y, h))
-                                    ok = true;
-                                if (psa)
-                                    SafeArrayDestroy(psa);
-                            }
+                            // 同样走三级尝试：WT 的退化选区靠第 2 级 Expand 命中
+                            if (RangeToCaretBottom(pRange, x, y, h))
+                                ok = true;
                             pRange->Release();
                         }
                     }
