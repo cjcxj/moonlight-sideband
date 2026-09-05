@@ -973,21 +973,26 @@ bool CursorModule::GetCaretViaUIA(int &outX, int &outY, int &outHeight)
                 IUIAutomationTextRangeArray *pRanges = nullptr;
                 if (SUCCEEDED(pPattern->GetSelection(&pRanges)) && pRanges)
                 {
-                    int n = pRanges->Length;
-                    for (int i = 0; i < n && !ok; i++)
+                    // COM IDL 属性在 C++ 里展开为 getter：get_Length(int*)，
+                    // 不能按 C#/JS 习惯直取 ranges->Length（C2039 的根因）
+                    int n = 0;
+                    if (SUCCEEDED(pRanges->get_Length(&n)))
                     {
-                        IUIAutomationTextRange *pRange = nullptr;
-                        if (FAILED(pRanges->GetElement(i, &pRange)) || !pRange)
-                            continue;
-                        SAFEARRAY *psa = nullptr;
-                        if (SUCCEEDED(pRange->GetBoundingRectangles(&psa)))
+                        for (int i = 0; i < n && !ok; i++)
                         {
-                            if (RectsToCaretBottom(psa, x, y, h))
-                                ok = true;
-                            if (psa)
-                                SafeArrayDestroy(psa);
+                            IUIAutomationTextRange *pRange = nullptr;
+                            if (FAILED(pRanges->GetElement(i, &pRange)) || !pRange)
+                                continue;
+                            SAFEARRAY *psa = nullptr;
+                            if (SUCCEEDED(pRange->GetBoundingRectangles(&psa)))
+                            {
+                                if (RectsToCaretBottom(psa, x, y, h))
+                                    ok = true;
+                                if (psa)
+                                    SafeArrayDestroy(psa);
+                            }
+                            pRange->Release();
                         }
-                        pRange->Release();
                     }
                     pRanges->Release();
                 }
