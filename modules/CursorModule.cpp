@@ -30,6 +30,8 @@
 #include <cstring>
 #include <cmath>
 #include <cstdio>
+#include <set>
+#include <string>
 
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "user32.lib")
@@ -1002,6 +1004,38 @@ bool CursorModule::GetCaretViaUIA(int &outX, int &outY, int &outHeight)
     }
 
     pFocus->Release();
+
+    // UIA 级诊断（DEBUG）：一次调用就能看清断在哪一环。
+    // 只在取不到时进入，且用 set 去重避免每次轮询刷屏。
+    if (!ok)
+    {
+        IUIAutomationElement *pDiag = nullptr;
+        if (SUCCEEDED(uia->GetFocusedElement(&pDiag)) && pDiag)
+        {
+            static std::set<std::string> reported;  // 只在 m_textCursorThread 上跑，无竞争
+            int ctlType = -1;
+            VARIANT vt;
+            VariantInit(&vt);
+            if (SUCCEEDED(pDiag->GetCurrentPropertyValue(UIA_ControlTypePropertyId, &vt)) &&
+                vt.vt == VT_I4)
+                ctlType = vt.lVal;
+            VariantClear(&vt);
+
+            bool hasTP2 = false, hasTP = false;
+            IUnknown *pUnk = nullptr;
+            if (SUCCEEDED(pDiag->GetCurrentPattern(UIA_TextPattern2Id, &pUnk)) && pUnk)
+                { hasTP2 = true; pUnk->Release(); }
+            if (SUCCEEDED(pDiag->GetCurrentPattern(UIA_TextPatternId, &pUnk)) && pUnk)
+                { hasTP = true; pUnk->Release(); }
+
+            char key[64];
+            std::snprintf(key, sizeof(key), "ctl=%d tp2=%d tp=%d", ctlType, hasTP2, hasTP);
+            if (reported.insert(key).second)
+                Logger::Get().Debug("[文本光标] UIA 取不到 caret：", key,
+                                    "（ctl: 500=Document/Edit类 504=Edit, tp2/tp: 有无 TextPattern2/1）");
+            pDiag->Release();
+        }
+    }
 
     if (!ok)
         return false;
