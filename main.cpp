@@ -4,6 +4,7 @@
  * 集成的旁路服务端，模块化架构：
  *   - CursorModule:  光标捕获与广播（兼容原 windows-cursor-streamer 协议）
  *   - DisplayModule: 显示器控制
+ *   - AudioModule:   声音输出设备 / 音量 / 静音
  *   - 未来模块...
  *
  * 兼容性：与原 CursorMonitor.exe 二进制兼容，
@@ -21,6 +22,7 @@
  *   服务器线程    —— SidebandServer::Run()，WSAPoll 收发
  *   CursorModule  —— 工作线程 / 文本光标线程 / 钩子消息循环线程
  *   DisplayModule —— 监控线程（每 2 秒轮询 + hash 比较，事件可提前唤醒）
+ *   AudioModule   —— 监控线程（同上，轮询输出设备/音量/默认设备状态）
  */
 
 // NOMINMAX / WIN32_LEAN_AND_MEAN / _WIN32_WINNT 等
@@ -47,6 +49,7 @@
 #include "SidebandServer.hpp"
 #include "modules/CursorModule.hpp"
 #include "modules/DisplayModule.hpp"
+#include "modules/AudioModule.hpp"
 
 namespace
 {
@@ -195,6 +198,7 @@ int main(int, char *[])
     // 这里不再需要持有具体类型的指针手动调用
     server.RegisterModule(std::make_unique<CursorModule>(server));
     server.RegisterModule(std::make_unique<DisplayModule>(server));
+    server.RegisterModule(std::make_unique<AudioModule>(server));
     server.StartModules();
 
     // === 托盘图标 + 隐藏窗口（主线程跑消息循环）===

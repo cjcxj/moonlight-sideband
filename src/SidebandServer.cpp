@@ -363,8 +363,8 @@ void SidebandServer::DispatchCommandInner(SidebandSession &session,
     case Cmd::HELLO:
     {
         std::string resp = "{\"proto_ver\":" + std::to_string(PROTO_VERSION) +
-                           ",\"caps\":[\"cursor\",\"display\"]"
-                           ",\"auth_required_for\":[12,16,17]"
+                           ",\"caps\":[\"cursor\",\"display\",\"audio\"]"
+                           ",\"auth_required_for\":[12,16,17,32,33,34]"
                            ",\"authenticated\":" + (session.IsAuthenticated() ? "true" : "false") +
                            "}";
         std::vector<uint8_t> p(resp.begin(), resp.end());

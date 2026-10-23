@@ -23,6 +23,7 @@ set(SOURCES
     src/TrayIcon.cpp
     modules/CursorModule.cpp
     modules/DisplayModule.cpp
+    modules/AudioModule.cpp
 )
 
 add_executable(moonlight_sideband ${SOURCES})
@@ -47,7 +48,7 @@ target_link_libraries(moonlight_sideband PRIVATE
     user32      # User32
     gdiplus     # GDI+ (PNG 编码)
     shcore      # DPI Awareness
-    ole32       # COM (IStream)
+    ole32       # COM (IStream / WASAPI 音频端点与 IPolicyConfig)
     advapi32    # Registry
     shell32     # 托盘图标 / CommandLineToArgvW
     bcrypt      # BCryptGenRandom (令牌生成)

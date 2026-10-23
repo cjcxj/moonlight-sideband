@@ -239,17 +239,29 @@ inline int GetInt(const std::string &json, const std::string &key,
     return (int)value;
 }
 
-// 读取布尔字段。
+// 读取布尔字段。found 非空时回写"是否真的读到一个合法布尔值" ——
+// 调用方需要区分"没这个键"和"键存在但值为 false"（例如静音开关）。
 inline bool GetBool(const std::string &json, const std::string &key,
-                    bool defaultValue = false)
+                    bool defaultValue = false, bool *found = nullptr)
 {
+    if (found)
+        *found = false;
+
     size_t v = detail::FindValuePos(json, key);
     if (v == std::string::npos)
         return defaultValue;
     if (json.compare(v, 4, "true") == 0)
+    {
+        if (found)
+            *found = true;
         return true;
+    }
     if (json.compare(v, 5, "false") == 0)
+    {
+        if (found)
+            *found = true;
         return false;
+    }
     return defaultValue;
 }
 

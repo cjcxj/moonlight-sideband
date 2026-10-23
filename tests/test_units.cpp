@@ -123,6 +123,21 @@ static void TestJsonNumbers()
     // 布尔
     CHECK(Json::GetBool(R"({"ok":true})", "ok") == true);
     CHECK(Json::GetBool(R"({"ok":false})", "ok", true) == false);
+
+    // found：区分"键不存在"与"值为 false"。AUDIO_MUTE_SET 靠它把
+    // {"device_id":"x"} 判成 invalid_payload，而不是当成"取消静音"执行下去。
+    bool found = true;
+    CHECK(Json::GetBool(R"({"muted":false})", "muted", true, &found) == false && found);
+    found = true;
+    CHECK(Json::GetBool(R"({"device_id":"x"})", "muted", true, &found) == true && !found);
+    found = true;
+    CHECK(Json::GetBool(R"({"muted":"false"})", "muted", false, &found) == false && !found);
+
+    // 值内部出现的键名不能被当成键（音频端点 ID 里就是大括号+点号这种形状）
+    CHECK_EQ_STR(Json::GetString(R"({"msg":"device_id bad","device_id":"{0.0.0.00000000}.{ab}"})",
+                                 "device_id"),
+                 "{0.0.0.00000000}.{ab}");
+    CHECK_EQ_INT(Json::GetInt(R"({"name":"volume 3","volume":70})", "volume"), 70);
 }
 
 static void TestJsonEscape()

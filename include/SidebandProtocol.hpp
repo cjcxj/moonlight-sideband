@@ -36,7 +36,8 @@ namespace Cmd {
     // === 认证（分级授权）===
     // 光标推送、显示器列表/模式查询等只读操作**不需要**认证，
     // 因此老客户端无需任何改动即可继续工作。
-    // 只有会改变系统状态的指令（DISPLAY_SWITCH / DISPLAY_MODE_SET / DISPLAY_SCALE_SET）
+    // 只有会改变系统状态的指令（DISPLAY_SWITCH / DISPLAY_MODE_SET / DISPLAY_SCALE_SET /
+    // AUDIO_DEFAULT_SET / AUDIO_VOLUME_SET / AUDIO_MUTE_SET）
     // 要求该连接先通过 AUTH_REQ 提交令牌。令牌见 exe 同目录的 moonlight_sideband.ini。
     constexpr uint32_t AUTH_REQ = 4;    // Android -> PC, JSON: {"token":"..."}
     constexpr uint32_t AUTH_RESP = 5;   // PC -> Android, JSON: {"ok":true} 或 {"ok":false,"error":"bad_token"}
@@ -55,6 +56,16 @@ namespace Cmd {
     constexpr uint32_t DISPLAY_MODE_SET = 16;       // Android -> PC, JSON: {display_id,w,h,refresh}  [需认证]
     // 设置缩放（CCD API，即时生效）
     constexpr uint32_t DISPLAY_SCALE_SET = 17;      // Android -> PC, JSON: {display_id,scale}        [需认证]
+
+    // === Audio 输出控制 (对应 Windows 设置里的"选择播放声音的位置") ===
+    // 设备列表/音量/静音状态是只读查询；改默认设备、改音量、改静音需要认证。
+    constexpr uint32_t AUDIO_LIST_REQ    = 30;  // Android -> PC, 空                        [只读]
+    constexpr uint32_t AUDIO_LIST_RESP   = 31;  // PC -> Android, JSON: {devices:[...]}
+    constexpr uint32_t AUDIO_DEFAULT_SET = 32;  // Android -> PC, JSON: {device_id}         [需认证]
+    constexpr uint32_t AUDIO_VOLUME_SET  = 33;  // Android -> PC, JSON: {device_id,volume}  [需认证]
+    constexpr uint32_t AUDIO_MUTE_SET    = 34;  // Android -> PC, JSON: {device_id,muted}   [需认证]
+    constexpr uint32_t AUDIO_OP_RESP     = 35;  // PC -> Android, 上述三条写指令的统一响应
+    constexpr uint32_t AUDIO_STATE       = 36;  // PC -> Android (事件推送), JSON 同 LIST_RESP
 
     // === Sunshine 配置 (阶段 3) ===
     constexpr uint32_t SUNSHINE_CONFIG_READ = 20;
