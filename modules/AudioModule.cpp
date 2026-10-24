@@ -67,6 +67,9 @@ template <typename T>
 class ComHandle
 {
 public:
+    // 默认构造必须显式写：只靠成员初始化器时 MSVC 在实例化处报 C2512
+    //（"no appropriate default constructor available"）。
+    ComHandle() : m_p(nullptr) {}
     ~ComHandle() { if (m_p) m_p->Release(); }
     ComHandle(const ComHandle &) = delete;
     ComHandle &operator=(const ComHandle &) = delete;
@@ -76,7 +79,7 @@ public:
     T *get() const { return m_p; }
 
 private:
-    T *m_p = nullptr;
+    T *m_p;
 };
 
 // ============================================================
@@ -375,8 +378,11 @@ std::vector<AudioModule::DeviceInfo> AudioModule::EnumerateDevices() const
             info.state = StateName(state);
 
         ComHandle<IAudioEndpointVolume> volume;
+        // Activate 的签名是 (REFIID, DWORD, PROPVARIANT*, void**) —— IID 已经在第一个
+        // 参数上给了，再用 IID_PPV_ARGS 会多出第二个 IID，变成 5 个参数（C2660）。
         if (SUCCEEDED(device->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_INPROC_SERVER,
-                                       nullptr, IID_PPV_ARGS(volume.ReleaseRef()))) && volume.get())
+                                       nullptr,
+                                       reinterpret_cast<void **>(volume.ReleaseRef()))) && volume.get())
         {
             float scalar = 0.f;
             BOOL muted = FALSE;
@@ -486,7 +492,8 @@ AudioModule::OpResult AudioModule::SetVolume(const std::string &deviceId, int vo
 
     ComHandle<IAudioEndpointVolume> endpointVolume;
     hr = device->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_INPROC_SERVER,
-                          nullptr, IID_PPV_ARGS(endpointVolume.ReleaseRef()));
+                          nullptr,
+                          reinterpret_cast<void **>(endpointVolume.ReleaseRef()));
     if (FAILED(hr) || !endpointVolume.get())
     {
         Logger::Get().Warning("AudioModule: 该设备不支持音量接口 hr=0x",
@@ -526,7 +533,8 @@ AudioModule::OpResult AudioModule::SetMuted(const std::string &deviceId, bool mu
 
     ComHandle<IAudioEndpointVolume> endpointVolume;
     hr = device->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_INPROC_SERVER,
-                          nullptr, IID_PPV_ARGS(endpointVolume.ReleaseRef()));
+                          nullptr,
+                          reinterpret_cast<void **>(endpointVolume.ReleaseRef()));
     if (FAILED(hr) || !endpointVolume.get())
         return OpResult::ApiFailed;
 
