@@ -146,10 +146,20 @@ HRESULT CreatePolicyConfig(IPolicyConfig **out)
     return S_OK;
 }
 
-// PKEY_Device_FriendlyName = {A45C254E-DF1C-4FFD-8020-67D146A850E0}, 14
-// 本地定义而不是 include <functiondiscoverykeys_devpkey.h>：那个头文件在未
-// #define INITGUID 时只给 extern 声明，得额外链 propsys.lib。
+// 端点属性表里的名称候选，按优先级排列。
+//
+// devpkey.h 的 DEVPKEY_* 基准是 {a45c254e-df1c-4**efd**-8020-67d146a850e0}，
+// functiondiscoverykeys_devpkey.h 的 PKEY_* 是 {a45c254e-df1c-4**ffd**-…}。
+// 两者只差一个 nibble，取错就永远拿不到值（此前正是把 14 号写在了 4ffd 类别下，
+// 于是每台设备都退化成端点 ID）。实测音频端点的属性表用的是 4efd 这一族。
+//
+// 本机注册表实测：4efd,2 = 「扬声器」，而 4efd,14 根本不存在；
+// 所以必须留 Name 兜底，不能只认 FriendlyName。
 const PROPERTYKEY kPKEYFriendlyName =
+    { { 0xa45c254e, 0xdf1c, 0x4efd, { 0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0 } }, 14 };
+const PROPERTYKEY kPKEYDeviceName =
+    { { 0xa45c254e, 0xdf1c, 0x4efd, { 0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0 } }, 2 };
+const PROPERTYKEY kPKEYFdFriendlyName =
     { { 0xa45c254e, 0xdf1c, 0x4ffd, { 0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0 } }, 14 };
 
 // 取设备友好名称。失败时回退到端点 ID（面板里至少能看到点东西）。
@@ -159,17 +169,23 @@ std::string GetFriendlyName(IMMDevice *device, const std::string &fallback)
     if (FAILED(device->OpenPropertyStore(STGM_READ, store.ReleaseRef())) || !store.get())
         return fallback;
 
-    PROPVARIANT var = {};
-    PropVariantInit(&var);
-    std::string out = fallback;
-    if (SUCCEEDED(store->GetValue(kPKEYFriendlyName, &var)) && var.vt == VT_LPWSTR && var.pwszVal)
+    static const PROPERTYKEY *const candidates[] = {
+        &kPKEYFriendlyName, &kPKEYDeviceName, &kPKEYFdFriendlyName,
+    };
+
+    for (const PROPERTYKEY *key : candidates)
     {
-        std::string utf8 = WideToUtf8(var.pwszVal);
-        if (!utf8.empty())
-            out = utf8;
+        PROPVARIANT var = {};
+        PropVariantInit(&var);
+        std::string out;
+        HRESULT hr = store->GetValue(*key, &var);
+        if (SUCCEEDED(hr) && var.vt == VT_LPWSTR && var.pwszVal)
+            out = WideToUtf8(var.pwszVal);
+        PropVariantClear(&var);
+        if (!out.empty())
+            return out;
     }
-    PropVariantClear(&var);
-    return out;
+    return fallback;
 }
 
 // 端点 ID -> UTF-8 std::string（调用方负责 CoTaskMemFree）
