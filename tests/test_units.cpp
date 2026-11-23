@@ -493,6 +493,26 @@ static void TestUiaFocusResolutionAndValidationBounds()
           chosen.right == fgRect.right && chosen.bottom == fgRect.bottom);
 }
 
+static void TestCandidateWindowRectValidation()
+{
+    using namespace Caret;
+
+    // 过小窗口（如隐藏占位/1x1）拒绝
+    CHECK(!IsCandidateWindowRectValid(PixelRect{100, 100, 110, 120}, 1920, 1080));
+    CHECK(!IsCandidateWindowRectValid(PixelRect{100, 100, 300, 110}, 1920, 1080));
+
+    // 全屏 TextInputHost CoreWindow 透明覆盖层必须拒绝
+    CHECK(!IsCandidateWindowRectValid(PixelRect{0, 0, 1920, 1080}, 1920, 1080));
+    CHECK(!IsCandidateWindowRectValid(PixelRect{0, 0, 2560, 1440}, 2560, 1440));
+
+    // 过高窗口（如表情面板/虚拟键盘）拒绝
+    CHECK(!IsCandidateWindowRectValid(PixelRect{400, 300, 900, 820}, 1920, 1080));
+
+    // Win11 7 候选高 DPI 横条（宽度 > 900px，之前被硬编码 >900 误杀）必须放行
+    CHECK(IsCandidateWindowRectValid(PixelRect{200, 180, 1180, 236}, 1920, 1080));
+    CHECK(IsCandidateWindowRectValid(PixelRect{350, 420, 1630, 484}, 2560, 1440));
+}
+
 int main()
 {
     std::printf("=== moonlight-sideband 单元测试 ===\n");
@@ -509,6 +529,7 @@ int main()
     TestNewlineAndAffinityCache();
     TestCaretPublishAndProtocol();
     TestUiaFocusResolutionAndValidationBounds();
+    TestCandidateWindowRectValidation();
 
     std::printf("=== %d 项检查, %d 项失败 ===\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

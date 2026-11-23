@@ -313,6 +313,27 @@ inline PixelRect SelectValidationWindowBound(const PixelRect &focusWinRect,
     return focusWinRect;
 }
 
+// 判断候选框矩形是否合法：放宽到高 DPI 下 7~9 候选横条（~1400-1800px 宽），同时排除全屏 CoreWindow / 表情面板
+inline bool IsCandidateWindowRectValid(const PixelRect &rc,
+                                       int32_t monWidth = 1920,
+                                       int32_t monHeight = 1080)
+{
+    if (rc.IsEmpty())
+        return false;
+    const int32_t w = rc.Width();
+    const int32_t h = rc.Height();
+    if (w < 36 || h < 18)
+        return false;
+
+    const int32_t maxH = std::max<int32_t>(380, monHeight > 0 ? monHeight / 3 : 380);
+    const int32_t maxW = std::max<int32_t>(1800, monWidth > 0 ? (monWidth * 9) / 10 : 1800);
+    if (h > maxH || w > maxW)
+        return false;
+    if (monWidth > 0 && monHeight > 0 && w >= monWidth - 20 && h >= monHeight - 20)
+        return false;
+    return true;
+}
+
 // ============================================================
 // 3. Win32BlinkTracker：解决 GUI_CARETBLINKING 闪烁暗灭期丢帧
 // ============================================================

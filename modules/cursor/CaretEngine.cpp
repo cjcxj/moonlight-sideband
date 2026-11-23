@@ -97,14 +97,27 @@ ProbeStatus CaretEngine::RunSingleProvider(ProviderId id,
                 ctx.nowMs >= ctx.lastKeyboardInputMs &&
                 (ctx.nowMs - ctx.lastKeyboardInputMs) <= 5000ULL;
 
-            const bool needHostLookup =
-                ctx.imeWindowRect.IsEmpty() ||
-                ctx.imeWindowRect.Width() > 900 ||
-                ctx.imeWindowRect.Height() > 280 ||
-                !recentIme;
+            bool imeWinValid = false;
+            if (!ctx.imeWindowRect.IsEmpty())
+            {
+                int32_t monW = 1920, monH = 1080;
+                POINT pt{ctx.imeWindowRect.CenterX(), ctx.imeWindowRect.CenterY()};
+                HMONITOR hMon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+                MONITORINFO mi{};
+                mi.cbSize = sizeof(mi);
+                if (hMon && GetMonitorInfoW(hMon, &mi))
+                {
+                    monW = std::max<int32_t>(1, mi.rcMonitor.right - mi.rcMonitor.left);
+                    monH = std::max<int32_t>(1, mi.rcMonitor.bottom - mi.rcMonitor.top);
+                }
+                imeWinValid = IsCandidateWindowRectValid(ctx.imeWindowRect, monW, monH);
+            }
 
-            if ((recentIme || recentKb) && needHostLookup &&
-                ctx.nowMs >= m_lastTextHostProbeMs + 120ULL)
+            const bool needHostLookup = !recentIme || !imeWinValid;
+            const uint64_t cooldownMs = (recentIme || recentKb) ? 100ULL : 350ULL;
+
+            if (needHostLookup &&
+                (m_lastTextHostProbeMs == 0 || ctx.nowMs >= m_lastTextHostProbeMs + cooldownMs))
             {
                 m_lastTextHostProbeMs = ctx.nowMs;
                 PixelRect hostImeRc{};

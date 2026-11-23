@@ -905,10 +905,18 @@ void CursorModule::TextCursorMonitorLoop()
             uint64_t lastKbMs = 0;
 
             {
-                // 活跃输入态 250ms 校对滚动/状态；无文本焦点时 1000ms 低频休眠（事件随时毫秒级唤醒）
-                const auto waitDur = m_textCursorActive.load(std::memory_order_relaxed)
+                // 活跃输入态 250ms 校对滚动/状态；刚按键 350ms 内使用 80ms 短随访捕捉 Win11 TextInputHost 延迟渲染的候选框；其余 1000ms 低频休眠
+                const uint64_t nowLoopMs = GetTickCount64();
+                const uint64_t recentAtomicKbMs = m_lastKeyboardAtomicMs.load(std::memory_order_relaxed);
+                const bool activeNow = m_textCursorActive.load(std::memory_order_relaxed);
+                const bool postKeyFollowup = !activeNow && recentAtomicKbMs > 0 &&
+                                             nowLoopMs >= recentAtomicKbMs &&
+                                             (nowLoopMs - recentAtomicKbMs) <= 350ULL;
+                const auto waitDur = activeNow
                                          ? std::chrono::milliseconds(250)
-                                         : std::chrono::milliseconds(1000);
+                                         : (postKeyFollowup
+                                                ? std::chrono::milliseconds(80)
+                                                : std::chrono::milliseconds(1000));
                 std::unique_lock<std::mutex> l(m_mutexTextCursor);
                 m_cvTextCursor.wait_for(l, waitDur,
                                         [this] { return m_textCursorPoke || m_exit; });

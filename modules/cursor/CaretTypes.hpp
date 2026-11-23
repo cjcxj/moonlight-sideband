@@ -23,6 +23,7 @@ struct PixelRect {
     int32_t Width() const { return right - left; }
     int32_t Height() const { return bottom - top; }
     int32_t CenterX() const { return left + (right - left) / 2; }
+    int32_t CenterY() const { return top + (bottom - top) / 2; }
     bool IsEmpty() const { return right <= left || bottom <= top; }
 };
 

@@ -1439,14 +1439,60 @@ ProbeStatus UIACaretProvider::Probe(const CaretContextSnapshot &ctx,
 
 namespace {
 
+bool IsWindowCloaked(HWND hwnd)
+{
+    using DwmGetWindowAttributeFn = HRESULT(WINAPI *)(HWND, DWORD, PVOID, DWORD);
+    static DwmGetWindowAttributeFn pDwmGet = []() -> DwmGetWindowAttributeFn {
+        HMODULE hDwm = LoadLibraryW(L"dwmapi.dll");
+        return hDwm ? reinterpret_cast<DwmGetWindowAttributeFn>(
+                          GetProcAddress(hDwm, "DwmGetWindowAttribute"))
+                    : nullptr;
+    }();
+    if (!pDwmGet)
+        return false;
+
+    DWORD cloaked = 0;
+    constexpr DWORD kDwmwaCloaked = 14;
+    if (SUCCEEDED(pDwmGet(hwnd, kDwmwaCloaked, &cloaked, sizeof(cloaked))))
+        return cloaked != 0;
+    return false;
+}
+
+void GetMonitorSizeForRect(const PixelRect &rc, int32_t &outW, int32_t &outH)
+{
+    outW = 1920;
+    outH = 1080;
+    POINT pt{rc.CenterX(), rc.CenterY()};
+    HMONITOR hMon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    if (hMon && GetMonitorInfoW(hMon, &mi))
+    {
+        outW = std::max<int32_t>(1, mi.rcMonitor.right - mi.rcMonitor.left);
+        outH = std::max<int32_t>(1, mi.rcMonitor.bottom - mi.rcMonitor.top);
+    }
+}
+
 struct TextHostEnumState {
+    std::vector<HWND> directCandidateWindows;
     std::vector<HWND> hostWindows;
 };
 
 BOOL CALLBACK EnumTextInputHostProc(HWND hwnd, LPARAM lp)
 {
-    if (!IsWindowVisible(hwnd))
+    if (!IsWindowVisible(hwnd) || IsWindowCloaked(hwnd))
         return TRUE;
+
+    auto *st = reinterpret_cast<TextHostEnumState *>(lp);
+    const std::wstring cls = SafeGetClassName(hwnd);
+    if (cls == L"Microsoft.IME.UIManager.CandidateWindow.Host" ||
+        cls == L"Microsoft.IME.CandidateWindow.View" ||
+        ContainsCaseInsensitive(cls, L"CandidateWindow") ||
+        StartsWithCaseInsensitive(cls, L"CiceroUIWndFrame"))
+    {
+        st->directCandidateWindows.push_back(hwnd);
+    }
+
     DWORD pid = 0;
     GetWindowThreadProcessId(hwnd, &pid);
     if (pid == 0)
@@ -1469,8 +1515,124 @@ BOOL CALLBACK EnumTextInputHostProc(HWND hwnd, LPARAM lp)
     CloseHandle(hProc);
 
     if (isTextHost)
-        reinterpret_cast<TextHostEnumState *>(lp)->hostWindows.push_back(hwnd);
+        st->hostWindows.push_back(hwnd);
     return TRUE;
+}
+
+bool TryFindUiaRectByType(IUIAutomation *uia,
+                          IUIAutomationElement *pRoot,
+                          CONTROLTYPEID ctlId,
+                          bool requireNotOffscreen,
+                          int32_t monW,
+                          int32_t monH,
+                          PixelRect &outRect,
+                          int *outCount = nullptr)
+{
+    if (outCount)
+        *outCount = 0;
+    IUIAutomationCondition *pCond = CreateIntPropCond(uia, UIA_ControlTypePropertyId, ctlId);
+    if (!pCond)
+        return false;
+
+    bool found = false;
+    IUIAutomationElementArray *pArr = nullptr;
+    if (SUCCEEDED(pRoot->FindAll(TreeScope_Descendants, pCond, &pArr)) && pArr)
+    {
+        int len = 0;
+        pArr->get_Length(&len);
+        if (outCount)
+            *outCount = len;
+        for (int i = 0; i < len; ++i)
+        {
+            IUIAutomationElement *pItem = nullptr;
+            if (FAILED(pArr->GetElement(i, &pItem)) || !pItem)
+                continue;
+            BOOL offscreen = FALSE;
+            if (requireNotOffscreen && FAILED(pItem->get_CurrentIsOffscreen(&offscreen)))
+                offscreen = TRUE;
+            RECT rc{};
+            if ((!requireNotOffscreen || !offscreen) &&
+                SUCCEEDED(pItem->get_CurrentBoundingRectangle(&rc)))
+            {
+                PixelRect pr = ToPixelRect(rc);
+                if (IsCandidateWindowRectValid(pr, monW, monH))
+                {
+                    outRect = pr;
+                    found = true;
+                }
+            }
+            pItem->Release();
+            if (found)
+                break;
+        }
+        pArr->Release();
+    }
+    pCond->Release();
+    return found;
+}
+
+bool TryFindUiaCandidateItemsUnion(IUIAutomation *uia,
+                                   IUIAutomationElement *pRoot,
+                                   int32_t monW,
+                                   int32_t monH,
+                                   PixelRect &outRect,
+                                   int *outItemCount = nullptr)
+{
+    if (outItemCount)
+        *outItemCount = 0;
+    IUIAutomationCondition *pCond = CreateIntPropCond(uia, UIA_ControlTypePropertyId, UIA_ListItemControlTypeId);
+    if (!pCond)
+        return false;
+
+    bool hasAny = false;
+    PixelRect unionRc{};
+    IUIAutomationElementArray *pArr = nullptr;
+    if (SUCCEEDED(pRoot->FindAll(TreeScope_Descendants, pCond, &pArr)) && pArr)
+    {
+        int len = 0;
+        pArr->get_Length(&len);
+        if (outItemCount)
+            *outItemCount = len;
+        for (int i = 0; i < len; ++i)
+        {
+            IUIAutomationElement *pItem = nullptr;
+            if (FAILED(pArr->GetElement(i, &pItem)) || !pItem)
+                continue;
+            BOOL offscreen = FALSE;
+            pItem->get_CurrentIsOffscreen(&offscreen);
+            RECT rc{};
+            if (!offscreen && SUCCEEDED(pItem->get_CurrentBoundingRectangle(&rc)))
+            {
+                const int32_t w = rc.right - rc.left;
+                const int32_t h = rc.bottom - rc.top;
+                if (w >= 16 && w <= 700 && h >= 16 && h <= 160)
+                {
+                    if (!hasAny)
+                    {
+                        unionRc = ToPixelRect(rc);
+                        hasAny = true;
+                    }
+                    else
+                    {
+                        unionRc.left = std::min<int32_t>(unionRc.left, rc.left);
+                        unionRc.top = std::min<int32_t>(unionRc.top, rc.top);
+                        unionRc.right = std::max<int32_t>(unionRc.right, rc.right);
+                        unionRc.bottom = std::max<int32_t>(unionRc.bottom, rc.bottom);
+                    }
+                }
+            }
+            pItem->Release();
+        }
+        pArr->Release();
+    }
+    pCond->Release();
+
+    if (hasAny && IsCandidateWindowRectValid(unionRc, monW, monH))
+    {
+        outRect = unionRc;
+        return true;
+    }
+    return false;
 }
 
 } // namespace
@@ -1483,60 +1645,84 @@ bool UIACaretProvider::FindImeCandidateRect(PixelRect &outRect)
     TextHostEnumState st;
     EnumWindows(EnumTextInputHostProc, reinterpret_cast<LPARAM>(&st));
 
+    // 1. 先检查非全屏的独立候选窗 HWND（零 UIA IPC 开销）
+    for (HWND hwnd : st.directCandidateWindows)
+    {
+        RECT rc{};
+        if (GetWindowRect(hwnd, &rc))
+        {
+            PixelRect pr = ToPixelRect(rc);
+            int32_t mw = 1920, mh = 1080;
+            GetMonitorSizeForRect(pr, mw, mh);
+            if (IsCandidateWindowRectValid(pr, mw, mh))
+            {
+                outRect = pr;
+                return true;
+            }
+        }
+    }
+
+    for (HWND hwnd : st.hostWindows)
+    {
+        RECT rc{};
+        if (GetWindowRect(hwnd, &rc))
+        {
+            PixelRect pr = ToPixelRect(rc);
+            int32_t mw = 1920, mh = 1080;
+            GetMonitorSizeForRect(pr, mw, mh);
+            if (IsCandidateWindowRectValid(pr, mw, mh))
+            {
+                outRect = pr;
+                return true;
+            }
+        }
+    }
+
     if (st.hostWindows.empty())
         return false;
 
-    VARIANT vtList;
-    VariantInit(&vtList);
-    vtList.vt = VT_I4;
-    vtList.lVal = UIA_ListControlTypeId;
-    IUIAutomationCondition *pCondList = nullptr;
-    m_uia->CreatePropertyCondition(UIA_ControlTypePropertyId, vtList, &pCondList);
-    VariantClear(&vtList);
-    if (!pCondList)
-        return false;
-
+    // 2. 全屏透明 CoreWindow 情况：走 UIA 依次探测 List / ListItem 并集 / Pane
     bool found = false;
+    int lastListLen = -1;
+    int lastItemLen = -1;
+    PixelRect lastWinRc{};
     for (HWND hwnd : st.hostWindows)
     {
+        RECT wrc{};
+        GetWindowRect(hwnd, &wrc);
+        lastWinRc = ToPixelRect(wrc);
+        int32_t mw = 1920, mh = 1080;
+        GetMonitorSizeForRect(lastWinRc, mw, mh);
+
         IUIAutomationElement *pRoot = nullptr;
         if (FAILED(m_uia->ElementFromHandle(hwnd, &pRoot)) || !pRoot)
             continue;
 
-        IUIAutomationElementArray *pArr = nullptr;
-        if (SUCCEEDED(pRoot->FindAll(TreeScope_Descendants, pCondList, &pArr)) && pArr)
-        {
-            int len = 0;
-            pArr->get_Length(&len);
-            for (int i = 0; i < len; ++i)
-            {
-                IUIAutomationElement *pItem = nullptr;
-                if (FAILED(pArr->GetElement(i, &pItem)) || !pItem)
-                    continue;
-                BOOL offscreen = TRUE;
-                RECT rc{};
-                if (SUCCEEDED(pItem->get_CurrentIsOffscreen(&offscreen)) && !offscreen &&
-                    SUCCEEDED(pItem->get_CurrentBoundingRectangle(&rc)))
-                {
-                    int32_t w = rc.right - rc.left;
-                    int32_t h = rc.bottom - rc.top;
-                    if (w >= 40 && w <= 900 && h >= 20 && h <= 260)
-                    {
-                        outRect = PixelRect{rc.left, rc.top, rc.right, rc.bottom};
-                        found = true;
-                    }
-                }
-                pItem->Release();
-                if (found)
-                    break;
-            }
-            pArr->Release();
-        }
+        if (TryFindUiaRectByType(m_uia, pRoot, UIA_ListControlTypeId, true, mw, mh, outRect, &lastListLen))
+            found = true;
+        else if (TryFindUiaCandidateItemsUnion(m_uia, pRoot, mw, mh, outRect, &lastItemLen))
+            found = true;
+        else if (TryFindUiaRectByType(m_uia, pRoot, UIA_ListControlTypeId, false, mw, mh, outRect))
+            found = true;
+        else if (TryFindUiaRectByType(m_uia, pRoot, UIA_PaneControlTypeId, true, mw, mh, outRect))
+            found = true;
+
         pRoot->Release();
         if (found)
             break;
     }
-    pCondList->Release();
+
+    if (!found)
+    {
+        static std::set<std::string> reportedImeMiss;
+        char buf[160];
+        std::snprintf(buf, sizeof(buf), "hosts=%zu win=(%d,%d,%dx%d) lists=%d items=%d",
+                      st.hostWindows.size(),
+                      lastWinRc.left, lastWinRc.top, lastWinRc.Width(), lastWinRc.Height(),
+                      lastListLen, lastItemLen);
+        if (reportedImeMiss.insert(buf).second)
+            Logger::Get().Debug("[文本光标] TextInputHost 未取到候选框：", buf);
+    }
     return found;
 }
 
@@ -1565,8 +1751,9 @@ ProbeStatus IMECaretProvider::Probe(const CaretContextSnapshot &ctx,
     const PixelRect &imeRc = (overrideImeRect && !overrideImeRect->IsEmpty())
                                  ? *overrideImeRect
                                  : ctx.imeWindowRect;
-    if (imeRc.IsEmpty() || imeRc.Width() < 20 || imeRc.Height() < 14 ||
-        imeRc.Width() > 900 || imeRc.Height() > 280)
+    int32_t monW = 1920, monH = 1080;
+    GetMonitorSizeForRect(imeRc, monW, monH);
+    if (!IsCandidateWindowRectValid(imeRc, monW, monH))
         return ProbeStatus::Miss;
 
     // 根据候选窗在屏幕中的位置判断其位于输入行下方（常规）还是上方（贴近屏幕底部时上翻）
