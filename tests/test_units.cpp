@@ -448,6 +448,51 @@ static void TestCaretPublishAndProtocol()
     CHECK(Json::GetBool(R"({"proto_ver":1})", "caret_ext", false) == false);
 }
 
+static void TestUiaFocusResolutionAndValidationBounds()
+{
+    using namespace Caret;
+
+    // Avalonia 类名归入自绘宿主与懒加载无障碍唤醒集合
+    CHECK(IsLazyAccessibilityClass(L"Avalonia-abc123"));
+    CHECK(IsKnownSelfDrawnHostClass(L"Avalonia-abc123"));
+
+    // 内部 Text / 无 Pattern 的 Custom 应触发向上查 1 层父控件
+    CHECK(ShouldProbeUiaParent(UiaIds::Text, false, false, false, false));
+    CHECK(!ShouldProbeUiaParent(UiaIds::Text, false, true, false, false));
+    CHECK(ShouldProbeUiaParent(UiaIds::Custom, false, false, false, false));
+    CHECK(!ShouldProbeUiaParent(UiaIds::Custom, true, false, false, false));
+    CHECK(!ShouldProbeUiaParent(UiaIds::Edit, false, false, false, false));
+
+    // 容器（Window / Pane / 无 Pattern 的 Custom）应触发向下找聚焦输入子节点
+    CHECK(ShouldSearchUiaFocusedDescendant(UiaIds::Window, false, false, false, false));
+    CHECK(ShouldSearchUiaFocusedDescendant(UiaIds::Pane, false, false, false, false));
+    CHECK(ShouldSearchUiaFocusedDescendant(UiaIds::Custom, false, false, false, false));
+    CHECK(!ShouldSearchUiaFocusedDescendant(UiaIds::Custom, true, false, false, false));
+    CHECK(!ShouldSearchUiaFocusedDescendant(UiaIds::Edit, false, false, false, false));
+
+    // ControlBox 类型判定
+    CHECK(IsUiaEditableControlBoxType(UiaIds::Edit, false, false, true, false, false, false));
+    CHECK(!IsUiaEditableControlBoxType(UiaIds::Edit, false, false, false, false, false, false));
+    CHECK(IsUiaEditableControlBoxType(UiaIds::Custom, false, false, true, true, false, false));
+    CHECK(IsUiaEditableControlBoxType(UiaIds::Custom, false, false, true, false, true, false));
+    CHECK(!IsUiaEditableControlBoxType(UiaIds::Custom, true, false, true, true, false, false));
+    CHECK(!IsUiaEditableControlBoxType(UiaIds::Custom, false, true, true, true, false, false));
+
+    // 1x1 helper focusWindowRect 不得把有效前景窗口矩形盖掉
+    PixelRect tinyHelper{0, 0, 1, 1};
+    PixelRect fgRect{200, 150, 900, 750};
+    PixelRect boxRect{350, 420, 720, 452};
+    PixelRect chosen = SelectValidationWindowBound(tinyHelper, fgRect, boxRect);
+    CHECK(chosen.left == fgRect.left && chosen.top == fgRect.top &&
+          chosen.right == fgRect.right && chosen.bottom == fgRect.bottom);
+
+    // 若 focusWindowRect 与 candidate 不相交而 fgRect 包含 candidate，应回退 fgRect
+    PixelRect subPane{210, 160, 400, 300};
+    chosen = SelectValidationWindowBound(subPane, fgRect, boxRect);
+    CHECK(chosen.left == fgRect.left && chosen.top == fgRect.top &&
+          chosen.right == fgRect.right && chosen.bottom == fgRect.bottom);
+}
+
 int main()
 {
     std::printf("=== moonlight-sideband 单元测试 ===\n");
@@ -463,6 +508,7 @@ int main()
     TestWin32BlinkGrace();
     TestNewlineAndAffinityCache();
     TestCaretPublishAndProtocol();
+    TestUiaFocusResolutionAndValidationBounds();
 
     std::printf("=== %d 项检查, %d 项失败 ===\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

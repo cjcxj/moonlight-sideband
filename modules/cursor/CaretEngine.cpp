@@ -1,4 +1,5 @@
 #include "CaretEngine.hpp"
+#include "Logger.hpp"
 
 #include <array>
 
@@ -50,9 +51,8 @@ bool CaretEngine::ValidateResult(const CaretContextSnapshot &ctx,
         };
     }
 
-    const PixelRect &winBound = !ctx.focusWindowRect.IsEmpty()
-                                    ? ctx.focusWindowRect
-                                    : ctx.foregroundWindowRect;
+    const PixelRect winBound = SelectValidationWindowBound(
+        ctx.focusWindowRect, ctx.foregroundWindowRect, res.rect);
     const bool isControlBox = (res.source == SidebandProtocol::CARET_SOURCE_CONTROL_BOX);
     const bool isImeAnchor = (res.source == SidebandProtocol::CARET_SOURCE_IME_ANCHOR);
 
@@ -220,6 +220,22 @@ CaretEngine::DetectOutput CaretEngine::DetectAndEvaluate(const CaretContextSnaps
             bestResult = std::move(controlBoxFallback);
             bestMonitor = monRc;
             bestHasMonitor = hasMon;
+            if (!m_options.allowControlBoxForLegacy)
+            {
+                static bool s_loggedBlockedBox = false;
+                if (!s_loggedBlockedBox)
+                {
+                    s_loggedBlockedBox = true;
+                    Logger::Get().Warning("CaretEngine: 已命中输入框矩形(ControlBox)，但 moonlight_sideband.ini 中 caret_allow_control_box=false 拦截了老协议推送");
+                }
+            }
+        }
+        else
+        {
+            Logger::Get().Debug("[文本光标] ControlBox 校验未通过 rect=(",
+                                controlBoxFallback.rect.left, ",", controlBoxFallback.rect.top, ",",
+                                controlBoxFallback.rect.right, ",", controlBoxFallback.rect.bottom,
+                                ") hasMon=", hasMon ? 1 : 0);
         }
     }
 

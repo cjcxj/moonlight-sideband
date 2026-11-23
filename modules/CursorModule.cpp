@@ -559,7 +559,10 @@ bool CursorModule::Start()
     m_textCursorThread = std::thread([this]()
                                      { TextCursorMonitorLoop(); });
 
-    Logger::Get().Info("CursorModule: 已启动");
+    Logger::Get().Info("CursorModule: 已启动 (ime_fallback=",
+                       (m_allowImeFallback ? "true" : "false"),
+                       ", control_box=",
+                       (m_allowControlBoxForLegacy ? "true" : "false"), ")");
     return true;
 }
 

@@ -105,7 +105,8 @@ inline bool IsLazyAccessibilityClass(std::wstring_view cls)
     if (IsBrowserOrWebViewClass(cls))
         return true;
     return StartsWithCaseInsensitive(cls, L"Qt") ||
-           ContainsCaseInsensitive(cls, L"QWindow");
+           ContainsCaseInsensitive(cls, L"QWindow") ||
+           StartsWithCaseInsensitive(cls, L"Avalonia");
 }
 
 inline bool IsKnownSelfDrawnHostClass(std::wstring_view cls)
@@ -114,6 +115,7 @@ inline bool IsKnownSelfDrawnHostClass(std::wstring_view cls)
         return true;
     return StartsWithCaseInsensitive(cls, L"Qt") ||
            ContainsCaseInsensitive(cls, L"QWindow") ||
+           StartsWithCaseInsensitive(cls, L"Avalonia") ||
            cls == L"SDL_app" ||
            StartsWithCaseInsensitive(cls, L"GLFW") ||
            cls == L"UnityWndClass" ||
@@ -204,6 +206,111 @@ inline bool IsCaretRectReasonable(const PixelRect &screenRect,
     }
 
     return true;
+}
+
+// ============================================================
+// 2b. UIA 元素归一化与窗口边界选择辅助（与 Windows SDK 常量解耦）
+// ============================================================
+
+namespace UiaIds {
+constexpr int32_t ComboBox = 50003;
+constexpr int32_t Edit     = 50004;
+constexpr int32_t List     = 50008;
+constexpr int32_t Tab      = 50018;
+constexpr int32_t Text     = 50020;
+constexpr int32_t ToolBar  = 50021;
+constexpr int32_t Tree     = 50023;
+constexpr int32_t Custom   = 50025;
+constexpr int32_t Group    = 50026;
+constexpr int32_t Document = 50030;
+constexpr int32_t Window   = 50032;
+constexpr int32_t Pane     = 50033;
+} // namespace UiaIds
+
+// 内部文本渲染节点（如 Avalonia TextPresenter / WPF 嵌套 TextBlock）拿到焦点时，向上看 1 层父控件
+inline bool ShouldProbeUiaParent(int32_t ctlType, bool hasVP, bool hasTP, bool hasTP2, bool hasTE)
+{
+    if (ctlType == UiaIds::Text)
+        return !hasTP && !hasTP2 && !hasTE;
+    if (ctlType == UiaIds::Custom)
+        return !hasVP && !hasTP && !hasTP2 && !hasTE;
+    return false;
+}
+
+// 焦点落在容器节点（如 Avalonia TopLevel Window / WPF UserControl/Pane）时，向下查找带键盘焦点的输入子节点
+inline bool ShouldSearchUiaFocusedDescendant(int32_t ctlType, bool hasVP, bool hasTP, bool hasTP2, bool hasTE)
+{
+    if (ctlType == UiaIds::Edit || ctlType == UiaIds::ComboBox || ctlType == UiaIds::Document)
+        return false;
+    if (hasTP2 || hasTP || hasTE)
+        return false;
+    if (ctlType == UiaIds::Custom && hasVP)
+        return false;
+    return ctlType == UiaIds::Window ||
+           ctlType == UiaIds::Pane ||
+           ctlType == UiaIds::Group ||
+           ctlType == UiaIds::Custom ||
+           ctlType == UiaIds::Tab ||
+           ctlType == UiaIds::ToolBar ||
+           ctlType == UiaIds::List ||
+           ctlType == UiaIds::Tree ||
+           ctlType == -1;
+}
+
+inline bool IsUiaEditableControlBoxType(int32_t ctlType,
+                                        bool isBrowserCtx,
+                                        bool isReadOnly,
+                                        bool isEnabled,
+                                        bool hasVP,
+                                        bool hasTP,
+                                        bool hasTP2)
+{
+    if (!isEnabled)
+        return false;
+    if (ctlType == UiaIds::Edit || ctlType == UiaIds::ComboBox)
+        return true;
+    if (!isBrowserCtx && !isReadOnly)
+    {
+        if (ctlType == UiaIds::Document)
+            return true;
+        if (ctlType == UiaIds::Custom && (hasVP || hasTP || hasTP2))
+            return true;
+    }
+    return false;
+}
+
+// 避免 tiny/隐藏子焦点窗（如 1x1 helper HWND）把有效控件矩形误杀
+inline PixelRect SelectValidationWindowBound(const PixelRect &focusWinRect,
+                                             const PixelRect &fgWinRect,
+                                             const PixelRect &candidateRect)
+{
+    const bool focusUsable = !focusWinRect.IsEmpty() &&
+                             focusWinRect.Width() >= 32 &&
+                             focusWinRect.Height() >= 16;
+    const bool fgUsable = !fgWinRect.IsEmpty() &&
+                          fgWinRect.Width() >= 32 &&
+                          fgWinRect.Height() >= 16;
+
+    if (!focusUsable)
+        return fgUsable ? fgWinRect : focusWinRect;
+
+    if (fgUsable && !candidateRect.IsEmpty())
+    {
+        constexpr int32_t kTol = 48;
+        const bool inFocus =
+            candidateRect.bottom >= focusWinRect.top - kTol &&
+            candidateRect.top <= focusWinRect.bottom + kTol &&
+            candidateRect.right >= focusWinRect.left - kTol &&
+            candidateRect.left <= focusWinRect.right + kTol;
+        const bool inFg =
+            candidateRect.bottom >= fgWinRect.top - kTol &&
+            candidateRect.top <= fgWinRect.bottom + kTol &&
+            candidateRect.right >= fgWinRect.left - kTol &&
+            candidateRect.left <= fgWinRect.right + kTol;
+        if (!inFocus && inFg)
+            return fgWinRect;
+    }
+    return focusWinRect;
 }
 
 // ============================================================

@@ -320,6 +320,23 @@ bool TryGetCachedControlRect(IUIAutomationElement *el, PixelRect &outRect)
     return ok;
 }
 
+bool TryGetControlRect(IUIAutomationElement *el, PixelRect &outRect)
+{
+    if (!el)
+        return false;
+    if (TryGetCachedControlRect(el, outRect))
+        return true;
+
+    RECT rc{};
+    if (SUCCEEDED(el->get_CurrentBoundingRectangle(&rc)) &&
+        rc.right > rc.left && rc.bottom > rc.top)
+    {
+        outRect = ToPixelRect(rc);
+        return !outRect.IsEmpty();
+    }
+    return false;
+}
+
 int GetCachedIntProp(IUIAutomationElement *el, PROPERTYID propId, int fallback)
 {
     VARIANT vt;
@@ -351,6 +368,131 @@ std::wstring GetCachedStringProp(IUIAutomationElement *el, PROPERTYID propId)
         res.assign(vt.bstrVal, SysStringLen(vt.bstrVal));
     VariantClear(&vt);
     return res;
+}
+
+struct UiaElementProps {
+    int ctlType = -1;
+    bool isPassword = false;
+    bool isReadOnly = false;
+    bool isEnabled = true;
+    bool hasKbFocus = false;
+    std::wstring uiaClass;
+    PixelRect controlRect{};
+    bool hasControlRect = false;
+    bool hasTP2 = false;
+    bool hasTP = false;
+    bool hasVP = false;
+    bool hasTE = false;
+};
+
+UiaElementProps ReadUiaElementProps(IUIAutomationElement *el, bool hasCache, bool defaultPassword)
+{
+    UiaElementProps p;
+    p.isPassword = defaultPassword;
+    if (!el)
+        return p;
+
+    if (hasCache)
+    {
+        p.ctlType = GetCachedIntProp(el, UIA_ControlTypePropertyId, -1);
+        p.isPassword = p.isPassword || GetCachedBoolProp(el, UIA_IsPasswordPropertyId, false);
+        p.isReadOnly = GetCachedBoolProp(el, UIA_ValueIsReadOnlyPropertyId, false);
+        p.isEnabled = GetCachedBoolProp(el, UIA_IsEnabledPropertyId, true);
+        p.hasKbFocus = GetCachedBoolProp(el, UIA_HasKeyboardFocusPropertyId, false);
+        p.uiaClass = GetCachedStringProp(el, UIA_ClassNamePropertyId);
+        p.hasControlRect = TryGetControlRect(el, p.controlRect);
+        p.hasTP2 = GetCachedBoolProp(el, UIA_IsTextPattern2AvailablePropertyId, false);
+        p.hasTP = GetCachedBoolProp(el, UIA_IsTextPatternAvailablePropertyId, false);
+        p.hasVP = GetCachedBoolProp(el, UIA_IsValuePatternAvailablePropertyId, false);
+#ifdef UIA_IsTextEditPatternAvailablePropertyId
+        p.hasTE = GetCachedBoolProp(el, UIA_IsTextEditPatternAvailablePropertyId, false);
+#endif
+    }
+    else
+    {
+        VARIANT vt;
+        VariantInit(&vt);
+        if (SUCCEEDED(el->GetCurrentPropertyValue(UIA_ControlTypePropertyId, &vt)) && vt.vt == VT_I4)
+            p.ctlType = vt.lVal;
+        VariantClear(&vt);
+        p.hasControlRect = TryGetControlRect(el, p.controlRect);
+        p.hasTP2 = true;
+        p.hasTP = true;
+#ifdef UIA_TextEditPatternId
+        p.hasTE = true;
+#endif
+    }
+    return p;
+}
+
+IUIAutomationCondition *CreateBoolPropCond(IUIAutomation *uia, PROPERTYID propId, bool val)
+{
+    if (!uia)
+        return nullptr;
+    VARIANT vt;
+    VariantInit(&vt);
+    vt.vt = VT_BOOL;
+    vt.boolVal = val ? VARIANT_TRUE : VARIANT_FALSE;
+    IUIAutomationCondition *cond = nullptr;
+    uia->CreatePropertyCondition(propId, vt, &cond);
+    VariantClear(&vt);
+    return cond;
+}
+
+IUIAutomationCondition *CreateIntPropCond(IUIAutomation *uia, PROPERTYID propId, int val)
+{
+    if (!uia)
+        return nullptr;
+    VARIANT vt;
+    VariantInit(&vt);
+    vt.vt = VT_I4;
+    vt.lVal = val;
+    IUIAutomationCondition *cond = nullptr;
+    uia->CreatePropertyCondition(propId, vt, &cond);
+    VariantClear(&vt);
+    return cond;
+}
+
+IUIAutomationCondition *OrCondTake(IUIAutomation *uia, IUIAutomationCondition *a, IUIAutomationCondition *b)
+{
+    if (!a)
+        return b;
+    if (!b)
+        return a;
+    IUIAutomationCondition *res = nullptr;
+    uia->CreateOrCondition(a, b, &res);
+    a->Release();
+    b->Release();
+    return res;
+}
+
+IUIAutomationCondition *AndCondTake(IUIAutomation *uia, IUIAutomationCondition *a, IUIAutomationCondition *b)
+{
+    if (!a || !b)
+    {
+        if (a) a->Release();
+        if (b) b->Release();
+        return nullptr;
+    }
+    IUIAutomationCondition *res = nullptr;
+    uia->CreateAndCondition(a, b, &res);
+    a->Release();
+    b->Release();
+    return res;
+}
+
+std::string WideToAsciiLossy(std::wstring_view ws)
+{
+    std::string out;
+    out.reserve(ws.size());
+    for (wchar_t ch : ws)
+    {
+        if (ch >= 0x20 && ch < 0x7F)
+            out.push_back(static_cast<char>(ch));
+        else
+            out.push_back('?');
+    }
+    return out;
 }
 
 } // namespace
@@ -757,6 +899,16 @@ UIACaretProvider::~UIACaretProvider()
 
 void UIACaretProvider::Shutdown()
 {
+    if (m_focusedInputCond)
+    {
+        m_focusedInputCond->Release();
+        m_focusedInputCond = nullptr;
+    }
+    if (m_controlWalker)
+    {
+        m_controlWalker->Release();
+        m_controlWalker = nullptr;
+    }
     if (m_cacheReq)
     {
         m_cacheReq->Release();
@@ -829,6 +981,8 @@ bool UIACaretProvider::EnsureInitialized()
         m_cacheReq->AddProperty(UIA_ClassNamePropertyId);
         m_cacheReq->AddProperty(UIA_IsPasswordPropertyId);
         m_cacheReq->AddProperty(UIA_ValueIsReadOnlyPropertyId);
+        m_cacheReq->AddProperty(UIA_IsEnabledPropertyId);
+        m_cacheReq->AddProperty(UIA_HasKeyboardFocusPropertyId);
         m_cacheReq->AddProperty(UIA_BoundingRectanglePropertyId);
         m_cacheReq->AddProperty(UIA_IsTextPattern2AvailablePropertyId);
         m_cacheReq->AddProperty(UIA_IsTextPatternAvailablePropertyId);
@@ -837,6 +991,22 @@ bool UIACaretProvider::EnsureInitialized()
         m_cacheReq->AddProperty(UIA_IsTextEditPatternAvailablePropertyId);
 #endif
     }
+
+    m_uia->get_ControlViewWalker(&m_controlWalker);
+
+    // 预构建聚焦输入控件查询条件，供 Avalonia / WPF 容器拿到焦点时向下查找
+    IUIAutomationCondition *inputKinds = nullptr;
+    inputKinds = OrCondTake(m_uia, inputKinds, CreateIntPropCond(m_uia, UIA_ControlTypePropertyId, UIA_EditControlTypeId));
+    inputKinds = OrCondTake(m_uia, inputKinds, CreateIntPropCond(m_uia, UIA_ControlTypePropertyId, UIA_DocumentControlTypeId));
+    inputKinds = OrCondTake(m_uia, inputKinds, CreateIntPropCond(m_uia, UIA_ControlTypePropertyId, UIA_ComboBoxControlTypeId));
+    inputKinds = OrCondTake(m_uia, inputKinds, CreateBoolPropCond(m_uia, UIA_IsValuePatternAvailablePropertyId, true));
+    inputKinds = OrCondTake(m_uia, inputKinds, CreateBoolPropCond(m_uia, UIA_IsTextPatternAvailablePropertyId, true));
+    inputKinds = OrCondTake(m_uia, inputKinds, CreateBoolPropCond(m_uia, UIA_IsTextPattern2AvailablePropertyId, true));
+
+    IUIAutomationCondition *kbCond = CreateBoolPropCond(m_uia, UIA_HasKeyboardFocusPropertyId, true);
+    IUIAutomationCondition *enCond = CreateBoolPropCond(m_uia, UIA_IsEnabledPropertyId, true);
+    IUIAutomationCondition *kbEnCond = AndCondTake(m_uia, kbCond, enCond);
+    m_focusedInputCond = AndCondTake(m_uia, kbEnCond, inputKinds);
 
     Logger::Get().Info("CaretEngine: UIA (CUIAutomation8) 初始化成功");
     return true;
@@ -931,48 +1101,108 @@ ProbeStatus UIACaretProvider::Probe(const CaretContextSnapshot &ctx,
                      ? m_uia->GetFocusedElementBuildCache(m_cacheReq, &pFocus)
                      : m_uia->GetFocusedElement(&pFocus);
 
-    if (FAILED(hr) || !pFocus)
+    if ((FAILED(hr) || !pFocus) &&
+        (hr == static_cast<HRESULT>(0x8001011FL) || hr == static_cast<HRESULT>(0x800705B4L)))
     {
-        if (hr == static_cast<HRESULT>(0x8001011FL) || hr == static_cast<HRESULT>(0x800705B4L))
-            return ProbeStatus::HardFailure;
+        return ProbeStatus::HardFailure;
+    }
+
+    if (!pFocus)
+    {
+        MaybeWakeBrowserAccessibility(ctx, L"", affinityEntry);
+        HWND targetHwnd = reinterpret_cast<HWND>(ctx.focusedWindow ? ctx.focusedWindow : ctx.foregroundWindow);
+        if (targetHwnd && IsWindow(targetHwnd))
+        {
+            HRESULT hrRoot = m_cacheReq
+                                 ? m_uia->ElementFromHandleBuildCache(targetHwnd, m_cacheReq, &pFocus)
+                                 : m_uia->ElementFromHandle(targetHwnd, &pFocus);
+            if (FAILED(hrRoot))
+                pFocus = nullptr;
+        }
+    }
+
+    if (!pFocus)
+    {
+        static std::set<std::string> reportedNull;
+        char buf[192];
+        std::snprintf(buf, sizeof(buf), "hr=0x%08lX top=%s foc=%s",
+                      static_cast<unsigned long>(hr),
+                      WideToAsciiLossy(ctx.topClassName).c_str(),
+                      WideToAsciiLossy(ctx.focusClassName).c_str());
+        if (reportedNull.insert(buf).second)
+            Logger::Get().Debug("[文本光标] UIA GetFocusedElement 为空：", buf);
         return ProbeStatus::Miss;
     }
 
-    int ctlType = -1;
-    bool isPassword = ctx.isFocusPasswordStyle;
-    bool isReadOnly = false;
-    std::wstring uiaClass;
-    PixelRect controlRect{};
-    bool hasControlRect = false;
-    bool hasTP2 = true;
-    bool hasTP = true;
-    bool hasVP = false;
-#ifdef UIA_TextEditPatternId
-    bool hasTE = true;
-#endif
+    UiaElementProps props = ReadUiaElementProps(pFocus, m_cacheReq != nullptr, ctx.isFocusPasswordStyle);
 
-    if (m_cacheReq)
+    // 1) 若焦点落在了 TextBox 内部子元素（如 Avalonia TextPresenter / WPF 内嵌文本层），向上看 1 层父元素
+    if (m_controlWalker && m_cacheReq &&
+        ShouldProbeUiaParent(props.ctlType, props.hasVP, props.hasTP, props.hasTP2, props.hasTE))
     {
-        ctlType = GetCachedIntProp(pFocus, UIA_ControlTypePropertyId, -1);
-        isPassword = isPassword || GetCachedBoolProp(pFocus, UIA_IsPasswordPropertyId, false);
-        isReadOnly = GetCachedBoolProp(pFocus, UIA_ValueIsReadOnlyPropertyId, false);
-        uiaClass = GetCachedStringProp(pFocus, UIA_ClassNamePropertyId);
-        hasControlRect = TryGetCachedControlRect(pFocus, controlRect);
-        hasTP2 = GetCachedBoolProp(pFocus, UIA_IsTextPattern2AvailablePropertyId, false);
-        hasTP = GetCachedBoolProp(pFocus, UIA_IsTextPatternAvailablePropertyId, false);
-        hasVP = GetCachedBoolProp(pFocus, UIA_IsValuePatternAvailablePropertyId, false);
-#ifdef UIA_IsTextEditPatternAvailablePropertyId
-        hasTE = GetCachedBoolProp(pFocus, UIA_IsTextEditPatternAvailablePropertyId, false);
+        IUIAutomationElement *pParent = nullptr;
+        if (SUCCEEDED(m_controlWalker->GetParentElementBuildCache(pFocus, m_cacheReq, &pParent)) && pParent)
+        {
+            UiaElementProps parentProps = ReadUiaElementProps(pParent, true, ctx.isFocusPasswordStyle);
+            const bool parentUseful =
+                parentProps.hasTP2 || parentProps.hasTP || parentProps.hasTE ||
+                IsUiaEditableControlBoxType(parentProps.ctlType, false, parentProps.isReadOnly,
+                                            parentProps.isEnabled, parentProps.hasVP,
+                                            parentProps.hasTP, parentProps.hasTP2);
+            if (parentUseful)
+            {
+                pFocus->Release();
+                pFocus = pParent;
+                props = std::move(parentProps);
+            }
+            else
+            {
+                pParent->Release();
+            }
+        }
+    }
+
+    // 2) 若焦点落在了窗口/容器（如 Avalonia TopLevel / WPF UserControl 壳），向下找带键盘焦点的输入子节点
+    if (m_focusedInputCond && m_cacheReq &&
+        ShouldSearchUiaFocusedDescendant(props.ctlType, props.hasVP, props.hasTP, props.hasTP2, props.hasTE))
+    {
+        IUIAutomationElement *pDesc = nullptr;
+        HRESULT hrFind = pFocus->FindFirstBuildCache(TreeScope_Descendants, m_focusedInputCond, m_cacheReq, &pDesc);
+        if ((FAILED(hrFind) || !pDesc) &&
+            ctx.foregroundWindow != 0 && ctx.foregroundWindow != ctx.focusedWindow)
+        {
+            HWND fgHwnd = reinterpret_cast<HWND>(ctx.foregroundWindow);
+            if (IsWindow(fgHwnd))
+            {
+                IUIAutomationElement *pFgRoot = nullptr;
+                if (SUCCEEDED(m_uia->ElementFromHandleBuildCache(fgHwnd, m_cacheReq, &pFgRoot)) && pFgRoot)
+                {
+                    pFgRoot->FindFirstBuildCache(TreeScope_Descendants, m_focusedInputCond, m_cacheReq, &pDesc);
+                    pFgRoot->Release();
+                }
+            }
+        }
+        if (pDesc)
+        {
+            pFocus->Release();
+            pFocus = pDesc;
+            props = ReadUiaElementProps(pFocus, true, ctx.isFocusPasswordStyle);
+        }
+    }
+
+    const int ctlType = props.ctlType;
+    const bool isPassword = props.isPassword;
+    const bool isReadOnly = props.isReadOnly;
+    const bool isEnabled = props.isEnabled;
+    const std::wstring &uiaClass = props.uiaClass;
+    const PixelRect &controlRect = props.controlRect;
+    const bool hasControlRect = props.hasControlRect;
+    const bool hasTP2 = props.hasTP2;
+    const bool hasTP = props.hasTP;
+    const bool hasVP = props.hasVP;
+#ifdef UIA_TextEditPatternId
+    const bool hasTE = props.hasTE;
 #endif
-    }
-    else
-    {
-        VARIANT vt;
-        VariantInit(&vt);
-        if (SUCCEEDED(pFocus->GetCurrentPropertyValue(UIA_ControlTypePropertyId, &vt)) && vt.vt == VT_I4)
-            ctlType = vt.lVal;
-        VariantClear(&vt);
-    }
 
     bool ok = false;
     bool isComposition = false;
@@ -1100,30 +1330,27 @@ ProbeStatus UIACaretProvider::Probe(const CaretContextSnapshot &ctx,
         }
     }
 
-    // 4. 输入控件矩形兜底（ControlBox，不伪装为精确光标；覆盖空 WPF/Avalonia TextBox、PasswordBox 及自定义可编辑控件）
+    // 4. 输入控件矩形兜底（ControlBox，覆盖空 WPF/Avalonia TextBox、PasswordBox 及自定义可编辑控件）
     const bool isBrowserCtx = IsBrowserOrWebViewClass(ctx.focusClassName) ||
                               IsBrowserOrWebViewClass(ctx.topClassName) ||
                               IsBrowserOrWebViewClass(uiaClass);
-    const bool editableControlType =
-        (ctlType == UIA_EditControlTypeId) ||
-        (ctlType == UIA_ComboBoxControlTypeId) ||
-        (!isBrowserCtx && !isReadOnly &&
-         (ctlType == UIA_DocumentControlTypeId ||
-          (ctlType == UIA_CustomControlTypeId && hasVP)));
+    const bool editableControlType = IsUiaEditableControlBoxType(
+        ctlType, isBrowserCtx, isReadOnly, isEnabled, hasVP, hasTP, hasTP2);
 
+    bool boxValid = false;
     if (!ok && outControlBoxFallback && editableControlType &&
         hasControlRect && !controlRect.IsEmpty())
     {
         PixelRect boxRect{};
-        bool boxValid = false;
         const int32_t ch = controlRect.Height();
-        if (ch >= 14 && ch <= 110)
+        if (ch >= 12 && ch <= 140)
         {
             boxRect = controlRect;
             boxValid = true;
         }
-        else if (ch > 110 && ch <= 900 && !isBrowserCtx && !isReadOnly &&
-                 (ctlType == UIA_EditControlTypeId || ctlType == UIA_DocumentControlTypeId))
+        else if (ch > 140 && ch <= 900 && !isBrowserCtx && !isReadOnly &&
+                 (ctlType == UIA_EditControlTypeId || ctlType == UIA_DocumentControlTypeId ||
+                  ctlType == UIA_CustomControlTypeId))
         {
             // 多行空文本框（如 WPF/Avalonia 空置多行输入框，TextPattern 无字符可返回）：估算首行输入区域
             boxRect = PixelRect{
@@ -1141,7 +1368,7 @@ ProbeStatus UIACaretProvider::Probe(const CaretContextSnapshot &ctx,
             box.rect = boxRect;
             box.controlRect = controlRect;
             box.hasControlRect = true;
-            box.hwnd = ctx.focusedWindow;
+            box.hwnd = ctx.focusedWindow ? ctx.focusedWindow : ctx.foregroundWindow;
             box.processId = ctx.processId;
             box.threadId = ctx.threadId;
             box.source = SidebandProtocol::CARET_SOURCE_CONTROL_BOX;
@@ -1158,7 +1385,7 @@ ProbeStatus UIACaretProvider::Probe(const CaretContextSnapshot &ctx,
 
     if (!ok)
     {
-        // 若是 Chromium/Electron/WebView/Qt 宿主，尝试发送 WM_GETOBJECT(OBJID_CLIENT) 唤醒惰性无障碍树
+        // 若是 Chromium/Electron/WebView/Qt/Avalonia 宿主，尝试发送 WM_GETOBJECT(OBJID_CLIENT) 唤醒惰性无障碍树
         if (IsLazyAccessibilityClass(ctx.focusClassName) ||
             IsLazyAccessibilityClass(ctx.topClassName) ||
             IsLazyAccessibilityClass(uiaClass))
@@ -1166,18 +1393,28 @@ ProbeStatus UIACaretProvider::Probe(const CaretContextSnapshot &ctx,
             MaybeWakeBrowserAccessibility(ctx, uiaClass, affinityEntry);
         }
 
-        static std::set<std::string> reported;
-        char key[96];
-#ifdef UIA_TextEditPatternId
-        const int teFlag = hasTE ? 1 : 0;
-#else
-        const int teFlag = 0;
-#endif
-        std::snprintf(key, sizeof(key), "ctl=%d tp2=%d tp=%d te=%d",
-                      ctlType, hasTP2 ? 1 : 0, hasTP ? 1 : 0, teFlag);
-        if (reported.insert(key).second)
+        if (!boxValid)
         {
-            Logger::Get().Debug("[文本光标] UIA 未取到精确 caret：", key);
+            static std::set<std::string> reported;
+            char key[256];
+#ifdef UIA_TextEditPatternId
+            const int teFlag = hasTE ? 1 : 0;
+#else
+            const int teFlag = 0;
+#endif
+            std::snprintf(key, sizeof(key),
+                          "top=%s uia=%s ctl=%d tp2=%d tp=%d te=%d vp=%d ro=%d en=%d rect=%d(%dx%d)",
+                          WideToAsciiLossy(ctx.topClassName).c_str(),
+                          WideToAsciiLossy(uiaClass).c_str(),
+                          ctlType, hasTP2 ? 1 : 0, hasTP ? 1 : 0, teFlag,
+                          hasVP ? 1 : 0, isReadOnly ? 1 : 0, isEnabled ? 1 : 0,
+                          hasControlRect ? 1 : 0,
+                          hasControlRect ? controlRect.Width() : 0,
+                          hasControlRect ? controlRect.Height() : 0);
+            if (reported.insert(key).second)
+            {
+                Logger::Get().Debug("[文本光标] UIA 未取到 caret：", key);
+            }
         }
         return ProbeStatus::Miss;
     }
@@ -1186,7 +1423,7 @@ ProbeStatus UIACaretProvider::Probe(const CaretContextSnapshot &ctx,
     outResult.rect = caretRect;
     outResult.controlRect = controlRect;
     outResult.hasControlRect = hasControlRect;
-    outResult.hwnd = ctx.focusedWindow;
+    outResult.hwnd = ctx.focusedWindow ? ctx.focusedWindow : ctx.foregroundWindow;
     outResult.processId = ctx.processId;
     outResult.threadId = ctx.threadId;
     outResult.source = SidebandProtocol::CARET_SOURCE_UIA;

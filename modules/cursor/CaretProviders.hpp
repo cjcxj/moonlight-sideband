@@ -21,6 +21,8 @@
 
 struct IUIAutomation;
 struct IUIAutomationCacheRequest;
+struct IUIAutomationCondition;
+struct IUIAutomationTreeWalker;
 
 namespace Caret {
 
@@ -91,6 +93,8 @@ private:
 
     IUIAutomation *m_uia = nullptr;
     IUIAutomationCacheRequest *m_cacheReq = nullptr;
+    IUIAutomationCondition *m_focusedInputCond = nullptr;
+    IUIAutomationTreeWalker *m_controlWalker = nullptr;
     bool m_comInited = false;
     bool m_broken = false;
     uint64_t m_nextRetryMs = 0;
