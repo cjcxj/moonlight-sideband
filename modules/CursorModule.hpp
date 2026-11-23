@@ -178,6 +178,8 @@ private:
     HWND m_imeHwnd = nullptr;
     uint64_t m_lastImeEventMs = 0;
     uint64_t m_lastKeyboardInputMs = 0;
+    std::atomic<uint64_t> m_lastKeyboardAtomicMs{0};
+    std::atomic<uint64_t> m_lastInactiveKbWakeMs{0};
 
     // 工作循环
     void WorkerLoop();

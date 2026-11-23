@@ -951,7 +951,8 @@ void CursorModule::TextCursorMonitorLoop()
             hint.triggeredByCaretEvent = caretEvt;
             hint.triggeredByImeEvent = imeEvt;
             hint.lastImeEventMs = lastImeMs;
-            hint.lastKeyboardInputMs = lastKbMs;
+            const uint64_t atomicKbMs = m_lastKeyboardAtomicMs.load(std::memory_order_relaxed);
+            hint.lastKeyboardInputMs = std::max(lastKbMs, atomicKbMs);
             hint.imeVisible = imeVisible;
             if (imeVisible && imeHwnd && IsWindow(imeHwnd) && IsWindowVisible(imeHwnd))
             {
@@ -1046,16 +1047,29 @@ LRESULT CALLBACK CursorModule::KeyboardProc(int nCode, WPARAM wParam, LPARAM lPa
     {
         if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)
         {
-            // 若当前在文本态直接唤醒；非文本态时仅记录按键时间（由焦点/IME WinEvent 主动唤醒，避免游戏按键空转）
+            const uint64_t nowMs = GetTickCount64();
+            s_instance->m_lastKeyboardAtomicMs.store(nowMs, std::memory_order_relaxed);
+
             if (s_instance->m_textCursorActive.load(std::memory_order_relaxed))
             {
                 s_instance->PokeTextCursor(false, true);
             }
             else if (auto *kb = reinterpret_cast<const KBDLLHOOKSTRUCT *>(lParam))
             {
-                // Tab / Enter / F6 / L 等常见切焦点键也允许触发一次低成本检查
-                if (kb->vkCode == VK_TAB || kb->vkCode == VK_RETURN || kb->vkCode == VK_F6)
+                if (kb->vkCode == VK_TAB || kb->vkCode == VK_RETURN ||
+                    kb->vkCode == VK_F6 || kb->vkCode == VK_PROCESSKEY)
+                {
                     s_instance->PokeTextCursor(false, true);
+                }
+                else
+                {
+                    const uint64_t prevWake = s_instance->m_lastInactiveKbWakeMs.load(std::memory_order_relaxed);
+                    if (nowMs >= prevWake + 200ULL)
+                    {
+                        s_instance->m_lastInactiveKbWakeMs.store(nowMs, std::memory_order_relaxed);
+                        s_instance->PokeTextCursor(false, true);
+                    }
+                }
             }
         }
     }

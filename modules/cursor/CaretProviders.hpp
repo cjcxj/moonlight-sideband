@@ -101,6 +101,7 @@ public:
     ProbeStatus Probe(const CaretContextSnapshot &ctx,
                       const CaretOptions &opts,
                       const PixelRect *overrideImeRect,
+                      bool bypassEventGate,
                       CaretResult &outResult);
 };
 

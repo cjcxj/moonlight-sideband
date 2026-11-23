@@ -100,6 +100,14 @@ inline bool IsBrowserOrWebViewClass(std::wstring_view cls)
            StartsWithCaseInsensitive(cls, L"Intermediate D3D Window");
 }
 
+inline bool IsLazyAccessibilityClass(std::wstring_view cls)
+{
+    if (IsBrowserOrWebViewClass(cls))
+        return true;
+    return StartsWithCaseInsensitive(cls, L"Qt") ||
+           ContainsCaseInsensitive(cls, L"QWindow");
+}
+
 inline bool IsKnownSelfDrawnHostClass(std::wstring_view cls)
 {
     if (IsBrowserOrWebViewClass(cls) || IsWindowsTerminalClass(cls))

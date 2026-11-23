@@ -69,6 +69,7 @@ private:
     MSAACaretProvider m_msaa;
     UIACaretProvider m_uia;
     IMECaretProvider m_ime;
+    uint64_t m_lastTextHostProbeMs = 0;
 };
 
 } // namespace Caret

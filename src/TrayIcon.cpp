@@ -22,10 +22,25 @@ constexpr UINT ID_MENU_EXIT       = 40001;
 constexpr UINT ID_MENU_AUTOSTART  = 40002;
 constexpr UINT ID_MENU_OPENLOG    = 40003;
 constexpr UINT ID_MENU_OPENCONFIG = 40004;
+constexpr UINT ID_MENU_ELEVATE    = 40005;
 
 void OpenWithShell(const std::wstring &path)
 {
     ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+bool IsCurrentProcessElevated()
+{
+    HANDLE hTok = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hTok))
+        return false;
+    TOKEN_ELEVATION elev{};
+    DWORD retLen = 0;
+    bool elevated = false;
+    if (GetTokenInformation(hTok, TokenElevation, &elev, sizeof(elev), &retLen))
+        elevated = (elev.TokenIsElevated != 0);
+    CloseHandle(hTok);
+    return elevated;
 }
 
 } // namespace
@@ -168,6 +183,14 @@ void TrayIcon::ShowContextMenu()
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING | (IsAutoStartEnabled() ? MF_CHECKED : MF_UNCHECKED),
                 ID_MENU_AUTOSTART, L"开机自启");
+    if (IsCurrentProcessElevated())
+    {
+        AppendMenuW(menu, MF_STRING | MF_GRAYED, ID_MENU_ELEVATE, L"权限: 管理员");
+    }
+    else
+    {
+        AppendMenuW(menu, MF_STRING, ID_MENU_ELEVATE, L"以管理员身份重启");
+    }
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, ID_MENU_EXIT, L"退出");
 
@@ -227,6 +250,21 @@ LRESULT CALLBACK TrayIcon::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         case ID_MENU_OPENCONFIG:
             OpenWithShell(Win32Util::GetExeDirectory() + L"moonlight_sideband.ini");
             return 0;
+        case ID_MENU_ELEVATE:
+        {
+            std::wstring exe = Win32Util::GetExePath();
+            HINSTANCE ret = ShellExecuteW(nullptr, L"runas", exe.c_str(),
+                                          L"--relaunch-wait", nullptr, SW_SHOWNORMAL);
+            if (reinterpret_cast<INT_PTR>(ret) > 32)
+            {
+                PostMessageW(hwnd, WM_CLOSE, 0, 0);
+            }
+            else
+            {
+                Logger::Get().Warning("TrayIcon: 用户取消或提权启动失败");
+            }
+            return 0;
+        }
         default:
             break;
         }

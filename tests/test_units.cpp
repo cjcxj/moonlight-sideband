@@ -262,6 +262,12 @@ static void TestCaretSanityAndClassFilters()
     CHECK(IsScintillaClass(L"Scintilla"));
     CHECK(IsClassicEditClass(L"RICHEDIT50W"));
 
+    // 惰性无障碍树唤醒范围：浏览器/WebView 之外还含 Qt 宿主（Qt 不主动建 UIA 树）
+    CHECK(IsLazyAccessibilityClass(L"Qt5152QWindowIcon"));
+    CHECK(IsLazyAccessibilityClass(L"Chrome_WidgetWin_1"));
+    CHECK(!IsLazyAccessibilityClass(L"Edit"));
+    CHECK(!IsLazyAccessibilityClass(L"WindowsForms10.EDIT.app12"));
+
     // EM_POSFROMCHAR 可问坐标的控件类：标准 Edit / RichEdit 变体 / WinForms 子类化 EDIT
     CHECK(IsEditMessageHostClass(L"Edit"));
     CHECK(IsEditMessageHostClass(L"RICHEDIT50W"));

@@ -84,18 +84,32 @@ ProbeStatus CaretEngine::RunSingleProvider(ProviderId id,
 
     case ProviderId::IME:
     {
-        ProbeStatus st = m_ime.Probe(ctx, m_options, nullptr, outResult);
-        if (st == ProbeStatus::Miss && m_options.allowImeFallback &&
-            ctx.imeVisible && ctx.lastImeEventMs > 0 &&
-            ctx.nowMs >= ctx.lastImeEventMs && (ctx.nowMs - ctx.lastImeEventMs) <= 8000ULL)
+        ProbeStatus st = m_ime.Probe(ctx, m_options, nullptr, false, outResult);
+        if (st == ProbeStatus::Miss && m_options.allowImeFallback)
         {
-            if (ctx.imeWindowRect.IsEmpty() ||
+            const bool recentIme =
+                ctx.imeVisible &&
+                ctx.lastImeEventMs > 0 &&
+                ctx.nowMs >= ctx.lastImeEventMs &&
+                (ctx.nowMs - ctx.lastImeEventMs) <= 8000ULL;
+            const bool recentKb =
+                ctx.lastKeyboardInputMs > 0 &&
+                ctx.nowMs >= ctx.lastKeyboardInputMs &&
+                (ctx.nowMs - ctx.lastKeyboardInputMs) <= 5000ULL;
+
+            const bool needHostLookup =
+                ctx.imeWindowRect.IsEmpty() ||
                 ctx.imeWindowRect.Width() > 900 ||
-                ctx.imeWindowRect.Height() > 280)
+                ctx.imeWindowRect.Height() > 280 ||
+                !recentIme;
+
+            if ((recentIme || recentKb) && needHostLookup &&
+                ctx.nowMs >= m_lastTextHostProbeMs + 120ULL)
             {
+                m_lastTextHostProbeMs = ctx.nowMs;
                 PixelRect hostImeRc{};
                 if (m_uia.FindImeCandidateRect(hostImeRc))
-                    st = m_ime.Probe(ctx, m_options, &hostImeRc, outResult);
+                    st = m_ime.Probe(ctx, m_options, &hostImeRc, true, outResult);
             }
         }
         return st;

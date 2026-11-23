@@ -832,6 +832,7 @@ bool UIACaretProvider::EnsureInitialized()
         m_cacheReq->AddProperty(UIA_BoundingRectanglePropertyId);
         m_cacheReq->AddProperty(UIA_IsTextPattern2AvailablePropertyId);
         m_cacheReq->AddProperty(UIA_IsTextPatternAvailablePropertyId);
+        m_cacheReq->AddProperty(UIA_IsValuePatternAvailablePropertyId);
 #ifdef UIA_IsTextEditPatternAvailablePropertyId
         m_cacheReq->AddProperty(UIA_IsTextEditPatternAvailablePropertyId);
 #endif
@@ -900,9 +901,9 @@ void UIACaretProvider::MaybeWakeBrowserAccessibility(const CaretContextSnapshot 
                                                      const std::wstring &uiaClass,
                                                      CaretAffinityCache::Entry &affinityEntry)
 {
-    if (!IsBrowserOrWebViewClass(ctx.focusClassName) &&
-        !IsBrowserOrWebViewClass(ctx.topClassName) &&
-        !IsBrowserOrWebViewClass(uiaClass))
+    if (!IsLazyAccessibilityClass(ctx.focusClassName) &&
+        !IsLazyAccessibilityClass(ctx.topClassName) &&
+        !IsLazyAccessibilityClass(uiaClass))
         return;
     if (ctx.nowMs < affinityEntry.lastBrowserWakeMs + 2000ULL)
         return;
@@ -945,6 +946,7 @@ ProbeStatus UIACaretProvider::Probe(const CaretContextSnapshot &ctx,
     bool hasControlRect = false;
     bool hasTP2 = true;
     bool hasTP = true;
+    bool hasVP = false;
 #ifdef UIA_TextEditPatternId
     bool hasTE = true;
 #endif
@@ -958,6 +960,7 @@ ProbeStatus UIACaretProvider::Probe(const CaretContextSnapshot &ctx,
         hasControlRect = TryGetCachedControlRect(pFocus, controlRect);
         hasTP2 = GetCachedBoolProp(pFocus, UIA_IsTextPattern2AvailablePropertyId, false);
         hasTP = GetCachedBoolProp(pFocus, UIA_IsTextPatternAvailablePropertyId, false);
+        hasVP = GetCachedBoolProp(pFocus, UIA_IsValuePatternAvailablePropertyId, false);
 #ifdef UIA_IsTextEditPatternAvailablePropertyId
         hasTE = GetCachedBoolProp(pFocus, UIA_IsTextEditPatternAvailablePropertyId, false);
 #endif
@@ -1097,36 +1100,68 @@ ProbeStatus UIACaretProvider::Probe(const CaretContextSnapshot &ctx,
         }
     }
 
-    // 4. 仅输入控件矩形兜底（ControlBox，不伪装为精确光标；包含 PasswordBox 的安全外框位置）
-    if (!ok && outControlBoxFallback &&
-        (ctlType == UIA_EditControlTypeId || ctlType == UIA_ComboBoxControlTypeId) &&
-        hasControlRect && !controlRect.IsEmpty() &&
-        controlRect.Height() >= 14 && controlRect.Height() <= 96)
+    // 4. 输入控件矩形兜底（ControlBox，不伪装为精确光标；覆盖空 WPF/Avalonia TextBox、PasswordBox 及自定义可编辑控件）
+    const bool isBrowserCtx = IsBrowserOrWebViewClass(ctx.focusClassName) ||
+                              IsBrowserOrWebViewClass(ctx.topClassName) ||
+                              IsBrowserOrWebViewClass(uiaClass);
+    const bool editableControlType =
+        (ctlType == UIA_EditControlTypeId) ||
+        (ctlType == UIA_ComboBoxControlTypeId) ||
+        (!isBrowserCtx && !isReadOnly &&
+         (ctlType == UIA_DocumentControlTypeId ||
+          (ctlType == UIA_CustomControlTypeId && hasVP)));
+
+    if (!ok && outControlBoxFallback && editableControlType &&
+        hasControlRect && !controlRect.IsEmpty())
     {
-        CaretResult box;
-        box.rect = controlRect;
-        box.controlRect = controlRect;
-        box.hasControlRect = true;
-        box.hwnd = ctx.focusedWindow;
-        box.processId = ctx.processId;
-        box.threadId = ctx.threadId;
-        box.source = SidebandProtocol::CARET_SOURCE_CONTROL_BOX;
-        box.confidence = SidebandProtocol::CaretConfidence::Estimated;
-        box.valid = true;
-        box.isTextInput = true;
-        box.isPassword = isPassword;
-        box.timestampMs = ctx.nowMs;
-        *outControlBoxFallback = box;
+        PixelRect boxRect{};
+        bool boxValid = false;
+        const int32_t ch = controlRect.Height();
+        if (ch >= 14 && ch <= 110)
+        {
+            boxRect = controlRect;
+            boxValid = true;
+        }
+        else if (ch > 110 && ch <= 900 && !isBrowserCtx && !isReadOnly &&
+                 (ctlType == UIA_EditControlTypeId || ctlType == UIA_DocumentControlTypeId))
+        {
+            // 多行空文本框（如 WPF/Avalonia 空置多行输入框，TextPattern 无字符可返回）：估算首行输入区域
+            boxRect = PixelRect{
+                controlRect.left,
+                controlRect.top + 4,
+                controlRect.left + 2,
+                std::min<int32_t>(controlRect.bottom, controlRect.top + 28)
+            };
+            boxValid = (boxRect.Height() >= 10);
+        }
+
+        if (boxValid)
+        {
+            CaretResult box;
+            box.rect = boxRect;
+            box.controlRect = controlRect;
+            box.hasControlRect = true;
+            box.hwnd = ctx.focusedWindow;
+            box.processId = ctx.processId;
+            box.threadId = ctx.threadId;
+            box.source = SidebandProtocol::CARET_SOURCE_CONTROL_BOX;
+            box.confidence = SidebandProtocol::CaretConfidence::Estimated;
+            box.valid = true;
+            box.isTextInput = true;
+            box.isPassword = isPassword;
+            box.timestampMs = ctx.nowMs;
+            *outControlBoxFallback = box;
+        }
     }
 
     pFocus->Release();
 
     if (!ok)
     {
-        // 若是 Chromium/Electron/WebView，尝试发送 WM_GETOBJECT(OBJID_CLIENT) 唤醒惰性无障碍树
-        if (IsBrowserOrWebViewClass(ctx.focusClassName) ||
-            IsBrowserOrWebViewClass(ctx.topClassName) ||
-            IsBrowserOrWebViewClass(uiaClass))
+        // 若是 Chromium/Electron/WebView/Qt 宿主，尝试发送 WM_GETOBJECT(OBJID_CLIENT) 唤醒惰性无障碍树
+        if (IsLazyAccessibilityClass(ctx.focusClassName) ||
+            IsLazyAccessibilityClass(ctx.topClassName) ||
+            IsLazyAccessibilityClass(uiaClass))
         {
             MaybeWakeBrowserAccessibility(ctx, uiaClass, affinityEntry);
         }
@@ -1275,6 +1310,7 @@ bool UIACaretProvider::FindImeCandidateRect(PixelRect &outRect)
 ProbeStatus IMECaretProvider::Probe(const CaretContextSnapshot &ctx,
                                     const CaretOptions &opts,
                                     const PixelRect *overrideImeRect,
+                                    bool bypassEventGate,
                                     CaretResult &outResult)
 {
     if (!opts.allowImeFallback)
@@ -1286,7 +1322,7 @@ ProbeStatus IMECaretProvider::Probe(const CaretContextSnapshot &ctx,
         ctx.nowMs >= ctx.lastImeEventMs &&
         (ctx.nowMs - ctx.lastImeEventMs) <= 8000ULL;
 
-    if (!recentIme)
+    if (!bypassEventGate && !recentIme)
         return ProbeStatus::Miss;
 
     const PixelRect &imeRc = (overrideImeRect && !overrideImeRect->IsEmpty())
