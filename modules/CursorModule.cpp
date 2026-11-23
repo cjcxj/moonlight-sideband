@@ -952,12 +952,12 @@ void CursorModule::TextCursorMonitorLoop()
             hint.triggeredByImeEvent = imeEvt;
             hint.lastImeEventMs = lastImeMs;
             hint.lastKeyboardInputMs = lastKbMs;
+            hint.imeVisible = imeVisible;
             if (imeVisible && imeHwnd && IsWindow(imeHwnd) && IsWindowVisible(imeHwnd))
             {
                 RECT rc{};
                 if (GetWindowRect(imeHwnd, &rc))
                 {
-                    hint.imeVisible = true;
                     hint.imeWindowRect = Caret::PixelRect{rc.left, rc.top, rc.right, rc.bottom};
                 }
             }

@@ -828,6 +828,7 @@ bool UIACaretProvider::EnsureInitialized()
         m_cacheReq->AddProperty(UIA_ControlTypePropertyId);
         m_cacheReq->AddProperty(UIA_ClassNamePropertyId);
         m_cacheReq->AddProperty(UIA_IsPasswordPropertyId);
+        m_cacheReq->AddProperty(UIA_ValueIsReadOnlyPropertyId);
         m_cacheReq->AddProperty(UIA_BoundingRectanglePropertyId);
         m_cacheReq->AddProperty(UIA_IsTextPattern2AvailablePropertyId);
         m_cacheReq->AddProperty(UIA_IsTextPatternAvailablePropertyId);
@@ -838,6 +839,61 @@ bool UIACaretProvider::EnsureInitialized()
 
     Logger::Get().Info("CaretEngine: UIA (CUIAutomation8) 初始化成功");
     return true;
+}
+
+void UIACaretProvider::CheckAndLogElevatedTarget(uint32_t targetPid)
+{
+    if (targetPid == 0 || targetPid == GetCurrentProcessId())
+        return;
+
+    static bool s_selfChecked = false;
+    static bool s_selfElevated = false;
+    if (!s_selfChecked)
+    {
+        s_selfChecked = true;
+        HANDLE hSelfTok = nullptr;
+        if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hSelfTok))
+        {
+            TOKEN_ELEVATION elev{};
+            DWORD retLen = 0;
+            if (GetTokenInformation(hSelfTok, TokenElevation, &elev, sizeof(elev), &retLen))
+                s_selfElevated = (elev.TokenIsElevated != 0);
+            CloseHandle(hSelfTok);
+        }
+    }
+    if (s_selfElevated)
+        return;
+
+    static std::set<uint32_t> s_warnedPids;
+    if (s_warnedPids.count(targetPid))
+        return;
+
+    HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, targetPid);
+    if (!hProc)
+        return;
+
+    bool targetElevated = false;
+    HANDLE hTok = nullptr;
+    if (OpenProcessToken(hProc, TOKEN_QUERY, &hTok))
+    {
+        TOKEN_ELEVATION elev{};
+        DWORD retLen = 0;
+        if (GetTokenInformation(hTok, TokenElevation, &elev, sizeof(elev), &retLen))
+            targetElevated = (elev.TokenIsElevated != 0);
+        CloseHandle(hTok);
+    }
+    else if (GetLastError() == ERROR_ACCESS_DENIED)
+    {
+        targetElevated = true;
+    }
+    CloseHandle(hProc);
+
+    if (targetElevated)
+    {
+        s_warnedPids.insert(targetPid);
+        Logger::Get().Warning("CaretEngine: 目标进程 pid=", targetPid,
+                              " 运行在管理员/高权限(UIPI 隔离)，普通权限下可能无法读取其光标");
+    }
 }
 
 void UIACaretProvider::MaybeWakeBrowserAccessibility(const CaretContextSnapshot &ctx,
@@ -883,6 +939,7 @@ ProbeStatus UIACaretProvider::Probe(const CaretContextSnapshot &ctx,
 
     int ctlType = -1;
     bool isPassword = ctx.isFocusPasswordStyle;
+    bool isReadOnly = false;
     std::wstring uiaClass;
     PixelRect controlRect{};
     bool hasControlRect = false;
@@ -896,6 +953,7 @@ ProbeStatus UIACaretProvider::Probe(const CaretContextSnapshot &ctx,
     {
         ctlType = GetCachedIntProp(pFocus, UIA_ControlTypePropertyId, -1);
         isPassword = isPassword || GetCachedBoolProp(pFocus, UIA_IsPasswordPropertyId, false);
+        isReadOnly = GetCachedBoolProp(pFocus, UIA_ValueIsReadOnlyPropertyId, false);
         uiaClass = GetCachedStringProp(pFocus, UIA_ClassNamePropertyId);
         hasControlRect = TryGetCachedControlRect(pFocus, controlRect);
         hasTP2 = GetCachedBoolProp(pFocus, UIA_IsTextPattern2AvailablePropertyId, false);
@@ -978,14 +1036,23 @@ ProbeStatus UIACaretProvider::Probe(const CaretContextSnapshot &ctx,
         }
     }
 
-    // 3. 退化路径：TextPattern::GetSelection —— 严格保持 Edit 控件 + Windows Terminal 闸门
+    // 3. 退化路径：TextPattern::GetSelection
+    //    - Edit / ComboBox / Windows Terminal 直接放行
+    //    - 非浏览器窗口的 Document / Custom（如 WPF RichTextBox / Avalonia），仅在非只读且选区折叠(Start==End)时放行
     if (!ok && hasTP)
     {
-        bool allowSelectionFallback = (ctlType == UIA_EditControlTypeId);
-        if (!allowSelectionFallback && IsWindowsTerminalClass(ctx.topClassName))
-            allowSelectionFallback = true;
+        const bool isBrowser = IsBrowserOrWebViewClass(ctx.focusClassName) ||
+                               IsBrowserOrWebViewClass(ctx.topClassName) ||
+                               IsBrowserOrWebViewClass(uiaClass);
+        const bool directAllowed =
+            (ctlType == UIA_EditControlTypeId) ||
+            (ctlType == UIA_ComboBoxControlTypeId) ||
+            IsWindowsTerminalClass(ctx.topClassName);
+        const bool collapsedDocAllowed =
+            !isBrowser && !isReadOnly &&
+            (ctlType == UIA_DocumentControlTypeId || ctlType == UIA_CustomControlTypeId);
 
-        if (allowSelectionFallback)
+        if (directAllowed || collapsedDocAllowed)
         {
             IUIAutomationTextPattern *pPattern = nullptr;
             if (QueryTextPattern(pFocus, &pPattern))
@@ -1001,6 +1068,19 @@ ProbeStatus UIACaretProvider::Probe(const CaretContextSnapshot &ctx,
                             IUIAutomationTextRange *pRange = nullptr;
                             if (FAILED(pRanges->GetElement(i, &pRange)) || !pRange)
                                 continue;
+                            if (!directAllowed)
+                            {
+                                int cmp = 1;
+                                if (FAILED(pRange->CompareEndpoints(TextPatternRangeEndpoint_Start,
+                                                                    pRange,
+                                                                    TextPatternRangeEndpoint_End,
+                                                                    &cmp)) ||
+                                    cmp != 0)
+                                {
+                                    pRange->Release();
+                                    continue;
+                                }
+                            }
                             if (RangeToCaretPixelRect(pRange, isPassword, hasControlRect, controlRect,
                                                       caretRect, conf))
                             {
@@ -1017,10 +1097,10 @@ ProbeStatus UIACaretProvider::Probe(const CaretContextSnapshot &ctx,
         }
     }
 
-    // 4. 仅输入控件矩形兜底（ControlBox，不伪装为精确光标）
+    // 4. 仅输入控件矩形兜底（ControlBox，不伪装为精确光标；包含 PasswordBox 的安全外框位置）
     if (!ok && outControlBoxFallback &&
         (ctlType == UIA_EditControlTypeId || ctlType == UIA_ComboBoxControlTypeId) &&
-        !isPassword && hasControlRect && !controlRect.IsEmpty() &&
+        hasControlRect && !controlRect.IsEmpty() &&
         controlRect.Height() >= 14 && controlRect.Height() <= 96)
     {
         CaretResult box;
@@ -1085,12 +1165,116 @@ ProbeStatus UIACaretProvider::Probe(const CaretContextSnapshot &ctx,
     return ProbeStatus::Hit;
 }
 
+namespace {
+
+struct TextHostEnumState {
+    std::vector<HWND> hostWindows;
+};
+
+BOOL CALLBACK EnumTextInputHostProc(HWND hwnd, LPARAM lp)
+{
+    if (!IsWindowVisible(hwnd))
+        return TRUE;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid == 0)
+        return TRUE;
+
+    HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!hProc)
+        return TRUE;
+
+    wchar_t exePath[MAX_PATH] = {};
+    DWORD sz = MAX_PATH;
+    bool isTextHost = false;
+    if (QueryFullProcessImageNameW(hProc, 0, exePath, &sz) && sz > 0)
+    {
+        const wchar_t *slash = std::wcsrchr(exePath, L'\\');
+        const wchar_t *name = slash ? (slash + 1) : exePath;
+        if (_wcsicmp(name, L"TextInputHost.exe") == 0)
+            isTextHost = true;
+    }
+    CloseHandle(hProc);
+
+    if (isTextHost)
+        reinterpret_cast<TextHostEnumState *>(lp)->hostWindows.push_back(hwnd);
+    return TRUE;
+}
+
+} // namespace
+
+bool UIACaretProvider::FindImeCandidateRect(PixelRect &outRect)
+{
+    if (!EnsureInitialized())
+        return false;
+
+    TextHostEnumState st;
+    EnumWindows(EnumTextInputHostProc, reinterpret_cast<LPARAM>(&st));
+
+    if (st.hostWindows.empty())
+        return false;
+
+    VARIANT vtList;
+    VariantInit(&vtList);
+    vtList.vt = VT_I4;
+    vtList.lVal = UIA_ListControlTypeId;
+    IUIAutomationCondition *pCondList = nullptr;
+    m_uia->CreatePropertyCondition(UIA_ControlTypePropertyId, vtList, &pCondList);
+    VariantClear(&vtList);
+    if (!pCondList)
+        return false;
+
+    bool found = false;
+    for (HWND hwnd : st.hostWindows)
+    {
+        IUIAutomationElement *pRoot = nullptr;
+        if (FAILED(m_uia->ElementFromHandle(hwnd, &pRoot)) || !pRoot)
+            continue;
+
+        IUIAutomationElementArray *pArr = nullptr;
+        if (SUCCEEDED(pRoot->FindAll(TreeScope_Descendants, pCondList, &pArr)) && pArr)
+        {
+            int len = 0;
+            pArr->get_Length(&len);
+            for (int i = 0; i < len; ++i)
+            {
+                IUIAutomationElement *pItem = nullptr;
+                if (FAILED(pArr->GetElement(i, &pItem)) || !pItem)
+                    continue;
+                BOOL offscreen = TRUE;
+                RECT rc{};
+                if (SUCCEEDED(pItem->get_CurrentIsOffscreen(&offscreen)) && !offscreen &&
+                    SUCCEEDED(pItem->get_CurrentBoundingRectangle(&rc)))
+                {
+                    int32_t w = rc.right - rc.left;
+                    int32_t h = rc.bottom - rc.top;
+                    if (w >= 40 && w <= 900 && h >= 20 && h <= 260)
+                    {
+                        outRect = PixelRect{rc.left, rc.top, rc.right, rc.bottom};
+                        found = true;
+                    }
+                }
+                pItem->Release();
+                if (found)
+                    break;
+            }
+            pArr->Release();
+        }
+        pRoot->Release();
+        if (found)
+            break;
+    }
+    pCondList->Release();
+    return found;
+}
+
 // ============================================================
 // Level 5: IMECaretProvider (Source = 5)
 // ============================================================
 
 ProbeStatus IMECaretProvider::Probe(const CaretContextSnapshot &ctx,
                                     const CaretOptions &opts,
+                                    const PixelRect *overrideImeRect,
                                     CaretResult &outResult)
 {
     if (!opts.allowImeFallback)
@@ -1105,8 +1289,11 @@ ProbeStatus IMECaretProvider::Probe(const CaretContextSnapshot &ctx,
     if (!recentIme)
         return ProbeStatus::Miss;
 
-    const PixelRect &imeRc = ctx.imeWindowRect;
-    if (imeRc.IsEmpty() || imeRc.Width() < 20 || imeRc.Height() < 14)
+    const PixelRect &imeRc = (overrideImeRect && !overrideImeRect->IsEmpty())
+                                 ? *overrideImeRect
+                                 : ctx.imeWindowRect;
+    if (imeRc.IsEmpty() || imeRc.Width() < 20 || imeRc.Height() < 14 ||
+        imeRc.Width() > 900 || imeRc.Height() > 280)
         return ProbeStatus::Miss;
 
     // 根据候选窗在屏幕中的位置判断其位于输入行下方（常规）还是上方（贴近屏幕底部时上翻）
@@ -1117,7 +1304,6 @@ ProbeStatus IMECaretProvider::Probe(const CaretContextSnapshot &ctx,
     int32_t anchorBottom = imeRc.top;
     if (GetMonitorInfoW(hMon, &mi))
     {
-        // 若候选框底边靠近工作区底边且其上沿距离屏幕底很小，或整体位于前台窗口底部以上但紧贴下缘
         if (imeRc.bottom >= mi.rcWork.bottom - 24 && imeRc.top > mi.rcWork.top + 80)
         {
             // 上翻候选框：实际输入行在候选框下方

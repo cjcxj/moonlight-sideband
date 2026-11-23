@@ -72,10 +72,16 @@ public:
     // 必须在工作线程（MTA）退出前调用，确保 COM 指针在 CoUninitialize 前释放
     void Shutdown();
 
+    // 若目标进程处于高权限/管理员且本进程为普通权限，记录一次 UIPI 诊断提示
+    void CheckAndLogElevatedTarget(uint32_t targetPid);
+
     ProbeStatus Probe(const CaretContextSnapshot &ctx,
                       CaretAffinityCache::Entry &affinityEntry,
                       CaretResult &outResult,
                       CaretResult *outControlBoxFallback);
+
+    // 当 EVENT_OBJECT_IME_SHOW 未给出有效小矩形时，从 Win10/11 TextInputHost 查找候选窗边界
+    bool FindImeCandidateRect(PixelRect &outRect);
 
 private:
     bool EnsureInitialized();
@@ -94,6 +100,7 @@ class IMECaretProvider {
 public:
     ProbeStatus Probe(const CaretContextSnapshot &ctx,
                       const CaretOptions &opts,
+                      const PixelRect *overrideImeRect,
                       CaretResult &outResult);
 };
 

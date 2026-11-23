@@ -295,6 +295,9 @@ static void TestCaretSanityAndClassFilters()
     CHECK(IsCaretRectReasonable(PixelRect{200, 300, 202, 322}, win, mon, false));
     CHECK(!IsCaretRectReasonable(PixelRect{200, 1500, 202, 1522}, win, mon, false));
     CHECK(!IsCaretRectReasonable(PixelRect{200, 300, 202, 302}, win, mon, false)); // 太矮
+    // IME 锚点允许落在紧凑窗口底边下方一定范围内（常规光标准则不允许）
+    CHECK(!IsCaretRectReasonable(PixelRect{200, 980, 202, 1004}, win, mon, false, false));
+    CHECK(IsCaretRectReasonable(PixelRect{200, 980, 202, 1004}, win, mon, false, true));
 }
 
 static void TestWin32BlinkGrace()
@@ -402,15 +405,26 @@ static void TestCaretPublishAndProtocol()
     CHECK(!d2.sendLegacy);
     CHECK(!d2.sendExt);
 
-    // 仅有 ControlBox 时：老协议被拦截成 -1（退出），扩展协议仍可下发 Estimated
+    // 仅有 ControlBox 时：默认开启透传（覆盖 PasswordBox / Avalonia TextBox 等单行控件）
     CaretResult box;
     box.valid = true;
     box.rect = PixelRect{400, 2120, 900, 2180};
     box.controlRect = box.rect;
     box.hasControlRect = true;
+    box.isPassword = true;
     box.source = CARET_SOURCE_CONTROL_BOX;
     box.confidence = CaretConfidence::Estimated;
 
+    CaretOptions optsBoxOn = opts;
+    optsBoxOn.allowControlBoxForLegacy = true;
+    auto d3On = pub.Evaluate(box, mon2, false, optsBoxOn);
+    CHECK(d3On.sendLegacy);
+    CHECK_EQ_INT(d3On.legacy.yPercent, ComputeMonitorPercent(2180, mon2.top, mon2.Height()));
+    CHECK_EQ_INT(d3On.legacy.source, CARET_SOURCE_CONTROL_BOX);
+
+    // 当显式关闭老客户端 ControlBox 时：老协议拦截为 -1，扩展协议仍下发 Estimated
+    pub.Reset();
+    pub.Evaluate(r, mon2, false, opts);
     auto d3 = pub.Evaluate(box, mon2, false, opts);
     CHECK(d3.sendLegacy);
     CHECK_EQ_INT(d3.legacy.yPercent, -1);
@@ -421,6 +435,7 @@ static void TestCaretPublishAndProtocol()
     CHECK_EQ_INT(Json::GetInt(extJson, "src"), CARET_SOURCE_CONTROL_BOX);
     CHECK_EQ_INT(Json::GetInt(extJson, "conf"), static_cast<int>(CaretConfidence::Estimated));
     CHECK(Json::GetBool(extJson, "comp", true) == false);
+    CHECK(Json::GetBool(extJson, "pwd", false) == true);
 
     // HELLO 能力协商字段解析
     CHECK(Json::GetBool(R"({"proto_ver":1,"caret_ext":true})", "caret_ext", false) == true);

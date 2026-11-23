@@ -54,8 +54,9 @@ bool CaretEngine::ValidateResult(const CaretContextSnapshot &ctx,
                                     ? ctx.focusWindowRect
                                     : ctx.foregroundWindowRect;
     const bool isControlBox = (res.source == SidebandProtocol::CARET_SOURCE_CONTROL_BOX);
+    const bool isImeAnchor = (res.source == SidebandProtocol::CARET_SOURCE_IME_ANCHOR);
 
-    return IsCaretRectReasonable(res.rect, winBound, outMonitorRect, isControlBox);
+    return IsCaretRectReasonable(res.rect, winBound, outMonitorRect, isControlBox, isImeAnchor);
 }
 
 ProbeStatus CaretEngine::RunSingleProvider(ProviderId id,
@@ -82,7 +83,23 @@ ProbeStatus CaretEngine::RunSingleProvider(ProviderId id,
         return m_uia.Probe(ctx, entry, outResult, outControlBoxFallback);
 
     case ProviderId::IME:
-        return m_ime.Probe(ctx, m_options, outResult);
+    {
+        ProbeStatus st = m_ime.Probe(ctx, m_options, nullptr, outResult);
+        if (st == ProbeStatus::Miss && m_options.allowImeFallback &&
+            ctx.imeVisible && ctx.lastImeEventMs > 0 &&
+            ctx.nowMs >= ctx.lastImeEventMs && (ctx.nowMs - ctx.lastImeEventMs) <= 8000ULL)
+        {
+            if (ctx.imeWindowRect.IsEmpty() ||
+                ctx.imeWindowRect.Width() > 900 ||
+                ctx.imeWindowRect.Height() > 280)
+            {
+                PixelRect hostImeRc{};
+                if (m_uia.FindImeCandidateRect(hostImeRc))
+                    st = m_ime.Probe(ctx, m_options, &hostImeRc, outResult);
+            }
+        }
+        return st;
+    }
 
     default:
         return ProbeStatus::Miss;
@@ -191,6 +208,9 @@ CaretEngine::DetectOutput CaretEngine::DetectAndEvaluate(const CaretContextSnaps
             bestHasMonitor = hasMon;
         }
     }
+
+    if (!bestResult.valid && ctx.processId != 0)
+        m_uia.CheckAndLogElevatedTarget(ctx.processId);
 
     out.result = bestResult;
     out.monitorRect = bestMonitor;

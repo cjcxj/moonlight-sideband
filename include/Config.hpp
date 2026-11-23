@@ -34,7 +34,7 @@ struct Config
     //   组合/候选框正在显示时，允许用 IME 窗口位置估算 YPercent（覆盖游戏/自绘框）
     // - caretAllowControlBox: 仅拿到 Edit 控件外框时，是否也发给未声明 caret_ext 的老客户端
     bool caretAllowImeFallback = true;
-    bool caretAllowControlBox = false;
+    bool caretAllowControlBox = true;
 
     // 从 exe 同目录的 ini 载入；文件不存在或缺字段时补齐并回写。
     // 返回 false 表示配置文件读写失败（此时使用内存中的默认值继续运行）。

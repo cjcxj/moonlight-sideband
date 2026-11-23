@@ -88,7 +88,7 @@ struct CaretContextSnapshot {
 
 struct CaretOptions {
     bool allowImeFallback = true;
-    bool allowControlBoxForLegacy = false;
+    bool allowControlBoxForLegacy = true;
     int32_t blinkGraceMs = 800;
     int32_t providerCooldownMs = 2000;
     int32_t failureThreshold = 3;

@@ -163,7 +163,8 @@ inline bool IsDummyWin32Caret(const PixelRect &caretClientRect,
 inline bool IsCaretRectReasonable(const PixelRect &screenRect,
                                   const PixelRect &windowRect,
                                   const PixelRect &monitorRect,
-                                  bool isControlBox)
+                                  bool isControlBox,
+                                  bool isImeAnchor = false)
 {
     const int32_t h = screenRect.Height();
     if (h < (isControlBox ? 10 : 5) || h > 280)
@@ -182,12 +183,13 @@ inline bool IsCaretRectReasonable(const PixelRect &screenRect,
             return false;
     }
 
-    // 若所属窗口矩形有效，插入符不应严重飘到窗口外面（允许少量边框/滚动容差）
+    // 若所属窗口矩形有效，插入符不应严重飘到窗口外面（IME 候选窗允许落在紧凑窗口底边下方一定范围内）
     if (!windowRect.IsEmpty())
     {
         constexpr int32_t kTol = 48;
+        const int32_t bottomTol = isImeAnchor ? 160 : kTol;
         if (screenRect.bottom < windowRect.top - kTol ||
-            screenRect.top > windowRect.bottom + kTol ||
+            screenRect.top > windowRect.bottom + bottomTol ||
             screenRect.right < windowRect.left - kTol ||
             screenRect.left > windowRect.right + kTol)
             return false;
