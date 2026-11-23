@@ -30,14 +30,19 @@ set(SOURCES
 
 add_executable(moonlight_sideband ${SOURCES})
 
-# 构建版本标识：编译时取当前 git 提交短哈希，写入日志方便区分新旧构建
-execute_process(
-    COMMAND git rev-parse --short HEAD
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-    OUTPUT_VARIABLE SIDEBAND_BUILD_COMMIT
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    ERROR_QUIET
-)
+# 构建版本标识，写进启动日志用来分辨手头这份 exe 是哪一笔构建。
+# CI 传 -DSIDEBAND_BUILD_COMMIT=<短哈希> 时不再问 git：runner 上工作区属主和运行
+# 用户不一致，rev-parse 会被 dubious ownership 挡掉，日志就退化成 unknown。
+set(SIDEBAND_BUILD_COMMIT "" CACHE STRING "写入启动日志的构建标识")
+if(NOT SIDEBAND_BUILD_COMMIT)
+    execute_process(
+        COMMAND git rev-parse --short HEAD
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        OUTPUT_VARIABLE SIDEBAND_BUILD_COMMIT
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+endif()
 if(NOT SIDEBAND_BUILD_COMMIT)
     set(SIDEBAND_BUILD_COMMIT "unknown")
 endif()
