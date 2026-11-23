@@ -261,6 +261,15 @@ static void TestCaretSanityAndClassFilters()
     CHECK(IsKnownSelfDrawnHostClass(L"UnityWndClass"));
     CHECK(IsScintillaClass(L"Scintilla"));
     CHECK(IsClassicEditClass(L"RICHEDIT50W"));
+
+    // EM_POSFROMCHAR 可问坐标的控件类：标准 Edit / RichEdit 变体 / WinForms 子类化 EDIT
+    CHECK(IsEditMessageHostClass(L"Edit"));
+    CHECK(IsEditMessageHostClass(L"RICHEDIT50W"));
+    CHECK(IsEditMessageHostClass(L"RichEdit50W"));
+    CHECK(IsEditMessageHostClass(L"WindowsForms10.EDIT.app12"));
+    CHECK(!IsEditMessageHostClass(L"ComboLBox"));          // 列表框，不认 EM_POSFROMCHAR
+    CHECK(!IsEditMessageHostClass(L"WindowsForms10.STATIC.app12"));
+    CHECK(!IsEditMessageHostClass(L"Chrome_WidgetWin_1"));
     CHECK(IsWindowsTerminalClass(L"CASCADIA_HOSTING_WINDOW_CLASS"));
     CHECK(!IsBrowserOrWebViewClass(L"Notepad"));
 
@@ -343,6 +352,16 @@ static void TestNewlineAndAffinityCache()
     CHECK(CaretAffinityCache::IsInCooldown(e, ProviderId::UIA, 2000));
     CHECK(!CaretAffinityCache::IsInCooldown(e, ProviderId::UIA, 3201));
     CHECK(!e.hasPreferred);
+
+    // 合理性复核失败只冷却，不永久拉黑：过窗后必须重新可用（单帧滚动/动画不该杀掉精确路径）
+    CaretAffinityCache::RecordSanityMiss(e, ProviderId::Win32, 5000, 2000);
+    CHECK(CaretAffinityCache::IsInCooldown(e, ProviderId::Win32, 6000));
+    CHECK(!CaretAffinityCache::IsInCooldown(e, ProviderId::Win32, 7001));
+
+    // 冷却期间又取到一次合法坐标 -> 立即解除冷却
+    CaretAffinityCache::RecordSanityMiss(e, ProviderId::Win32, 8000, 2000);
+    CaretAffinityCache::RecordSuccess(e, ProviderId::Win32);
+    CHECK(!CaretAffinityCache::IsInCooldown(e, ProviderId::Win32, 8500));
 }
 
 static void TestCaretPublishAndProtocol()

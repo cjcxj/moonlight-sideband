@@ -614,7 +614,7 @@ ProbeStatus AppMsgCaretProvider::Probe(const CaretContextSnapshot &ctx, CaretRes
         return ProbeStatus::Hit;
     }
 
-    if (ctx.focusClassName == L"Edit")
+    if (IsEditMessageHostClass(ctx.focusClassName))
     {
         DWORD_PTR sel = 0;
         if (!SendMessageTimeoutW(hwnd, EM_GETSEL, 0, 0,

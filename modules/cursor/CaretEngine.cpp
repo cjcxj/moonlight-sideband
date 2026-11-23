@@ -70,8 +70,6 @@ ProbeStatus CaretEngine::RunSingleProvider(ProviderId id,
     switch (id)
     {
     case ProviderId::Win32:
-        if (entry.dummyWin32)
-            return ProbeStatus::Miss;
         return m_win32.Probe(ctx, m_options, outResult);
 
     case ProviderId::AppMsg:
@@ -174,8 +172,9 @@ CaretEngine::DetectOutput CaretEngine::DetectAndEvaluate(const CaretContextSnaps
             }
             else if (pid == ProviderId::Win32)
             {
-                // Win32 命中了异常大/跑出窗口的假光标，标记以便后续跳过
-                entry.dummyWin32 = true;
+                // 单帧坐标不合理（滚动/动画/跨 DPI）：短暂冷却，下一轮仍给机会
+                CaretAffinityCache::RecordSanityMiss(entry, pid, ctx.nowMs,
+                                                     m_options.providerCooldownMs);
             }
         }
     }

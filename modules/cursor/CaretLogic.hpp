@@ -77,6 +77,19 @@ inline bool IsClassicEditClass(std::wstring_view cls)
            cls == L"ComboLBox";
 }
 
+// 能用 EM_GETSEL + EM_POSFROMCHAR 直接问出插入点像素坐标的那几类编辑控件。
+// 与 IsClassicEditClass 不同：ComboLBox 是列表框、不认 EM_POSFROMCHAR，
+// 而 .NET WinForms 的文本框是子类化的 EDIT（WindowsForms10.EDIT.app…），
+// 类名既不是 "Edit" 也不以 RichEdit 开头，漏掉它就等于把整类 WinForms 程序
+// 交给 UIA/IME 兜底，位置精度直接掉一档。
+inline bool IsEditMessageHostClass(std::wstring_view cls)
+{
+    return cls == L"Edit" ||
+           StartsWithCaseInsensitive(cls, L"RichEdit") ||
+           StartsWithCaseInsensitive(cls, L"RICHEDIT") ||
+           StartsWithCaseInsensitive(cls, L"WindowsForms10.EDIT");
+}
+
 inline bool IsBrowserOrWebViewClass(std::wstring_view cls)
 {
     return StartsWithCaseInsensitive(cls, L"Chrome_WidgetWin") ||
@@ -314,7 +327,6 @@ public:
         uint64_t lastUsedSeq = 0;
         bool hasPreferred = false;
         ProviderId preferred = ProviderId::Win32;
-        bool dummyWin32 = false;
         uint64_t lastBrowserWakeMs = 0;
         std::array<int32_t, kProviderCount> consecutiveFails{};
         std::array<uint64_t, kProviderCount> cooldownUntilMs{};
@@ -378,6 +390,17 @@ public:
             e.hasPreferred = true;
             e.preferred = p;
         }
+    }
+
+    // 取到了矩形但过不了合理性复核（跑出窗口/超出显示器）：只冷却一段时间再给机会。
+    // 这里绝不能永久拉黑——滚动、窗口动画、跨 DPI 屏之间切换都会出现单帧的不合理坐标，
+    // 永久拉黑的表现就是"这个程序以前能取到，后来一直取不到"，而且只能靠切显示器复位。
+    static void RecordSanityMiss(Entry &e, ProviderId p, uint64_t nowMs, int32_t cooldownMs)
+    {
+        const size_t idx = static_cast<size_t>(p);
+        if (idx >= kProviderCount)
+            return;
+        e.cooldownUntilMs[idx] = nowMs + static_cast<uint64_t>(cooldownMs);
     }
 
     static void RecordHardFailure(Entry &e, ProviderId p, uint64_t nowMs,
