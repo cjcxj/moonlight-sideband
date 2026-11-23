@@ -273,6 +273,12 @@ ctest --test-dir build
    —— 需要在发送 CmdID 12/16/17 之前先发一次 `AUTH_REQ`(4) 提交 ini 里的令牌
 4. **阶段 4**：根据需求添加更多功能菜单
 
+## 设计文档
+
+- [Android 端接入分级授权改动方案](docs/ANDROID_AUTH_INTEGRATION.md)
+- [Windows 文本光标探测：覆盖场景与边界说明](docs/CARET_COVERAGE_SCENARIOS.md) — 各 Windows UI 框架/典型应用覆盖率预估、`WindTerm`/`Tai`/`v2rayN`/`Unity`/`Roblox`/锁屏等实测场景归因与排查
+- [隐藏式 Windows 隐形输入法光标探针设计方案（UI-Less TSF TIP / IMM32）](docs/HIDDEN_IME_CARET_PROBE.md) — 针对 `WindTerm` / `Unity` 等纯自绘且无 UIA 文本接口应用，以及手机端 `VK_PACKET` 直出中文不弹系统候选框场景的进阶方案与边界说明
+
 ## 许可证
 
 继承自 moonlight-cjcxj 项目。
