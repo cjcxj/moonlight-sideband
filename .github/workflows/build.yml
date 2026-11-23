@@ -17,11 +17,27 @@ jobs:
     - name: Checkout Code
       uses: actions/checkout@v4
 
+    # runner 上工作区属主与运行用户不一致，CMake 里的 rev-parse 兜底会被
+    # "dubious ownership" 挡掉、拿到空串，日志"构建版本"就永远写 unknown，
+    # 手里两份 exe 分不清是哪笔构建的。PR 事件要取 head sha，
+    # github.sha 在 PR 触发时是那个只存在于 refs/pull 里的合并提交。
+    - name: 取短哈希
+      id: sha
+      shell: pwsh
+      run: |
+        $full = "${{ github.event.pull_request.head.sha || github.sha }}"
+        "short=$($full.Substring(0, 7))" >> $env:GITHUB_OUTPUT
+
     - name: Configure CMake
-      run: cmake -S . -B build
+      run: cmake -S . -B build -DSIDEBAND_BUILD_TESTS=ON -DSIDEBAND_BUILD_COMMIT=${{ steps.sha.outputs.short }}
 
     - name: Build Project
       run: cmake --build build --config Release
+
+    # 单测只覆盖平台无关逻辑（窗口类名分类、假光标过滤、协议打包），
+    # 挂了就不出包，避免把明显取不到插入符的 exe 发下去实机试。
+    - name: Run Unit Tests
+      run: ctest --test-dir build -C Release --output-on-failure
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v4

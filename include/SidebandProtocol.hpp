@@ -76,6 +76,9 @@ namespace Cmd {
 
     // === 扩展区 ===
     constexpr uint32_t USER_RESERVED_START = 100;
+    // 扩展文本光标状态推送（PC -> Android，仅对在 HELLO 中声明 "caret_ext":true 的客户端下发）
+    // JSON: {"y":0..10000|-1,"x":0..10000|-1,"w":px,"h":px,"src":int,"conf":int,"comp":bool,"pwd":bool,"ctrl_bottom":0..10000|-1}
+    constexpr uint32_t TEXT_CURSOR_EXT = 102;
 }
 
 // === 协议包构造辅助 ===
@@ -87,12 +90,26 @@ constexpr uint32_t CURSOR_HEADER_SIZE = 20;  // [Hash][HotX][HotY][Frames][Delay
 constexpr uint32_t TEXT_CURSOR_PACKET_SIZE = 24;  // [BodyLen=20][Hash][CmdID=2][YPercent][Height][Source]
 
 // 文本光标来源标记（BuildTextCursorPacket 的 sourceTag 参数 / 包尾保留字段 2）
-// 阶段一：只有 0（无插入符）与 1（Win32 系统插入符）两种取值。
-// 预留 2 = WinEvent OBJID_CARET / MSAA，3 = UI Automation，供后续阶段扩充。
-constexpr int32_t CARET_SOURCE_NONE   = 0;
-constexpr int32_t CARET_SOURCE_WIN32  = 1;
-constexpr int32_t CARET_SOURCE_MSAA   = 2;  // 预留：WinEvent OBJID_CARET + accLocation
-constexpr int32_t CARET_SOURCE_UIA    = 3;  // 预留：TextPattern2::GetCaretRange
+// 兼容约定：0=无，1=Win32，2=MSAA/WinEvent，3=UIA；
+// 4+ 为扩展来源（发给老客户端时按配置决定映射或降级）。
+constexpr int32_t CARET_SOURCE_NONE        = 0;
+constexpr int32_t CARET_SOURCE_WIN32       = 1;
+constexpr int32_t CARET_SOURCE_MSAA        = 2;  // WinEvent OBJID_CARET / AccessibleObjectFromWindow
+constexpr int32_t CARET_SOURCE_UIA         = 3;  // TextEditPattern / TextPattern2 / gated TextPattern
+constexpr int32_t CARET_SOURCE_IA2         = 4;  // 预留：IAccessible2
+constexpr int32_t CARET_SOURCE_IME_ANCHOR  = 5;  // IME 组合/候选窗口位置锚点兜底
+constexpr int32_t CARET_SOURCE_CONTROL_BOX = 6;  // 仅输入控件矩形兜底（非精确插入符）
+constexpr int32_t CARET_SOURCE_APP_MSG     = 7;  // Scintilla / Edit / RichEdit 直接窗口消息查询
+
+// 文本光标置信度（用于区分精确插入符与区域估算）
+enum class CaretConfidence : int32_t {
+    None      = 0,
+    Estimated = 1,  // IME 候选框 / 控件框估算
+    Low       = 2,  // 启发式回退
+    Medium    = 3,  // MSAA / 间接范围推算
+    High      = 4,  // UIA 字符扩展 / 行尾借字符
+    Exact     = 5   // Win32 / UIA GetCaretRange / Scintilla / EM_POSFROMCHAR 直接命中
+};
 
 // 新控制指令包头大小（BodyLen 之后）
 constexpr uint32_t COMMAND_HEADER_SIZE = 16;  // [Hash][CmdID][ReqID][PayloadLen]

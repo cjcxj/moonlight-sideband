@@ -22,10 +22,41 @@ constexpr UINT ID_MENU_EXIT       = 40001;
 constexpr UINT ID_MENU_AUTOSTART  = 40002;
 constexpr UINT ID_MENU_OPENLOG    = 40003;
 constexpr UINT ID_MENU_OPENCONFIG = 40004;
+constexpr UINT ID_MENU_ELEVATE    = 40005;
+
+// ChangeWindowMessageFilterEx 的 action 值（SDK 头文件不一定导出这些宏）：
+// MSGFLT_RESET=0 / MSGFLT_ALLOW=1 / MSGFLT_DISALLOW=2
+#ifndef MSGFLT_ALLOW
+#define MSGFLT_ALLOW 1UL
+#endif
 
 void OpenWithShell(const std::wstring &path)
 {
     ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+bool IsCurrentProcessElevated()
+{
+    HANDLE hTok = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hTok))
+        return false;
+    TOKEN_ELEVATION elev{};
+    DWORD retLen = 0;
+    bool elevated = false;
+    if (GetTokenInformation(hTok, TokenElevation, &elev, sizeof(elev), &retLen))
+        elevated = (elev.TokenIsElevated != 0);
+    CloseHandle(hTok);
+    return elevated;
+}
+
+void AllowShellMessage(HWND hwnd, UINT msg, const char *name)
+{
+    if (!hwnd || msg == 0)
+        return;
+    // 只放行这一条消息编号、且只对这一个窗口生效；带指针的数据型跨进程消息
+    //（WM_COPYDATA 等）不受影响。
+    if (!ChangeWindowMessageFilterEx(hwnd, msg, MSGFLT_ALLOW, nullptr))
+        Logger::Get().Warning("TrayIcon: 跨权限消息放行失败 msg=", name, " err=", GetLastError());
 }
 
 } // namespace
@@ -75,12 +106,24 @@ bool TrayIcon::Create(const std::wstring &tooltip)
     // 资源管理器崩溃/重启后托盘图标会丢失，需要重新添加
     m_taskbarCreatedMsg = RegisterWindowMessageW(L"TaskbarCreated");
 
+    // UIPI：以管理员权限运行时，本窗口处于高完整性级别，而托盘回调、
+    // TaskbarCreated 广播都由普通权限的资源管理器发出，跨完整性窗消息默认被丢弃
+    // —— 表现为图标还在、但右键点了没反应。只放行这两条消息号，且只对这个窗口。
+    //（WM_DISPLAYCHANGE 之类小于 WM_USER 的系统消息本来就能穿透筛选器，无需处理。）
+    const bool elevated = IsCurrentProcessElevated();
+    if (elevated)
+    {
+        AllowShellMessage(m_hwnd, WM_TRAY_NOTIFY, "WM_TRAY_NOTIFY");
+        AllowShellMessage(m_hwnd, m_taskbarCreatedMsg, "TaskbarCreated");
+    }
+
     m_hIcon = LoadIconW(nullptr, IDI_APPLICATION);
 
     if (!AddIcon())
         Logger::Get().Warning("TrayIcon: 托盘图标添加失败（程序仍可运行）");
 
-    Logger::Get().Info("TrayIcon: 隐藏窗口与托盘图标已创建");
+    Logger::Get().Info("TrayIcon: 隐藏窗口与托盘图标已创建，权限=",
+                       (elevated ? "管理员" : "普通"));
     return true;
 }
 
@@ -168,6 +211,14 @@ void TrayIcon::ShowContextMenu()
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING | (IsAutoStartEnabled() ? MF_CHECKED : MF_UNCHECKED),
                 ID_MENU_AUTOSTART, L"开机自启");
+    if (IsCurrentProcessElevated())
+    {
+        AppendMenuW(menu, MF_STRING | MF_GRAYED, ID_MENU_ELEVATE, L"权限: 管理员");
+    }
+    else
+    {
+        AppendMenuW(menu, MF_STRING, ID_MENU_ELEVATE, L"以管理员身份重启");
+    }
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, ID_MENU_EXIT, L"退出");
 
@@ -227,6 +278,21 @@ LRESULT CALLBACK TrayIcon::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         case ID_MENU_OPENCONFIG:
             OpenWithShell(Win32Util::GetExeDirectory() + L"moonlight_sideband.ini");
             return 0;
+        case ID_MENU_ELEVATE:
+        {
+            std::wstring exe = Win32Util::GetExePath();
+            HINSTANCE ret = ShellExecuteW(nullptr, L"runas", exe.c_str(),
+                                          L"--relaunch-wait", nullptr, SW_SHOWNORMAL);
+            if (reinterpret_cast<INT_PTR>(ret) > 32)
+            {
+                PostMessageW(hwnd, WM_CLOSE, 0, 0);
+            }
+            else
+            {
+                Logger::Get().Warning("TrayIcon: 用户取消或提权启动失败");
+            }
+            return 0;
+        }
         default:
             break;
         }

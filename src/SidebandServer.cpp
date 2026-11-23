@@ -240,6 +240,23 @@ void SidebandServer::BroadcastTextCursorState(int32_t yPercentage,
     }
 }
 
+void SidebandServer::BroadcastTextCursorExt(const std::string &jsonPayload)
+{
+    std::vector<SessionPtr> snapshot;
+    {
+        std::lock_guard<std::mutex> lock(m_clientsMutex);
+        snapshot.assign(m_clients.begin(), m_clients.end());
+    }
+
+    const uint8_t *data = reinterpret_cast<const uint8_t *>(jsonPayload.data());
+    const uint32_t len = static_cast<uint32_t>(jsonPayload.size());
+    for (auto &client : snapshot)
+    {
+        if (client->IsConnected() && client->SupportsCaretExt())
+            client->SendCommand(SidebandProtocol::Cmd::TEXT_CURSOR_EXT, 0, data, len);
+    }
+}
+
 void SidebandServer::BroadcastCommand(uint32_t cmd_id, uint32_t req_id,
                                       const uint8_t *payload, uint32_t payload_len)
 {
@@ -362,10 +379,19 @@ void SidebandServer::DispatchCommandInner(SidebandSession &session,
 
     case Cmd::HELLO:
     {
+        if (payload && payload_len > 0)
+        {
+            std::string reqStr(reinterpret_cast<const char *>(payload), payload_len);
+            bool found = false;
+            bool caretExt = Json::GetBool(reqStr, "caret_ext", false, &found);
+            if (found)
+                session.SetSupportsCaretExt(caretExt);
+        }
         std::string resp = "{\"proto_ver\":" + std::to_string(PROTO_VERSION) +
-                           ",\"caps\":[\"cursor\",\"display\",\"audio\"]"
+                           ",\"caps\":[\"cursor\",\"display\",\"audio\",\"caret_ext\"]"
+                           ",\"caret_ext\":true"
                            ",\"auth_required_for\":[12,16,17,32,33,34]"
-                           ",\"authenticated\":" + (session.IsAuthenticated() ? "true" : "false") +
+                           ",\"authenticated\":" + std::string(session.IsAuthenticated() ? "true" : "false") +
                            "}";
         std::vector<uint8_t> p(resp.begin(), resp.end());
         session.SendCommand(Cmd::HELLO, req_id, p);

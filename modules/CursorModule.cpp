@@ -10,28 +10,19 @@
  */
 
 #include "CursorModule.hpp"
+#include "cursor/CaretEngine.hpp"
 #include "Logger.hpp"
 #include "SidebandProtocol.hpp"
+#include "Win32Util.hpp"
 
 #include <windows.h>
 #include <shellscalingapi.h>
 #include <gdiplus.h>
-// UIA 客户端规范头。命名规则备忘（前一轮踩过的坑，别再犯）：
-// 客户端接口全部带 IUIAutomation 前缀 —— IUIAutomationTextPattern(2)、
-// IUIAutomationTextRange(Array)、IUIAutomationElement；
-// ITextPattern(2) 是提供方（UIAutomationCore provider 侧）的名字，
-// 客户端头里不存在。元素上取模式的方法是 GetCurrentPattern
-//（IUnknown** 出参），GetPattern 是 WinRT provider 侧的名字。
-#include <UIAutomationClient.h>
-#include <ole2.h>
-#include <oleauto.h>   // SafeArrayAccessData / SafeArrayGetElement
 
 #include <algorithm>
 #include <cstring>
 #include <cmath>
 #include <cstdio>
-#include <cwchar>
-#include <set>
 #include <string>
 
 #pragma comment(lib, "gdi32.lib")
@@ -40,35 +31,19 @@
 #pragma comment(lib, "shcore.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "advapi32.lib")
-// UIA 接口定义的导入库（UIAutomationClient.h 自带 pragma 时此行为冗余保险）
-#pragma comment(lib, "uiautomationcore.lib")
 
-namespace {
-// GetCurrentPattern 出参是 IUnknown**，取到后再按需 QueryInterface。
-// 封装判空 + 转具体客户端接口，消除散落各处的双重判错分支。
-bool QueryTextPattern2(IUIAutomationElement *el, IUIAutomationTextPattern2 **out)
-{
-    *out = nullptr;
-    IUnknown *pUnk = nullptr;
-    HRESULT hr = el->GetCurrentPattern(UIA_TextPattern2Id, &pUnk);
-    if (FAILED(hr) || !pUnk)
-        return false;
-    hr = pUnk->QueryInterface(IID_PPV_ARGS(out));
-    pUnk->Release();
-    return SUCCEEDED(hr) && *out;
-}
-bool QueryTextPattern(IUIAutomationElement *el, IUIAutomationTextPattern **out)
-{
-    *out = nullptr;
-    IUnknown *pUnk = nullptr;
-    HRESULT hr = el->GetCurrentPattern(UIA_TextPatternId, &pUnk);
-    if (FAILED(hr) || !pUnk)
-        return false;
-    hr = pUnk->QueryInterface(IID_PPV_ARGS(out));
-    pUnk->Release();
-    return SUCCEEDED(hr) && *out;
-}
-} // namespace
+#ifndef EVENT_OBJECT_TEXTSELECTIONCHANGED
+#define EVENT_OBJECT_TEXTSELECTIONCHANGED 0x8014
+#endif
+#ifndef EVENT_OBJECT_IME_SHOW
+#define EVENT_OBJECT_IME_SHOW 0x8027
+#endif
+#ifndef EVENT_OBJECT_IME_HIDE
+#define EVENT_OBJECT_IME_HIDE 0x8028
+#endif
+#ifndef EVENT_OBJECT_IME_CHANGE
+#define EVENT_OBJECT_IME_CHANGE 0x8029
+#endif
 
 // 全局单例（钩子回调转发用）
 CursorModule *CursorModule::s_instance = nullptr;
@@ -539,7 +514,12 @@ void CursorEngine::CaptureAndSend()
 //                      CursorModule
 // ============================================================
 
-CursorModule::CursorModule(SidebandServer &server) : m_server(server)
+CursorModule::CursorModule(SidebandServer &server,
+                           bool allowImeFallback,
+                           bool allowControlBoxForLegacy)
+    : m_server(server),
+      m_allowImeFallback(allowImeFallback),
+      m_allowControlBoxForLegacy(allowControlBoxForLegacy)
 {
     s_instance = this;
 }
@@ -557,6 +537,10 @@ bool CursorModule::Start()
         return true; // 已启动
 
     m_engine = std::make_unique<CursorEngine>(m_server);
+    Caret::CaretOptions opts;
+    opts.allowImeFallback = m_allowImeFallback;
+    opts.allowControlBoxForLegacy = m_allowControlBoxForLegacy;
+    m_caretEngine = std::make_unique<Caret::CaretEngine>(opts);
     m_exit = false;
 
     // 钩子消息循环线程（必须在有自己的消息循环的线程上安装 WH_MOUSE_LL/WH_KEYBOARD_LL/WinEventHook）
@@ -575,7 +559,10 @@ bool CursorModule::Start()
     m_textCursorThread = std::thread([this]()
                                      { TextCursorMonitorLoop(); });
 
-    Logger::Get().Info("CursorModule: 已启动");
+    Logger::Get().Info("CursorModule: 已启动 (ime_fallback=",
+                       (m_allowImeFallback ? "true" : "false"),
+                       ", control_box=",
+                       (m_allowControlBoxForLegacy ? "true" : "false"), ")");
     return true;
 }
 
@@ -602,6 +589,7 @@ void CursorModule::Stop()
     if (m_textCursorThread.joinable())
         m_textCursorThread.join();
 
+    m_caretEngine.reset();
     m_engine.reset();
     Logger::Get().Info("CursorModule: 已停止");
 }
@@ -612,29 +600,45 @@ void CursorModule::HookLoop()
 
     try
     {
-    // 在此线程上安装钩子（要求消息循环）
-    m_hWinEventHook = SetWinEventHook(
-        EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_NAMECHANGE, NULL,
-        CursorModule::WinEventProc, 0, 0,
-        WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+        // 1. 鼠标光标形状变化钩子
+        m_hWinEventHook = SetWinEventHook(
+            EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_NAMECHANGE, NULL,
+            CursorModule::WinEventProc, 0, 0,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
 
-    m_hMouseHook = SetWindowsHookEx(WH_MOUSE_LL, CursorModule::MouseProc, NULL, 0);
-    if (!m_hMouseHook)
-        Logger::Get().Error("CursorModule: 鼠标钩子安装失败");
+        // 2. 文本插入符事件钩子（窄区间 + 回调首行硬过滤）
+        m_hCaretFgHook = SetWinEventHook(
+            EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, NULL,
+            CursorModule::CaretWinEventProc, 0, 0,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
 
-    m_hKeyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, CursorModule::KeyboardProc, NULL, 0);
-    if (!m_hKeyboardHook)
-        Logger::Get().Error("CursorModule: 键盘钩子安装失败");
-    else
-        Logger::Get().Info("CursorModule: 文本光标追踪已启用 (鼠标+键盘+轮询)");
+        m_hCaretObjHook = SetWinEventHook(
+            EVENT_OBJECT_SHOW, EVENT_OBJECT_LOCATIONCHANGE, NULL,
+            CursorModule::CaretWinEventProc, 0, 0,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
 
-    // 消息循环（钩子回调在此线程派发）
-    MSG msg;
-    while (!m_exit && GetMessage(&msg, NULL, 0, 0))
-    {
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
-    }
+        m_hCaretTextHook = SetWinEventHook(
+            EVENT_OBJECT_TEXTSELECTIONCHANGED, EVENT_OBJECT_IME_CHANGE, NULL,
+            CursorModule::CaretWinEventProc, 0, 0,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+
+        m_hMouseHook = SetWindowsHookEx(WH_MOUSE_LL, CursorModule::MouseProc, NULL, 0);
+        if (!m_hMouseHook)
+            Logger::Get().Error("CursorModule: 鼠标钩子安装失败");
+
+        m_hKeyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, CursorModule::KeyboardProc, NULL, 0);
+        if (!m_hKeyboardHook)
+            Logger::Get().Error("CursorModule: 键盘钩子安装失败");
+        else
+            Logger::Get().Info("CursorModule: 文本光标追踪已启用 (WinEvent + 鼠标/键盘 + 兜底)");
+
+        // 消息循环（钩子回调在此线程派发）
+        MSG msg;
+        while (!m_exit && GetMessage(&msg, NULL, 0, 0))
+        {
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
     }
     catch (const std::exception &e)
     {
@@ -646,6 +650,21 @@ void CursorModule::HookLoop()
     }
 
     // 卸载钩子（必须在安装它的线程上）
+    if (m_hCaretTextHook)
+    {
+        UnhookWinEvent(m_hCaretTextHook);
+        m_hCaretTextHook = NULL;
+    }
+    if (m_hCaretObjHook)
+    {
+        UnhookWinEvent(m_hCaretObjHook);
+        m_hCaretObjHook = NULL;
+    }
+    if (m_hCaretFgHook)
+    {
+        UnhookWinEvent(m_hCaretFgHook);
+        m_hCaretFgHook = NULL;
+    }
     if (m_hWinEventHook)
     {
         UnhookWinEvent(m_hWinEventHook);
@@ -666,32 +685,42 @@ void CursorModule::HookLoop()
 
 void CursorModule::OnClientConnected(SidebandSession &)
 {
-    // 新客户端连入，强制刷新光标状态。
-    // 只置标志：软重置统一由 WorkerLoop 在捕获线程执行，
-    // 避免在网络线程直接调 m_engine->ResetAfterDisplayChange() 造成跨线程写。
     {
         std::lock_guard<std::mutex> l(m_mutexCursor);
         m_displayResetPending = true;
         m_cursorChanged = true;
     }
     m_cvCursorChanged.notify_one();
+
+    {
+        std::lock_guard<std::mutex> l(m_mutexTextCursor);
+        m_textCursorResetPending = true;
+        m_textCursorPoke = true;
+        m_textCursorPokeForce = true;
+    }
+    m_cvTextCursor.notify_one();
 }
 
 void CursorModule::OnClientDisconnected(SidebandSession &)
 {
-    // 单客户端断开不影响其他客户端；不需要特殊处理
 }
 
 void CursorModule::OnDisplayChanged()
 {
-    // WM_DISPLAYCHANGE（UI 线程）→ 只置标志唤醒 WorkerLoop，
-    // 软重置在捕获线程执行（CursorEngine 的状态成员无同步保护）。
     {
         std::lock_guard<std::mutex> l(m_mutexCursor);
         m_displayResetPending = true;
         m_cursorChanged = true;
     }
     m_cvCursorChanged.notify_one();
+
+    {
+        std::lock_guard<std::mutex> l(m_mutexTextCursor);
+        m_textCursorResetPending = true;
+        m_textCursorPoke = true;
+        m_textCursorPokeForce = true;
+    }
+    m_cvTextCursor.notify_one();
 }
 
 void CursorModule::WorkerLoop()
@@ -706,7 +735,6 @@ void CursorModule::WorkerLoop()
                                            [this] { return m_cursorChanged || m_exit; });
                 if (m_exit)
                     break;
-                // 显示拓扑变化 / 新客户端连入 → 先做软重置，再照常捕获
                 bool reset = m_displayResetPending;
                 m_displayResetPending = false;
                 m_cursorChanged = false;
@@ -730,16 +758,130 @@ void CursorModule::WorkerLoop()
     }
 }
 
-void CursorModule::PokeTextCursor(bool force)
+void CursorModule::PokeTextCursor(bool force, bool fromKeyboard)
 {
-    // 由低级钩子回调调用 —— 只允许做常数时间的工作然后立刻返回
     {
         std::lock_guard<std::mutex> l(m_mutexTextCursor);
         m_textCursorPoke = true;
         if (force)
             m_textCursorPokeForce = true;
+        if (fromKeyboard)
+            m_lastKeyboardInputMs = GetTickCount64();
     }
     m_cvTextCursor.notify_one();
+}
+
+void CursorModule::OnCaretWinEvent(DWORD event, HWND hwnd, LONG idObject, LONG idChild)
+{
+    // 首行硬过滤：绝不允许桌面窗口位置抖动把工作线程打醒
+    if (event == EVENT_SYSTEM_FOREGROUND)
+    {
+        m_trackedFgHwnd.store(hwnd, std::memory_order_relaxed);
+        PokeTextCursor(true);
+        return;
+    }
+
+    if (event == EVENT_OBJECT_FOCUS)
+    {
+        if (idObject != OBJID_CLIENT && idObject != CHILDID_SELF)
+            return;
+        m_trackedFocusHwnd.store(hwnd, std::memory_order_relaxed);
+        PokeTextCursor(true);
+        return;
+    }
+
+    if (event == EVENT_OBJECT_TEXTSELECTIONCHANGED)
+    {
+        PokeTextCursor(false);
+        return;
+    }
+
+    if (event == EVENT_OBJECT_IME_SHOW || event == EVENT_OBJECT_IME_CHANGE)
+    {
+        std::lock_guard<std::mutex> l(m_mutexTextCursor);
+        m_imeVisible = true;
+        if (hwnd)
+            m_imeHwnd = hwnd;
+        m_lastImeEventMs = GetTickCount64();
+        m_pendingImeEvent = true;
+        m_textCursorPoke = true;
+        m_cvTextCursor.notify_one();
+        return;
+    }
+
+    if (event == EVENT_OBJECT_IME_HIDE)
+    {
+        std::lock_guard<std::mutex> l(m_mutexTextCursor);
+        m_imeVisible = false;
+        m_imeHwnd = nullptr;
+        m_textCursorPoke = true;
+        m_cvTextCursor.notify_one();
+        return;
+    }
+
+    if (event == EVENT_OBJECT_SHOW ||
+        event == EVENT_OBJECT_HIDE ||
+        event == EVENT_OBJECT_LOCATIONCHANGE)
+    {
+        if (idObject == OBJID_CARET)
+        {
+            std::lock_guard<std::mutex> l(m_mutexTextCursor);
+            m_pendingCaretEvent = true;
+            m_lastCaretEventHwnd = hwnd;
+            m_lastCaretEventObj = idObject;
+            m_lastCaretEventChild = idChild;
+            m_textCursorPoke = true;
+            m_cvTextCursor.notify_one();
+            return;
+        }
+
+        if (event == EVENT_OBJECT_LOCATIONCHANGE && idObject == OBJID_WINDOW && hwnd)
+        {
+            HWND fg = m_trackedFgHwnd.load(std::memory_order_relaxed);
+            HWND foc = m_trackedFocusHwnd.load(std::memory_order_relaxed);
+            if (hwnd == fg || hwnd == foc)
+            {
+                PokeTextCursor(false);
+            }
+        }
+    }
+}
+
+// 覆盖率排查用：把「哪个程序、哪个窗口类」直接写进文本光标日志，
+// 否则一轮应用扫下来只能靠时间戳猜是谁。
+// 只读进程名与类名，不碰任何文本内容；级别没开到 DEBUG 时一笔系统调用都不做。
+// hwnd 传的是插入符归属窗口（IME 锚点路径填的也是被输入程序的窗口，不是候选框自己），
+// 所以 src=5 这行报出来的仍是「你正在敲字的那个应用」。
+static std::string CaretOwnerTag(HWND hwnd)
+{
+    if (Logger::Get().GetLogLevel() > LogLevel::DEBUG)
+        return std::string();
+    if (!hwnd || !IsWindow(hwnd))
+        return "<->";
+
+    wchar_t cls[96] = L"";
+    GetClassNameW(hwnd, cls, 96);
+
+    std::string exe = "?";
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid)
+    {
+        HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (hProcess)
+        {
+            wchar_t path[512] = L"";
+            DWORD len = 512;
+            if (QueryFullProcessImageNameW(hProcess, 0, path, &len))
+            {
+                const std::wstring full(path, len);
+                const size_t slash = full.find_last_of(L"\\/");
+                exe = Win32Util::WideToUtf8(slash == std::wstring::npos ? full : full.substr(slash + 1));
+            }
+            CloseHandle(hProcess);
+        }
+    }
+    return exe + "|" + Win32Util::WideToUtf8(cls);
 }
 
 void CursorModule::TextCursorMonitorLoop()
@@ -751,22 +893,120 @@ void CursorModule::TextCursorMonitorLoop()
         try
         {
             bool force = false;
+            bool reset = false;
+            bool caretEvt = false;
+            bool imeEvt = false;
+            bool imeVisible = false;
+            HWND caretHwnd = nullptr;
+            LONG caretObj = 0;
+            LONG caretChild = 0;
+            HWND imeHwnd = nullptr;
+            uint64_t lastImeMs = 0;
+            uint64_t lastKbMs = 0;
+
             {
-                // 有输入事件就立刻醒，否则每 100ms 兜底轮询一次
+                // 活跃输入态 250ms 校对滚动/状态；刚按键 350ms 内使用 80ms 短随访捕捉 Win11 TextInputHost 延迟渲染的候选框；其余 1000ms 低频休眠
+                const uint64_t nowLoopMs = GetTickCount64();
+                const uint64_t recentAtomicKbMs = m_lastKeyboardAtomicMs.load(std::memory_order_relaxed);
+                const bool activeNow = m_textCursorActive.load(std::memory_order_relaxed);
+                const bool postKeyFollowup = !activeNow && recentAtomicKbMs > 0 &&
+                                             nowLoopMs >= recentAtomicKbMs &&
+                                             (nowLoopMs - recentAtomicKbMs) <= 350ULL;
+                const auto waitDur = activeNow
+                                         ? std::chrono::milliseconds(250)
+                                         : (postKeyFollowup
+                                                ? std::chrono::milliseconds(80)
+                                                : std::chrono::milliseconds(1000));
                 std::unique_lock<std::mutex> l(m_mutexTextCursor);
-                m_cvTextCursor.wait_for(l, std::chrono::milliseconds(100),
+                m_cvTextCursor.wait_for(l, waitDur,
                                         [this] { return m_textCursorPoke || m_exit; });
                 if (m_exit)
                     break;
+
+                // 短暂事件合并去抖（12ms），防止连续高频 LOCATIONCHANGE/打字脉冲重复触发跨进程 UIA
+                if (m_textCursorPoke && !m_textCursorPokeForce && !m_textCursorResetPending)
+                {
+                    l.unlock();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(12));
+                    l.lock();
+                    if (m_exit)
+                        break;
+                }
+
                 force = m_textCursorPokeForce;
+                reset = m_textCursorResetPending;
+                caretEvt = m_pendingCaretEvent;
+                imeEvt = m_pendingImeEvent;
+                imeVisible = m_imeVisible;
+                caretHwnd = m_lastCaretEventHwnd;
+                caretObj = m_lastCaretEventObj;
+                caretChild = m_lastCaretEventChild;
+                imeHwnd = m_imeHwnd;
+                lastImeMs = m_lastImeEventMs;
+                lastKbMs = m_lastKeyboardInputMs;
+
                 m_textCursorPoke = false;
                 m_textCursorPokeForce = false;
+                m_textCursorResetPending = false;
+                m_pendingCaretEvent = false;
+                m_pendingImeEvent = false;
             }
 
-            // UpdateTextCursorState 现在只在本线程调用，
-            // 其内部的 static 缓存不再有跨线程竞争
-            if (m_server.HasClients())
-                UpdateTextCursorState(force);
+            if (reset && m_caretEngine)
+                m_caretEngine->ResetState();
+
+            if (!m_server.HasClients() || !m_caretEngine)
+                continue;
+
+            Caret::CaretContextSnapshot hint;
+            hint.triggeredByCaretEvent = caretEvt;
+            hint.triggeredByImeEvent = imeEvt;
+            hint.lastImeEventMs = lastImeMs;
+            const uint64_t atomicKbMs = m_lastKeyboardAtomicMs.load(std::memory_order_relaxed);
+            hint.lastKeyboardInputMs = std::max(lastKbMs, atomicKbMs);
+            hint.imeVisible = imeVisible;
+            if (imeVisible && imeHwnd && IsWindow(imeHwnd) && IsWindowVisible(imeHwnd))
+            {
+                RECT rc{};
+                if (GetWindowRect(imeHwnd, &rc))
+                {
+                    hint.imeWindowRect = Caret::PixelRect{rc.left, rc.top, rc.right, rc.bottom};
+                }
+            }
+
+            auto out = m_caretEngine->DetectAndEvaluate(&hint, caretHwnd, caretObj, caretChild, force);
+            m_textCursorActive.store(out.result.valid, std::memory_order_relaxed);
+
+            if (out.result.valid)
+            {
+                m_trackedFgHwnd.store(GetForegroundWindow(), std::memory_order_relaxed);
+                m_trackedFocusHwnd.store(reinterpret_cast<HWND>(out.result.hwnd), std::memory_order_relaxed);
+            }
+
+            if (out.publish.sendLegacy)
+            {
+                const HWND ownerHwnd = out.result.valid
+                                           ? reinterpret_cast<HWND>(out.result.hwnd)
+                                           : GetForegroundWindow();
+                const std::string owner = CaretOwnerTag(ownerHwnd);
+
+                if (out.publish.legacy.yPercent == -1)
+                    Logger::Get().Debug("[文本光标] 退出输入状态 ", owner);
+                else
+                    Logger::Get().Debug("[文本光标] Y=", out.publish.legacy.yPercent / 100.0f,
+                                        "% src=", out.publish.legacy.source,
+                                        " h=", out.publish.legacy.height,
+                                        " @", owner);
+
+                m_server.BroadcastTextCursorState(out.publish.legacy.yPercent,
+                                                  out.publish.legacy.height,
+                                                  out.publish.legacy.source);
+            }
+
+            if (out.publish.sendExt && !out.extJson.empty())
+            {
+                m_server.BroadcastTextCursorExt(out.extJson);
+            }
         }
         catch (const std::exception &e)
         {
@@ -778,482 +1018,8 @@ void CursorModule::TextCursorMonitorLoop()
         }
     }
 
-    // UIA/COM 清理必须在本线程做（m_pUia 是跨进程 COM 接口指针，
-    // 线程亲和；CoUninitialize 同理）。跑在循环之后的这里正是
-    // m_textCursorThread 自己的退出路径。
-    if (m_pUia)
-    {
-        m_pUia->Release();
-        m_pUia = nullptr;
-    }
-    if (m_uiaComInited)
-    {
-        CoUninitialize();
-        m_uiaComInited = false;
-    }
-}
-
-// 判定插入符是否真的在闪。GUI_CARETBLINKING 未置位时 hwndCaret 可能
-// 仍是一个残留的已注册插入符 —— 典型场景：应用失焦/失活后没调
-// DestroyCaret，GetGUIThreadInfo 照样报出 rcCaret，但插入符实际不可见。
-// 直接上报会持续报告一个并不存在的光标位置，所以这里过滤掉。
-static bool IsCaretActuallyBlinking(const GUITHREADINFO &gti)
-{
-    return (gti.flags & GUI_CARETBLINKING) != 0;
-}
-
-// ============================================================
-//   UI Automation 路径（阶段二：自绘 caret 应用兜底）
-// ============================================================
-
-// 确保 UIA 可用（惰性初始化，只在 m_textCursorThread 上调用）。
-// 返回可用的 IUIAutomation*；不可用时返回 nullptr。
-// 失败分两种：
-//  - CoCreateInstance/Initialize 失败：置 m_uiaBroken，之后每 60s 才重试一次，
-//    避免每次取词都在注定失败的 COM 初始化上空转。
-//  - 只是本次调用失败：不动 m_uiaBroken，下一轮照常再试。
-IUIAutomation *CursorModule::EnsureUia()
-{
-    if (m_pUia)
-        return m_pUia;
-    if (m_uiaBroken)
-    {
-        if (std::chrono::steady_clock::now() < m_uiaNextRetry)
-            return nullptr;
-        m_uiaBroken = false;  // 重试窗口到了，重新走完整初始化
-    }
-
-    // CoInitialize: UIA 内部自己持有 MTA，普通线程需要先初始化 COM。
-    // STA 也可用（UIA 会内部转 MTA），MTA 减少一次隐式封送。
-    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE)
-        { m_uiaBroken = true; m_uiaNextRetry = std::chrono::steady_clock::now() + std::chrono::seconds(60); return nullptr; }
-    // 只有本线程自己 init 成功（S_OK）才需要配对 CoUninitialize；
-    // RPC_E_CHANGED_MODE 表示线程已有别的模式，释放责任不归我们。
-    if (hr == S_OK)
-        m_uiaComInited = true;
-
-    hr = CoCreateInstance(CLSID_CUIAutomation, nullptr, CLSCTX_INPROC_SERVER,
-                          IID_PPV_ARGS(&m_pUia));
-    if (FAILED(hr) || !m_pUia)
-    {
-        char hrBuf[32];
-        std::snprintf(hrBuf, sizeof(hrBuf), "0x%08lX", (unsigned long)hr);
-        Logger::Get().Warning("CursorModule: UIA 初始化失败 hr=", hrBuf);
-        m_pUia = nullptr;
-        m_uiaBroken = true;
-        m_uiaNextRetry = std::chrono::steady_clock::now() + std::chrono::seconds(60);
-        return nullptr;
-    }
-
-    Logger::Get().Info("CursorModule: UIA 初始化成功（自绘插入符应用开始支持）");
-    return m_pUia;
-}
-
-// 从 TextRange 的边界矩形数组里取"最后一行"的底边中点。
-// 返回 false = 矩形数组为空/格式异常。
-// GetBoundingRectangles 返回 VT_R8 SAFEARRAY，每矩形 4 个 double：
-// [left, top, width, height]（注意是宽高不是 right/bottom）。
-static bool RectsToCaretBottom(SAFEARRAY *psa, int &outX, int &outY, int &outHeight)
-{
-    if (!psa || SafeArrayGetDim(psa) != 1)  // GetDim 返回维度数（非 HRESULT）
-        return false;
-
-    LONG lb = 0, ub = 0;
-    SafeArrayGetLBound(psa, 1, &lb);
-    SafeArrayGetUBound(psa, 1, &ub);
-    LONG count = ub - lb + 1;
-    if (count < 4 || (count % 4) != 0)
-        return false;
-    LONG rects = count / 4;
-
-    // 一次性锁定直取数据指针，避免逐元素 SafeArrayGetElement 的反复加锁。
-    // 返回的指针指向 LBound 元素，元素连续存放，第 r 个矩形就是 data + r*4。
-    double *data = nullptr;
-    if (FAILED(SafeArrayAccessData(psa, (void HUGEP **)&data)) || !data)
-        return false;
-
-    double bestTop = 0.0, bestBottom = 0.0, bestLeft = 0.0, bestRight = 0.0;
-    bool got = false;
-    for (LONG r = 0; r < rects; r++)
-    {
-        const double *v = data + r * 4;
-        double left = v[0], top = v[1], width = v[2], height = v[3];
-        // 只要求行高非零：GetCaretRange 返回的是退化（空）选区，在不少实现
-        //（含 Chromium）里就是零宽 + 行高的矩形，零宽是正常形态不能跳过。
-        // 零宽时 left==right，中线自然退化为 left，正是插入点。
-        if (height <= 0.0)
-            continue;
-        double bottom = top + height;
-        // 取"最后一行"（caret 所在行）：行基线在下的就是当前输入行
-        if (!got || bottom > bestBottom)
-        {
-            got = true;
-            bestTop = top;
-            bestBottom = bottom;
-            bestLeft = left;
-            bestRight = left + width;
-        }
-    }
-    SafeArrayUnaccessData(psa);
-    if (!got)
-        return false;
-
-    int x = (int)std::llround((bestLeft + bestRight) / 2.0);
-    int y = (int)std::llround(bestBottom);
-    int h = (int)std::llround(bestBottom - bestTop);
-    if (h < 0)
-        h = 0;
-    outX = x;
-    outY = y;
-    outHeight = h;
-    return true;
-}
-
-// 从文本区间取插入符底边（三级尝试），坐标语义与 RectsToCaretBottom 一致。
-//
-// 1) 直接 GetBoundingRectangles：非退化选区（用户真的选中了文字），
-//    以及 Chromium 等直接给"零宽+行高"矩形的实现，走这里。
-// 2) 退化区间陷阱：打字位（未选中文本）是零宽区间，Windows Terminal、
-//    JetBrains 系等实现对其直接返回**空矩形数组**（microsoft/terminal
-//    #14664），必须先 Clone 再 ExpandToEnclosingUnit(TextUnit_Character)
-//    归一化为一个字符，才有矩形可取。
-// 3) 行尾兜底：prompt 末尾 / 空缓冲时 Expand 无字符可展，把 Start 端点
-//    向前借 1 个字符，取那一行的矩形（X 不上报，借字符右缘无妨）。
-static bool RangeToCaretBottom(IUIAutomationTextRange *pRange, int &outX, int &outY, int &outHeight)
-{
-    if (!pRange)
-        return false;
-
-    // 1. 直接取
-    SAFEARRAY *psa = nullptr;
-    if (SUCCEEDED(pRange->GetBoundingRectangles(&psa)))
-    {
-        bool ok = RectsToCaretBottom(psa, outX, outY, outHeight);
-        if (psa)
-            SafeArrayDestroy(psa);
-        if (ok)
-            return true;
-    }
-
-    // 2. 退化区间：Expand 归一化后再取
-    IUIAutomationTextRange *pExpanded = nullptr;
-    if (SUCCEEDED(pRange->Clone(&pExpanded)) && pExpanded)
-    {
-        pExpanded->ExpandToEnclosingUnit(TextUnit_Character);
-        psa = nullptr;
-        if (SUCCEEDED(pExpanded->GetBoundingRectangles(&psa)))
-        {
-            bool ok = RectsToCaretBottom(psa, outX, outY, outHeight);
-            if (psa)
-                SafeArrayDestroy(psa);
-            if (ok)
-            {
-                pExpanded->Release();
-                return true;
-            }
-        }
-
-        // 3. 行尾：向后无字符，向前借 1 个字符
-        IUIAutomationTextRange *pBack = nullptr;
-        if (SUCCEEDED(pRange->Clone(&pBack)) && pBack)
-        {
-            int moved = 0;
-            if (SUCCEEDED(pBack->MoveEndpointByUnit(TextPatternRangeEndpoint_Start,
-                                                    TextUnit_Character, -1, &moved)) && moved != 0)
-            {
-                psa = nullptr;
-                if (SUCCEEDED(pBack->GetBoundingRectangles(&psa)))
-                {
-                    bool ok = RectsToCaretBottom(psa, outX, outY, outHeight);
-                    if (psa)
-                        SafeArrayDestroy(psa);
-                    if (ok)
-                    {
-                        pBack->Release();
-                        pExpanded->Release();
-                        return true;
-                    }
-                }
-            }
-            pBack->Release();
-        }
-        pExpanded->Release();
-    }
-    return false;
-}
-
-bool CursorModule::GetCaretViaUIA(int &outX, int &outY, int &outHeight)
-{
-    outX = outY = outHeight = 0;
-
-    IUIAutomation *uia = EnsureUia();
-    if (!uia)
-        return false;
-
-    // 1. 聚焦元素。FocusChanged 可能后到，捕获点位置为准 —— GetFocusedElement
-    //    直查实时状态，比事件缓存可靠。
-    IUIAutomationElement *pFocus = nullptr;
-    if (FAILED(uia->GetFocusedElement(&pFocus)) || !pFocus)
-        return false;
-
-    bool ok = false;
-    int x = 0, y = 0, h = 0;
-
-    // 2. TextPattern2::GetCaretRange —— Chromium、Firefox、WinUI、记事本
-    //    等现代文本栈都实现。取不到再退化到 selection（第 3 步）。
-    IUIAutomationTextPattern2 *pPattern2 = nullptr;
-    if (QueryTextPattern2(pFocus, &pPattern2))
-    {
-        // 场景：SelectAll 后 caret 在文末 —— 确保取的是 caret 而非 selection 头。
-        BOOL isActive = FALSE;
-        IUIAutomationTextRange *pRange = nullptr;
-        if (SUCCEEDED(pPattern2->GetCaretRange(&isActive, &pRange)) && pRange)
-        {
-            // RangeToCaretBottom 内含退化区间 Expand + 行尾借字符三级尝试，
-            // 覆盖直接取矩形为空的实现（Windows Terminal 等）。
-            if (RangeToCaretBottom(pRange, x, y, h))
-                ok = true;
-            pRange->Release();
-        }
-        pPattern2->Release();
-    }
-
-    // 3. 退化路径：无 TextPattern2 时取选区矩形。客户端 GetSelection 返回
-    //    IUIAutomationTextRangeArray（Length + GetElement 的 COM 集合，
-    //    不是 SAFEARRAY）。
-    //    【闸门】只接受 Edit 控件，或前台窗口是 Windows Terminal 的
-    //    Document 控件：浏览器里点击页面文本会留下 DOM 选区，Document
-    //    控件的 TextPattern 会把它报成 selection —— 那不是 caret，
-    //    照单全收就等于从 UIA 后门放回假数据（阶段一刚清理掉的那种）。
-    //    例外原因：WT 无 TextPattern2、退化选区返回空矩形（#14664），
-    //    只有 GetSelection+Expand 这一条路能取到（RangeToCaretBottom
-    //    第 2 级）；其 TermControl 恰为 Document 控件。名单只收
-    //    CASCADIA_HOSTING_WINDOW_CLASS 一个类，别的窗口该挡照挡。
-    if (!ok)
-    {
-        IUIAutomationTextPattern *pPattern = nullptr;
-        if (QueryTextPattern(pFocus, &pPattern))
-        {
-            VARIANT vtType;
-            VariantInit(&vtType);
-            bool isEdit = false;
-            if (SUCCEEDED(pFocus->GetCurrentPropertyValue(UIA_ControlTypePropertyId, &vtType)) &&
-                vtType.vt == VT_I4 && vtType.lVal == UIA_EditControlTypeId)
-                isEdit = true;
-            VariantClear(&vtType);
-
-            if (!isEdit)
-            {
-                // 前台窗口类名单点放行：Windows Terminal（CASCADIA_HOSTING_WINDOW_CLASS）
-                HWND fg = GetForegroundWindow();
-                wchar_t cls[64] = L"";
-                if (fg && GetClassNameW(fg, cls, 64) &&
-                    wcscmp(cls, L"CASCADIA_HOSTING_WINDOW_CLASS") == 0)
-                    isEdit = true;
-            }
-
-            if (isEdit)
-            {
-                IUIAutomationTextRangeArray *pRanges = nullptr;
-                if (SUCCEEDED(pPattern->GetSelection(&pRanges)) && pRanges)
-                {
-                    // COM IDL 属性在 C++ 里展开为 getter：get_Length(int*)，
-                    // 不能按 C#/JS 习惯直取 ranges->Length（C2039 的根因）
-                    int n = 0;
-                    if (SUCCEEDED(pRanges->get_Length(&n)))
-                    {
-                        for (int i = 0; i < n && !ok; i++)
-                        {
-                            IUIAutomationTextRange *pRange = nullptr;
-                            if (FAILED(pRanges->GetElement(i, &pRange)) || !pRange)
-                                continue;
-                            // 同样走三级尝试：WT 的退化选区靠第 2 级 Expand 命中
-                            if (RangeToCaretBottom(pRange, x, y, h))
-                                ok = true;
-                            pRange->Release();
-                        }
-                    }
-                    pRanges->Release();
-                }
-            }
-            pPattern->Release();
-        }
-    }
-
-    pFocus->Release();
-
-    // UIA 级诊断（DEBUG）：一次调用就能看清断在哪一环。
-    // 只在取不到时进入，且用 set 去重避免每次轮询刷屏。
-    if (!ok)
-    {
-        IUIAutomationElement *pDiag = nullptr;
-        if (SUCCEEDED(uia->GetFocusedElement(&pDiag)) && pDiag)
-        {
-            static std::set<std::string> reported;  // 只在 m_textCursorThread 上跑，无竞争
-            int ctlType = -1;
-            VARIANT vt;
-            VariantInit(&vt);
-            if (SUCCEEDED(pDiag->GetCurrentPropertyValue(UIA_ControlTypePropertyId, &vt)) &&
-                vt.vt == VT_I4)
-                ctlType = vt.lVal;
-            VariantClear(&vt);
-
-            bool hasTP2 = false, hasTP = false;
-            IUnknown *pUnk = nullptr;
-            if (SUCCEEDED(pDiag->GetCurrentPattern(UIA_TextPattern2Id, &pUnk)) && pUnk)
-                { hasTP2 = true; pUnk->Release(); }
-            if (SUCCEEDED(pDiag->GetCurrentPattern(UIA_TextPatternId, &pUnk)) && pUnk)
-                { hasTP = true; pUnk->Release(); }
-
-            char key[64];
-            std::snprintf(key, sizeof(key), "ctl=%d tp2=%d tp=%d", ctlType, hasTP2, hasTP);
-            if (reported.insert(key).second)
-                Logger::Get().Debug("[文本光标] UIA 取不到 caret：", key,
-                                    "（ctl: 500=Document/Edit类 504=Edit, tp2/tp: 有无 TextPattern2/1）");
-            pDiag->Release();
-        }
-    }
-
-    if (!ok)
-        return false;
-
-    outX = x;
-    outY = y;
-    outHeight = h;
-    return true;
-}
-
-bool CursorModule::GetCaretViaWin32(int &outX, int &outY, int &outHeight)
-{
-    // 必须取前台窗口所属线程：GetGUIThreadInfo(0) 拿的是"调用线程"的 GUI 状态，
-    // 而本函数跑在 m_textCursorThread 工作线程上，没有 GUI 消息队列，
-    // 永远拿不到 caret/focus。前台窗口的线程才有这些信息。
-    HWND hwndForeground = GetForegroundWindow();
-    if (!hwndForeground)
-        return false;
-    DWORD foregroundThreadId = GetWindowThreadProcessId(hwndForeground, nullptr);
-    if (foregroundThreadId == 0)
-        return false;
-
-    GUITHREADINFO gti = {sizeof(GUITHREADINFO)};
-    if (!GetGUIThreadInfo(foregroundThreadId, &gti))
-        return false;
-
-    // 只认真正的 Win32 系统插入符。
-    //
-    // 历史教训：旧版这里还有一条"焦点窗口内有鼠标 → 返回鼠标位置"的兜底，
-    // 注释写着"适用于自绘光标的应用，如 Chrome/Electron"。但它与输入框毫无
-    // 关系：打字时鼠标通常停在别处，发出去的 Y 是错的；没在输入时（鼠标
-    // 恰好停在焦点窗口内）还会源源不断地伪造"文本光标"状态，并经由
-    // m_textCursorActive 让键盘钩子持续自我续命。自绘 caret 的应用
-    //（Chromium/Electron、UWP/WinUI、Qt、Flutter、Java）hwndCaret 为
-    // NULL —— 正确行为是落到 UIA 路径（GetCaretViaUIA）。
-    if (!gti.hwndCaret)
-        return false;
-
-    // 插入符必须在闪（见 IsCaretActuallyBlinking 的注释）。
-    if (!IsCaretActuallyBlinking(gti))
-        return false;
-
-    // 高度优先取 bottom - top；注册了零高/畸形矩形的个别应用给 0（未知）。
-    // 注意不做 "left >= 0" 检查：插入符横向滚出客户区（left 为负）时
-    // Y 仍然是有效的输入行位置，按"无插入符"处理反而丢掉了真实状态。
-    int height = gti.rcCaret.bottom - gti.rcCaret.top;
-    if (height < 0)
-        height = 0;
-
-    // 基准取底边（bottom）：下游"别让软键盘挡住当前输入行"要避开的是
-    // 行底而非行顶。X 取插入符中线，仅供需要水平位置的调用方使用。
-    POINT caretPos = {gti.rcCaret.left + (gti.rcCaret.right - gti.rcCaret.left) / 2,
-                      gti.rcCaret.bottom};
-    if (!ClientToScreen(gti.hwndCaret, &caretPos))
-        return false;
-
-    outX = caretPos.x;
-    outY = caretPos.y;
-    outHeight = height;
-    return true;
-}
-
-void CursorModule::UpdateTextCursorState(bool forceUpdate)
-{
-    // 本函数只跑在 m_textCursorThread（见 TextCursorMonitorLoop），
-    // static 缓存无跨线程竞争。
-    static int lastCaretX = -1;
-    static int lastCaretY = -1;
-
-    int currentState = -1;
-    int caretX = 0, caretY = 0;
-    int caretHeight = 0;
-    int caretSource = SidebandProtocol::CARET_SOURCE_NONE;
-
-    // 两级取词：Win32 系统 caret 优先（零成本、零风险），失败再走 UIA
-    //（跨进程 COM，可能阻塞，但能覆盖自绘 caret 的现代应用栈）。
-    if (GetCaretViaWin32(caretX, caretY, caretHeight))
-    {
-        caretSource = SidebandProtocol::CARET_SOURCE_WIN32;
-    }
-    else if (GetCaretViaUIA(caretX, caretY, caretHeight))
-    {
-        caretSource = SidebandProtocol::CARET_SOURCE_UIA;
-    }
-
-    bool haveCaret = (caretSource != SidebandProtocol::CARET_SOURCE_NONE);
-    if (haveCaret)
-    {
-        if (!forceUpdate && caretX == lastCaretX && caretY == lastCaretY)
-            return;
-        lastCaretX = caretX;
-        lastCaretY = caretY;
-
-        POINT pt = {caretX, caretY};
-        HMONITOR hMon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
-        MONITORINFO mi = {sizeof(MONITORINFO)};
-        if (GetMonitorInfo(hMon, &mi))
-        {
-            int monitorHeight = mi.rcMonitor.bottom - mi.rcMonitor.top;
-            int relativeY = caretY - mi.rcMonitor.top;
-            currentState = (int)((relativeY * 10000.0f) / monitorHeight);
-            currentState = std::clamp(currentState, 0, 10000);
-        }
-        else
-        {
-            // 拿不到显示器信息时本包只能按"无插入符"发送，
-            // 不允许出现"-1 却带着高度/来源"的自相矛盾包。
-            caretHeight = 0;
-            caretSource = SidebandProtocol::CARET_SOURCE_NONE;
-            currentState = -1;
-        }
-        m_textCursorActive = true;
-    }
-    else
-    {
-        lastCaretX = -1;
-        lastCaretY = -1;
-        m_textCursorActive = false;
-    }
-
-    int lastState = m_lastSentState.load();
-    bool stateChanged = forceUpdate;
-    if (!stateChanged)
-    {
-        if (currentState == -1 && lastState != -1)
-            stateChanged = true;
-        else if (currentState != -1 && std::abs(currentState - lastState) > 50)
-            stateChanged = true;
-    }
-
-    if (stateChanged)
-    {
-        if (currentState == -1)
-            Logger::Get().Debug("[文本光标] 退出输入状态");
-        else
-            Logger::Get().Debug("[文本光标] Y 轴位置:", currentState / 100.0f, "%");
-
-        m_server.BroadcastTextCursorState(currentState, caretHeight, caretSource);
-        m_lastSentState.store(currentState);
-    }
+    if (m_caretEngine)
+        m_caretEngine->ShutdownProviders();
 }
 
 // ============================================================
@@ -1270,28 +1036,52 @@ void CALLBACK CursorModule::WinEventProc(HWINEVENTHOOK, DWORD, HWND, LONG id, LO
     }
 }
 
-// 低级钩子回调铁律：常数时间内返回。
-// 它跑在全系统每一次鼠标事件上，一旦单次超过 LowLevelHooksTimeout
-//（HKCU\Control Panel\Desktop\LowLevelHooksTimeout，默认 300ms），
-// Windows 会不声不响地把这个钩子摘掉，而且期间整个系统的输入都会卡顿。
-// 原实现在这里同步调用 UpdateTextCursorState()，里面有 GetGUIThreadInfo /
-// GetWindowRect 等可能阻塞在别的进程上的调用 —— 现在只置标志并唤醒工作线程。
+void CALLBACK CursorModule::CaretWinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd,
+                                              LONG idObject, LONG idChild, DWORD, DWORD)
+{
+    if (s_instance)
+        s_instance->OnCaretWinEvent(event, hwnd, idObject, idChild);
+}
+
 LRESULT CALLBACK CursorModule::MouseProc(int nCode, WPARAM wParam, LPARAM lParam)
 {
     if (nCode == HC_ACTION && s_instance && wParam == WM_LBUTTONUP)
     {
-        s_instance->PokeTextCursor(true);
+        s_instance->PokeTextCursor(true, false);
     }
     return CallNextHookEx(s_instance ? s_instance->m_hMouseHook : NULL, nCode, wParam, lParam);
 }
 
 LRESULT CALLBACK CursorModule::KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
 {
-    if (nCode == HC_ACTION && s_instance && s_instance->m_textCursorActive)
+    if (nCode == HC_ACTION && s_instance)
     {
         if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)
         {
-            s_instance->PokeTextCursor(false);
+            const uint64_t nowMs = GetTickCount64();
+            s_instance->m_lastKeyboardAtomicMs.store(nowMs, std::memory_order_relaxed);
+
+            if (s_instance->m_textCursorActive.load(std::memory_order_relaxed))
+            {
+                s_instance->PokeTextCursor(false, true);
+            }
+            else if (auto *kb = reinterpret_cast<const KBDLLHOOKSTRUCT *>(lParam))
+            {
+                if (kb->vkCode == VK_TAB || kb->vkCode == VK_RETURN ||
+                    kb->vkCode == VK_F6 || kb->vkCode == VK_PROCESSKEY)
+                {
+                    s_instance->PokeTextCursor(false, true);
+                }
+                else
+                {
+                    const uint64_t prevWake = s_instance->m_lastInactiveKbWakeMs.load(std::memory_order_relaxed);
+                    if (nowMs >= prevWake + 200ULL)
+                    {
+                        s_instance->m_lastInactiveKbWakeMs.store(nowMs, std::memory_order_relaxed);
+                        s_instance->PokeTextCursor(false, true);
+                    }
+                }
+            }
         }
     }
     return CallNextHookEx(s_instance ? s_instance->m_hKeyboardHook : NULL, nCode, wParam, lParam);

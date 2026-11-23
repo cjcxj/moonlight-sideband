@@ -149,17 +149,61 @@ void ApplyCommandLineOverrides(Config &cfg)
 
 } // namespace
 
+static bool HasCmdFlag(const wchar_t *flag)
+{
+    int argc = 0;
+    LPWSTR *argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (!argv)
+        return false;
+    bool found = false;
+    for (int i = 1; i < argc; ++i)
+    {
+        if (std::wstring(argv[i]) == flag)
+        {
+            found = true;
+            break;
+        }
+    }
+    LocalFree(argv);
+    return found;
+}
+
 int main(int, char *[])
 {
     // === 单实例检查 ===
     // 之前没有这道关：起第二份实例时，由于监听 socket 设了 SO_REUSEADDR，
     // 在 Windows 上第二次 bind 反而可能成功，两个进程抢同一个端口，行为未定义。
-    HANDLE hInstanceMutex = CreateMutexW(nullptr, TRUE, kInstanceMutexName);
-    if (!hInstanceMutex || GetLastError() == ERROR_ALREADY_EXISTS)
+    const bool relaunchWait = HasCmdFlag(L"--relaunch-wait");
+    HANDLE hInstanceMutex = nullptr;
+    for (int attempt = 0; attempt < (relaunchWait ? 3 : 1); ++attempt)
+    {
+        hInstanceMutex = CreateMutexW(nullptr, TRUE, kInstanceMutexName);
+        if (hInstanceMutex && GetLastError() != ERROR_ALREADY_EXISTS)
+            break;
+        if (!hInstanceMutex)
+            break; // 连句柄都没拿到，等待和重试都没有意义
+        if (!relaunchWait)
+        {
+            CloseHandle(hInstanceMutex);
+            hInstanceMutex = nullptr;
+            break;
+        }
+
+        // 提权重启路径：老实例收尾时会 ReleaseMutex（正常退出）或直接进程消亡
+        //（被强杀时互斥量转 abandoned），两种情况这个等待都会醒来，
+        // 所以等到句柄可用即可，不需要按固定次数空转。
+        const DWORD waitSt = WaitForSingleObject(hInstanceMutex, 10000);
+        Logger::Get().Info("提权重启: 等待旧实例退出，结果 ",
+                           waitSt == WAIT_OBJECT_0 ? "正常释放"
+                           : waitSt == WAIT_ABANDONED ? "旧实例异常消亡"
+                           : "超时（旧实例仍在运行）");
+        CloseHandle(hInstanceMutex);
+        hInstanceMutex = nullptr;
+    }
+
+    if (!hInstanceMutex)
     {
         Logger::Get().Info("已有一份 moonlight-sideband 正在运行，本次启动退出");
-        if (hInstanceMutex)
-            CloseHandle(hInstanceMutex);
         return 0;
     }
 
@@ -196,7 +240,8 @@ int main(int, char *[])
 
     // 注册模块 —— Start/Stop 已在 ISidebandModule 接口里，
     // 这里不再需要持有具体类型的指针手动调用
-    server.RegisterModule(std::make_unique<CursorModule>(server));
+    server.RegisterModule(std::make_unique<CursorModule>(
+        server, cfg.caretAllowImeFallback, cfg.caretAllowControlBox));
     server.RegisterModule(std::make_unique<DisplayModule>(server));
     server.RegisterModule(std::make_unique<AudioModule>(server));
     server.StartModules();

@@ -45,6 +45,10 @@ public:
     // 认证失败计数，用于简单的暴力破解限速
     int BumpAuthFailures() { return ++m_authFailures; }
 
+    // === 扩展能力协商（HELLO）===
+    bool SupportsCaretExt() const { return m_supportsCaretExt.load(std::memory_order_acquire); }
+    void SetSupportsCaretExt(bool v) { m_supportsCaretExt.store(v, std::memory_order_release); }
+
     // === 发送 API ===
 
     // 发送光标包。是否走"缓存命中短包"由会话自己判断并记账 ——
@@ -113,6 +117,7 @@ private:
     SOCKET m_socket;
     std::atomic<bool> m_connected;      // 主循环线程与广播线程都会访问，必须原子
     std::atomic<bool> m_authenticated;
+    std::atomic<bool> m_supportsCaretExt;
     std::atomic<int> m_authFailures;
     std::string m_peer;
 

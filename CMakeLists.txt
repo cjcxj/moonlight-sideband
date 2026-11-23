@@ -22,20 +22,27 @@ set(SOURCES
     src/Config.cpp
     src/TrayIcon.cpp
     modules/CursorModule.cpp
+    modules/cursor/CaretProviders.cpp
+    modules/cursor/CaretEngine.cpp
     modules/DisplayModule.cpp
     modules/AudioModule.cpp
 )
 
 add_executable(moonlight_sideband ${SOURCES})
 
-# 构建版本标识：编译时取当前 git 提交短哈希，写入日志方便区分新旧构建
-execute_process(
-    COMMAND git rev-parse --short HEAD
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-    OUTPUT_VARIABLE SIDEBAND_BUILD_COMMIT
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    ERROR_QUIET
-)
+# 构建版本标识，写进启动日志用来分辨手头这份 exe 是哪一笔构建。
+# CI 传 -DSIDEBAND_BUILD_COMMIT=<短哈希> 时不再问 git：runner 上工作区属主和运行
+# 用户不一致，rev-parse 会被 dubious ownership 挡掉，日志就退化成 unknown。
+set(SIDEBAND_BUILD_COMMIT "" CACHE STRING "写入启动日志的构建标识")
+if(NOT SIDEBAND_BUILD_COMMIT)
+    execute_process(
+        COMMAND git rev-parse --short HEAD
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        OUTPUT_VARIABLE SIDEBAND_BUILD_COMMIT
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+endif()
 if(NOT SIDEBAND_BUILD_COMMIT)
     set(SIDEBAND_BUILD_COMMIT "unknown")
 endif()
@@ -49,10 +56,12 @@ target_link_libraries(moonlight_sideband PRIVATE
     gdiplus     # GDI+ (PNG 编码)
     shcore      # DPI Awareness
     ole32       # COM (IStream / WASAPI 音频端点与 IPolicyConfig)
+    oleacc      # MSAA (AccessibleObjectFromWindow / AccessibleObjectFromEvent)
+    oleaut32    # SafeArray / Variant / BSTR
     advapi32    # Registry
     shell32     # 托盘图标 / CommandLineToArgvW
     bcrypt      # BCryptGenRandom (令牌生成)
-    uiautomationcore  # UIA（阶段二：自绘 caret 应用兜底取插入符位置）
+    uiautomationcore  # UIA（自绘 caret 应用取插入符位置）
 )
 
 # 嵌入 Manifest (DPI Awareness)
@@ -119,7 +128,10 @@ option(SIDEBAND_BUILD_TESTS "Build unit tests for platform-independent logic" OF
 if(SIDEBAND_BUILD_TESTS)
     enable_testing()
     add_executable(sideband_tests tests/test_units.cpp)
-    target_include_directories(sideband_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_include_directories(sideband_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/modules
+    )
     if(MSVC)
         target_compile_options(sideband_tests PRIVATE /utf-8)
     endif()
