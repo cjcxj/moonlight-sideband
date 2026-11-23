@@ -13,6 +13,7 @@
 #include "cursor/CaretEngine.hpp"
 #include "Logger.hpp"
 #include "SidebandProtocol.hpp"
+#include "Win32Util.hpp"
 
 #include <windows.h>
 #include <shellscalingapi.h>
@@ -843,6 +844,43 @@ void CursorModule::OnCaretWinEvent(DWORD event, HWND hwnd, LONG idObject, LONG i
     }
 }
 
+// 覆盖率排查用：把「哪个程序、哪个窗口类」直接写进文本光标日志，
+// 否则一轮应用扫下来只能靠时间戳猜是谁。
+// 只读进程名与类名，不碰任何文本内容；级别没开到 DEBUG 时一笔系统调用都不做。
+// hwnd 传的是插入符归属窗口（IME 锚点路径填的也是被输入程序的窗口，不是候选框自己），
+// 所以 src=5 这行报出来的仍是「你正在敲字的那个应用」。
+static std::string CaretOwnerTag(HWND hwnd)
+{
+    if (Logger::Get().GetLogLevel() > LogLevel::DEBUG)
+        return std::string();
+    if (!hwnd || !IsWindow(hwnd))
+        return "<->";
+
+    wchar_t cls[96] = L"";
+    GetClassNameW(hwnd, cls, 96);
+
+    std::string exe = "?";
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid)
+    {
+        HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (hProcess)
+        {
+            wchar_t path[512] = L"";
+            DWORD len = 512;
+            if (QueryFullProcessImageNameW(hProcess, 0, path, &len))
+            {
+                const std::wstring full(path, len);
+                const size_t slash = full.find_last_of(L"\\/");
+                exe = Win32Util::WideToUtf8(slash == std::wstring::npos ? full : full.substr(slash + 1));
+            }
+            CloseHandle(hProcess);
+        }
+    }
+    return exe + "|" + Win32Util::WideToUtf8(cls);
+}
+
 void CursorModule::TextCursorMonitorLoop()
 {
     Logger::Get().Debug("CursorModule: 文本光标监控线程已启动");
@@ -935,12 +973,18 @@ void CursorModule::TextCursorMonitorLoop()
 
             if (out.publish.sendLegacy)
             {
+                const HWND ownerHwnd = out.result.valid
+                                           ? reinterpret_cast<HWND>(out.result.hwnd)
+                                           : GetForegroundWindow();
+                const std::string owner = CaretOwnerTag(ownerHwnd);
+
                 if (out.publish.legacy.yPercent == -1)
-                    Logger::Get().Debug("[文本光标] 退出输入状态");
+                    Logger::Get().Debug("[文本光标] 退出输入状态 ", owner);
                 else
                     Logger::Get().Debug("[文本光标] Y=", out.publish.legacy.yPercent / 100.0f,
                                         "% src=", out.publish.legacy.source,
-                                        " h=", out.publish.legacy.height);
+                                        " h=", out.publish.legacy.height,
+                                        " @", owner);
 
                 m_server.BroadcastTextCursorState(out.publish.legacy.yPercent,
                                                   out.publish.legacy.height,
