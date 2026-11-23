@@ -24,6 +24,12 @@ constexpr UINT ID_MENU_OPENLOG    = 40003;
 constexpr UINT ID_MENU_OPENCONFIG = 40004;
 constexpr UINT ID_MENU_ELEVATE    = 40005;
 
+// ChangeWindowMessageFilterEx 的 action 值（SDK 头文件不一定导出这些宏）：
+// MSGFLT_RESET=0 / MSGFLT_ALLOW=1 / MSGFLT_DISALLOW=2
+#ifndef MSGFLT_ALLOW
+#define MSGFLT_ALLOW 1UL
+#endif
+
 void OpenWithShell(const std::wstring &path)
 {
     ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
@@ -49,7 +55,7 @@ void AllowShellMessage(HWND hwnd, UINT msg)
         return;
     // 只放行这一条消息编号、且只对这一个窗口生效；带指针的数据型跨进程消息
     //（WM_COPYDATA 等）不受影响。
-    if (!ChangeWindowMessageFilterEx(hwnd, msg, MSGFILTER_USE, nullptr))
+    if (!ChangeWindowMessageFilterEx(hwnd, msg, MSGFLT_ALLOW, nullptr))
         Logger::Get().Warning("TrayIcon: 跨权限消息放行失败 msg=", msg, " err=", GetLastError());
 }
 
@@ -101,12 +107,11 @@ bool TrayIcon::Create(const std::wstring &tooltip)
     m_taskbarCreatedMsg = RegisterWindowMessageW(L"TaskbarCreated");
 
     // UIPI：以管理员权限运行时，本窗口处于高完整性级别，而托盘回调、
-    // TaskbarCreated 广播和 WM_DISPLAYCHANGE 都由普通权限的资源管理器发出，
-    // 跨完整性窗消息默认被丢弃 —— 表现为图标还在、但右键点了没反应。
-    // 显式放行这三条（只放行消息本身，不放开任何带指针的跨进程数据）。
+    // TaskbarCreated 广播都由普通权限的资源管理器发出，跨完整性窗消息默认被丢弃
+    // —— 表现为图标还在、但右键点了没反应。只放行这两条消息号，且只对这个窗口。
+    //（WM_DISPLAYCHANGE 之类小于 WM_USER 的系统消息本来就能穿透筛选器，无需处理。）
     AllowShellMessage(m_hwnd, WM_TRAY_NOTIFY);
     AllowShellMessage(m_hwnd, m_taskbarCreatedMsg);
-    AllowShellMessage(m_hwnd, WM_DISPLAYCHANGE);
 
     m_hIcon = LoadIconW(nullptr, IDI_APPLICATION);
 
