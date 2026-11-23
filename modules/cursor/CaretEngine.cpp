@@ -1,6 +1,7 @@
 #include "CaretEngine.hpp"
 #include "Logger.hpp"
 
+#include <algorithm>
 #include <array>
 
 namespace Caret {

@@ -1509,7 +1509,7 @@ BOOL CALLBACK EnumTextInputHostProc(HWND hwnd, LPARAM lp)
     {
         const wchar_t *slash = std::wcsrchr(exePath, L'\\');
         const wchar_t *name = slash ? (slash + 1) : exePath;
-        if (_wcsicmp(name, L"TextInputHost.exe") == 0)
+        if (CompareStringOrdinal(name, -1, L"TextInputHost.exe", -1, TRUE) == CSTR_EQUAL)
             isTextHost = true;
     }
     CloseHandle(hProc);

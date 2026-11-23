@@ -511,6 +511,11 @@ static void TestCandidateWindowRectValidation()
     // Win11 7 候选高 DPI 横条（宽度 > 900px，之前被硬编码 >900 误杀）必须放行
     CHECK(IsCandidateWindowRectValid(PixelRect{200, 180, 1180, 236}, 1920, 1080));
     CHECK(IsCandidateWindowRectValid(PixelRect{350, 420, 1630, 484}, 2560, 1440));
+
+    // PixelRect CenterX/CenterY 一致性检查
+    PixelRect r{100, 200, 300, 260};
+    CHECK(r.CenterX() == 200);
+    CHECK(r.CenterY() == 230);
 }
 
 int main()

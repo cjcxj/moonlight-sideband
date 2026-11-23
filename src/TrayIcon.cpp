@@ -49,14 +49,14 @@ bool IsCurrentProcessElevated()
     return elevated;
 }
 
-void AllowShellMessage(HWND hwnd, UINT msg)
+void AllowShellMessage(HWND hwnd, UINT msg, const char *name)
 {
     if (!hwnd || msg == 0)
         return;
     // 只放行这一条消息编号、且只对这一个窗口生效；带指针的数据型跨进程消息
     //（WM_COPYDATA 等）不受影响。
     if (!ChangeWindowMessageFilterEx(hwnd, msg, MSGFLT_ALLOW, nullptr))
-        Logger::Get().Warning("TrayIcon: 跨权限消息放行失败 msg=", msg, " err=", GetLastError());
+        Logger::Get().Warning("TrayIcon: 跨权限消息放行失败 msg=", name, " err=", GetLastError());
 }
 
 } // namespace
@@ -110,8 +110,12 @@ bool TrayIcon::Create(const std::wstring &tooltip)
     // TaskbarCreated 广播都由普通权限的资源管理器发出，跨完整性窗消息默认被丢弃
     // —— 表现为图标还在、但右键点了没反应。只放行这两条消息号，且只对这个窗口。
     //（WM_DISPLAYCHANGE 之类小于 WM_USER 的系统消息本来就能穿透筛选器，无需处理。）
-    AllowShellMessage(m_hwnd, WM_TRAY_NOTIFY);
-    AllowShellMessage(m_hwnd, m_taskbarCreatedMsg);
+    const bool elevated = IsCurrentProcessElevated();
+    if (elevated)
+    {
+        AllowShellMessage(m_hwnd, WM_TRAY_NOTIFY, "WM_TRAY_NOTIFY");
+        AllowShellMessage(m_hwnd, m_taskbarCreatedMsg, "TaskbarCreated");
+    }
 
     m_hIcon = LoadIconW(nullptr, IDI_APPLICATION);
 
@@ -119,7 +123,7 @@ bool TrayIcon::Create(const std::wstring &tooltip)
         Logger::Get().Warning("TrayIcon: 托盘图标添加失败（程序仍可运行）");
 
     Logger::Get().Info("TrayIcon: 隐藏窗口与托盘图标已创建，权限=",
-                       IsCurrentProcessElevated() ? "管理员" : "普通");
+                       (elevated ? "管理员" : "普通"));
     return true;
 }
 
