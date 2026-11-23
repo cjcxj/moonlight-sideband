@@ -12,6 +12,7 @@
 
 #include "Json.hpp"
 #include "SidebandProtocol.hpp"
+#include "cursor/CaretLogic.hpp"
 
 #include <cstdio>
 #include <cstring>
@@ -248,6 +249,165 @@ static void TestAuthPayloadRoundTrip()
     CHECK_EQ_STR(Json::GetString(R"({"nope":1})", "token"), "");
 }
 
+static void TestCaretSanityAndClassFilters()
+{
+    std::printf("Caret 假光标过滤与窗口类名分类\n");
+
+    using namespace Caret;
+    CHECK(IsBrowserOrWebViewClass(L"Chrome_WidgetWin_1"));
+    CHECK(IsBrowserOrWebViewClass(L"Chrome_RenderWidgetHostHWND"));
+    CHECK(IsBrowserOrWebViewClass(L"MozillaWindowClass"));
+    CHECK(IsKnownSelfDrawnHostClass(L"Qt5152QWindowIcon"));
+    CHECK(IsKnownSelfDrawnHostClass(L"UnityWndClass"));
+    CHECK(IsScintillaClass(L"Scintilla"));
+    CHECK(IsClassicEditClass(L"RICHEDIT50W"));
+    CHECK(IsWindowsTerminalClass(L"CASCADIA_HOSTING_WINDOW_CLASS"));
+    CHECK(!IsBrowserOrWebViewClass(L"Notepad"));
+
+    const PixelRect client{0, 0, 1200, 800};
+
+    // 1x1 占位哑光标（在 0,0 附近）必须被过滤
+    CHECK(IsDummyWin32Caret(PixelRect{0, 0, 1, 1}, client, false));
+    CHECK(IsDummyWin32Caret(PixelRect{2, 2, 3, 5}, client, false));
+
+    // 自绘宿主里的 (0,0) 2x16 小光标也应判定为哑光标
+    CHECK(IsDummyWin32Caret(PixelRect{0, 0, 2, 16}, client, true));
+
+    // 正常文本插入符（比如 2x20，即使在 (0, 200) 或正常输入区）必须放行
+    CHECK(!IsDummyWin32Caret(PixelRect{100, 200, 102, 220}, client, false));
+    // 零宽高行矩形（如部分控件）也要放行
+    CHECK(!IsDummyWin32Caret(PixelRect{50, 100, 50, 120}, client, false));
+    // 超出窗口可视客户区纵向范围的异常坐标必须过滤
+    CHECK(IsDummyWin32Caret(PixelRect{50, 900, 52, 920}, client, false));
+
+    // 屏幕/窗口范围校验
+    const PixelRect win{100, 100, 1100, 900};
+    const PixelRect mon{0, 0, 2560, 1440};
+    CHECK(IsCaretRectReasonable(PixelRect{200, 300, 202, 322}, win, mon, false));
+    CHECK(!IsCaretRectReasonable(PixelRect{200, 1500, 202, 1522}, win, mon, false));
+    CHECK(!IsCaretRectReasonable(PixelRect{200, 300, 202, 302}, win, mon, false)); // 太矮
+}
+
+static void TestWin32BlinkGrace()
+{
+    std::printf("Win32 闪烁暗灭期宽限状态机\n");
+
+    using namespace Caret;
+    Win32BlinkTracker tracker;
+    const PixelRect client{0, 0, 800, 600};
+    const PixelRect caretRc{120, 200, 122, 220};
+    PixelRect out{};
+
+    // 亮起期命中
+    CHECK(tracker.Evaluate(true, 100, 101, 102, caretRc, client, false, 1000, 800, false, out));
+    CHECK_EQ_INT(out.bottom, 220);
+
+    // 暗灭期但在 800ms 宽限内，且三句柄一致 -> 保持有效
+    CHECK(tracker.Evaluate(false, 100, 101, 102, caretRc, client, false, 1500, 800, false, out));
+    CHECK_EQ_INT(out.bottom, 220);
+
+    // 焦点窗口切换 -> 即使在宽限时间内也立刻失效
+    CHECK(!tracker.Evaluate(false, 100, 999, 102, caretRc, client, false, 1600, 800, false, out));
+
+    // 超出宽限时间 -> 失效
+    CHECK(tracker.Evaluate(true, 100, 101, 102, caretRc, client, false, 2000, 800, false, out));
+    CHECK(!tracker.Evaluate(false, 100, 101, 102, caretRc, client, false, 2900, 800, false, out));
+}
+
+static void TestNewlineAndAffinityCache()
+{
+    std::printf("行尾换行调整与亲和度/熔断缓存\n");
+
+    using namespace Caret;
+    PixelRect newLine{};
+    // 前字符是 '\n' -> 光标应该落在下一行左缘
+    CHECK(AdjustLineEndAfterNewline(PixelRect{300, 100, 310, 124}, 40, true, L'\n', newLine));
+    CHECK_EQ_INT(newLine.top, 124);
+    CHECK_EQ_INT(newLine.bottom, 148);
+    CHECK_EQ_INT(newLine.left, 40);
+
+    // 非换行符不应触发换行调整
+    CHECK(!AdjustLineEndAfterNewline(PixelRect{300, 100, 310, 124}, 40, true, L'a', newLine));
+
+    CaretAffinityCache cache;
+    auto &e = cache.GetOrCreate(CaretAffinityCache::Key{1234, 5678, L"Chrome_WidgetWin_1"});
+    CaretAffinityCache::RecordSuccess(e, ProviderId::UIA);
+    CHECK(e.hasPreferred);
+    CHECK(e.preferred == ProviderId::UIA);
+
+    // 连续 3 次硬失败触发 2000ms 冷却并清除偏好
+    CaretAffinityCache::RecordHardFailure(e, ProviderId::UIA, 1000, 3, 2000);
+    CHECK(!CaretAffinityCache::IsInCooldown(e, ProviderId::UIA, 1000));
+    CaretAffinityCache::RecordHardFailure(e, ProviderId::UIA, 1100, 3, 2000);
+    CaretAffinityCache::RecordHardFailure(e, ProviderId::UIA, 1200, 3, 2000);
+    CHECK(CaretAffinityCache::IsInCooldown(e, ProviderId::UIA, 2000));
+    CHECK(!CaretAffinityCache::IsInCooldown(e, ProviderId::UIA, 3201));
+    CHECK(!e.hasPreferred);
+}
+
+static void TestCaretPublishAndProtocol()
+{
+    std::printf("显示器 YPercent 换算、节流与扩展协议\n");
+
+    using namespace Caret;
+    using namespace SidebandProtocol;
+
+    // 副屏（y: 1440..2880，高 1440），底边在 2160 -> 恰好 5000 (50.00%)
+    const PixelRect mon2{0, 1440, 2560, 2880};
+    CHECK_EQ_INT(ComputeMonitorPercent(2160, mon2.top, mon2.Height()), 5000);
+
+    CaretOptions opts;
+    opts.allowImeFallback = true;
+    opts.allowControlBoxForLegacy = false;
+
+    CaretPublishTracker pub;
+    CaretResult r;
+    r.valid = true;
+    r.rect = PixelRect{500, 2136, 502, 2160};
+    r.controlRect = PixelRect{400, 2120, 900, 2180};
+    r.hasControlRect = true;
+    r.source = CARET_SOURCE_UIA;
+    r.confidence = CaretConfidence::Exact;
+
+    auto d1 = pub.Evaluate(r, mon2, false, opts);
+    CHECK(d1.sendLegacy);
+    CHECK_EQ_INT(d1.legacy.yPercent, 5000);
+    CHECK_EQ_INT(d1.legacy.height, 24);
+    CHECK_EQ_INT(d1.legacy.source, CARET_SOURCE_UIA);
+    CHECK(d1.sendExt);
+    CHECK_EQ_INT(d1.extY, 5000);
+
+    // 1px 微小抖动（在 0.15% 死区内）不应触发广播
+    r.rect.bottom = 2161;
+    auto d2 = pub.Evaluate(r, mon2, false, opts);
+    CHECK(!d2.sendLegacy);
+    CHECK(!d2.sendExt);
+
+    // 仅有 ControlBox 时：老协议被拦截成 -1（退出），扩展协议仍可下发 Estimated
+    CaretResult box;
+    box.valid = true;
+    box.rect = PixelRect{400, 2120, 900, 2180};
+    box.controlRect = box.rect;
+    box.hasControlRect = true;
+    box.source = CARET_SOURCE_CONTROL_BOX;
+    box.confidence = CaretConfidence::Estimated;
+
+    auto d3 = pub.Evaluate(box, mon2, false, opts);
+    CHECK(d3.sendLegacy);
+    CHECK_EQ_INT(d3.legacy.yPercent, -1);
+    CHECK(d3.sendExt);
+    CHECK_EQ_INT(d3.extY, ComputeMonitorPercent(2180, mon2.top, mon2.Height()));
+
+    std::string extJson = BuildTextCursorExtJson(box, d3.extY, d3.extX, d3.extCtrlBottom);
+    CHECK_EQ_INT(Json::GetInt(extJson, "src"), CARET_SOURCE_CONTROL_BOX);
+    CHECK_EQ_INT(Json::GetInt(extJson, "conf"), static_cast<int>(CaretConfidence::Estimated));
+    CHECK(Json::GetBool(extJson, "comp", true) == false);
+
+    // HELLO 能力协商字段解析
+    CHECK(Json::GetBool(R"({"proto_ver":1,"caret_ext":true})", "caret_ext", false) == true);
+    CHECK(Json::GetBool(R"({"proto_ver":1})", "caret_ext", false) == false);
+}
+
 int main()
 {
     std::printf("=== moonlight-sideband 单元测试 ===\n");
@@ -259,6 +419,10 @@ int main()
     TestJsonMalformed();
     TestProtocolPackets();
     TestAuthPayloadRoundTrip();
+    TestCaretSanityAndClassFilters();
+    TestWin32BlinkGrace();
+    TestNewlineAndAffinityCache();
+    TestCaretPublishAndProtocol();
 
     std::printf("=== %d 项检查, %d 项失败 ===\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

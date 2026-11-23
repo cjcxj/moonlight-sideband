@@ -196,7 +196,8 @@ int main(int, char *[])
 
     // 注册模块 —— Start/Stop 已在 ISidebandModule 接口里，
     // 这里不再需要持有具体类型的指针手动调用
-    server.RegisterModule(std::make_unique<CursorModule>(server));
+    server.RegisterModule(std::make_unique<CursorModule>(
+        server, cfg.caretAllowImeFallback, cfg.caretAllowControlBox));
     server.RegisterModule(std::make_unique<DisplayModule>(server));
     server.RegisterModule(std::make_unique<AudioModule>(server));
     server.StartModules();

@@ -82,6 +82,9 @@ public:
                                   int32_t caretHeight = 0,
                                   int32_t sourceTag = SidebandProtocol::CARET_SOURCE_NONE);
 
+    // 仅向在 HELLO 中声明支持 "caret_ext":true 的客户端推送扩展文本光标 JSON（CmdID=102）
+    void BroadcastTextCursorExt(const std::string &jsonPayload);
+
     // 向所有客户端广播控制指令
     void BroadcastCommand(uint32_t cmd_id, uint32_t req_id,
                           const uint8_t *payload, uint32_t payload_len);

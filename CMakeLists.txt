@@ -22,6 +22,8 @@ set(SOURCES
     src/Config.cpp
     src/TrayIcon.cpp
     modules/CursorModule.cpp
+    modules/cursor/CaretProviders.cpp
+    modules/cursor/CaretEngine.cpp
     modules/DisplayModule.cpp
     modules/AudioModule.cpp
 )
@@ -49,10 +51,12 @@ target_link_libraries(moonlight_sideband PRIVATE
     gdiplus     # GDI+ (PNG 编码)
     shcore      # DPI Awareness
     ole32       # COM (IStream / WASAPI 音频端点与 IPolicyConfig)
+    oleacc      # MSAA (AccessibleObjectFromWindow / AccessibleObjectFromEvent)
+    oleaut32    # SafeArray / Variant / BSTR
     advapi32    # Registry
     shell32     # 托盘图标 / CommandLineToArgvW
     bcrypt      # BCryptGenRandom (令牌生成)
-    uiautomationcore  # UIA（阶段二：自绘 caret 应用兜底取插入符位置）
+    uiautomationcore  # UIA（自绘 caret 应用取插入符位置）
 )
 
 # 嵌入 Manifest (DPI Awareness)
@@ -119,7 +123,10 @@ option(SIDEBAND_BUILD_TESTS "Build unit tests for platform-independent logic" OF
 if(SIDEBAND_BUILD_TESTS)
     enable_testing()
     add_executable(sideband_tests tests/test_units.cpp)
-    target_include_directories(sideband_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_include_directories(sideband_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/modules
+    )
     if(MSVC)
         target_compile_options(sideband_tests PRIVATE /utf-8)
     endif()

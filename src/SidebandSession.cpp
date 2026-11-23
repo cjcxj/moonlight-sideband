@@ -10,7 +10,7 @@
 
 SidebandSession::SidebandSession(SOCKET sock)
     : m_socket(sock), m_connected(true), m_authenticated(false),
-      m_authFailures(0), m_lastSentHash(0)
+      m_supportsCaretExt(false), m_authFailures(0), m_lastSentHash(0)
 {
     // 禁用 Nagle 算法，低延迟
     int yes = 1;

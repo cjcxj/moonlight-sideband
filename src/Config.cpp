@@ -141,6 +141,14 @@ bool Config::LoadOrCreate()
             {
                 token = val;
             }
+            else if (key == "caret_allow_ime_fallback")
+            {
+                caretAllowImeFallback = ParseBool(val, caretAllowImeFallback);
+            }
+            else if (key == "caret_allow_control_box")
+            {
+                caretAllowControlBox = ParseBool(val, caretAllowControlBox);
+            }
         }
         in.close();
 
@@ -185,7 +193,13 @@ bool Config::Save() const
         << "# 控制令牌：切换显示器 / 设置分辨率 / 设置缩放 需要客户端先提交它。\n"
         << "# 光标推送和只读查询不需要，所以老客户端不受影响。\n"
         << "# 请把这串值填到 Android 端；删掉本行会在下次启动时重新生成。\n"
-        << "token=" << token << "\n";
+        << "token=" << token << "\n"
+        << "\n"
+        << "# 无精确光标但 IME 候选框/组合框激活时，允许用 IME 窗口锚点估算输入位置。\n"
+        << "caret_allow_ime_fallback=" << (caretAllowImeFallback ? "true" : "false") << "\n"
+        << "\n"
+        << "# 仅获得输入控件矩形（无精确光标）时，是否也推送给老版客户端（CmdID=2）。\n"
+        << "caret_allow_control_box=" << (caretAllowControlBox ? "true" : "false") << "\n";
 
     return out.good();
 }
